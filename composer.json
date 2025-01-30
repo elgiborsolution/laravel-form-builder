@@ -1,0 +1,21 @@
+{
+  "name": "elgibor-solution/laravel-data-sources",
+  "description": "A Laravel package for managing dynamic data sources.",
+  "type": "library",
+  "autoload": {
+      "psr-4": {
+          "ESolution\\DataSources\\": "src/"
+      }
+  },
+  "require": {
+      "php": ">=8.0",
+      "illuminate/support": "^10.0"
+  },
+  "extra": {
+      "laravel": {
+          "providers": [
+              "ESolution\\DataSources\\Providers\\DataSourcesServiceProvider"
+          ]
+      }
+  }
+}
