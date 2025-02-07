@@ -1,6 +1,7 @@
 {
   "name": "elgibor-solution/laravel-data-sources",
   "description": "A Laravel package for managing dynamic data sources.",
+  "version": "1.0.0",
   "type": "library",
   "autoload": {
       "psr-4": {
