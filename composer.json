@@ -3,6 +3,7 @@
   "description": "A Laravel package for managing form builder resources.",
   "version": "1.0.0",
   "type": "library",
+  "license": "Apache-2.0",
   "autoload": {
       "psr-4": {
           "ESolution\\DataSources\\": "src/"
