@@ -157,7 +157,8 @@ class DataSourceController extends Controller
     if ($dataSource->use_custom_query && $dataSource->custom_query) {
       $query = $dataSource->custom_query;
     } else {
-      $columns = implode(',', $dataSource->columns);
+      $columnArray = json_decode($dataSource->columns, true);
+      $columns = implode(',', $columnArray);
       $query = "SELECT $columns FROM {$dataSource->table_name} WHERE 1=1";
 
       foreach ($queryParams as $key => $value) {

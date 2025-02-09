@@ -18,6 +18,8 @@ class DataSourcesServiceProvider extends ServiceProvider
         // Load routes
         $this->loadRoutesFrom(__DIR__.'/../../routes/api.php');
 
+	$this->loadRoutesFrom(__DIR__.'/../../routes/tenant.php');
+
         // Publish migrations
         $this->publishes([
             __DIR__.'/../../database/migrations' => database_path('migrations'),
