@@ -2,10 +2,13 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataSource;
+use ESolution\DataSources\Models\DataSourceParameter;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Pagination\LengthAwarePaginator;
 
 class DataSourceController extends Controller
 {
@@ -17,15 +20,35 @@ class DataSourceController extends Controller
   public function store(Request $request)
   {
     $validated = $request->validate([
-      'name' => 'required|string',
+      'name' => 'required|string|unique:data_sources,name',
       'table_name' => 'required|string',
       'use_custom_query' => 'boolean',
       'columns' => 'required|array',
+      'parameters' => 'required|array',
       'custom_query' => 'nullable|string'
     ]);
 
     if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
       return response()->json(['error' => 'Only SELECT queries are allowed'], 400);
+    }
+
+    $validateParam = [
+      'param_name' => 'required|string',
+      'param_default_value' => 'nullable|string',
+      'param_type' => ["required" , "string", "in:string,integer,boolean,date,float"],
+      'is_required' => 'nullable|integer',
+    ];
+    $dataParam = [];
+    foreach ($request->parameters as $key => $value) {
+
+        $validator = Validator::make($value, $validateParam);
+
+        if ($validator->fails()) {
+            return response()->json(['error'=>$validator->errors()], 401);
+        }
+
+        $dataParam[] = $value;
+
     }
 
     $dataSource = DataSource::create([
@@ -35,6 +58,10 @@ class DataSourceController extends Controller
       'columns' => json_encode($validated['columns']),
       'custom_query' => $validated['custom_query'] ?? null
     ]);
+
+    if(count($dataParam) > 0){
+        $dataSource->parameters()->createMany($dataParam);
+    }
 
     return response()->json($dataSource, 201);
   }
@@ -49,8 +76,12 @@ class DataSourceController extends Controller
   // UPDATE a data source
   public function update(Request $request, $id)
   {
+    $dataSource = DataSource::findOrFail($id);
+    if (empty($dataSource)) {
+      return response()->json(['error' => 'Data source not found'], 400);
+    }
     $validated = $request->validate([
-      'name' => 'required|string',
+      'name' => 'required|string|unique:data_sources,name,'. $dataSource->id ,
       'table_name' => 'required|string',
       'use_custom_query' => 'boolean',
       'columns' => 'required|array',
@@ -61,7 +92,25 @@ class DataSourceController extends Controller
       return response()->json(['error' => 'Only SELECT queries are allowed'], 400);
     }
 
-    $dataSource = DataSource::findOrFail($id);
+    $validateParam = [
+      'param_name' => 'required|string',
+      'param_default_value' => 'nullable|string',
+      'param_type' => ["required" , "string", "in:string,integer,boolean,date,float"],
+      'is_required' => 'nullable|integer',
+    ];
+    $dataParam = [];
+    foreach ($request->parameters as $key => $value) {
+
+        $validator = Validator::make($value, $validateParam);
+
+        if ($validator->fails()) {
+            return response()->json(['error'=>$validator->errors()], 401);
+        }
+
+        $dataParam[] = $value;
+
+    }
+
     $dataSource->update([
       'name' => $validated['name'],
       'table_name' => $validated['table_name'],
@@ -70,20 +119,42 @@ class DataSourceController extends Controller
       'custom_query' => $validated['custom_query'] ?? null
     ]);
 
+    $dataSource->parameters()->delete();
+
+    if(count($dataParam) > 0){
+        $dataSource->parameters()->createMany($dataParam);
+    }
+
+    
+
     return response()->json($dataSource->load(['parameters']));
   }
 
   // DELETE a data source
   public function destroy($id)
   {
+    $dataSource = DataSource::findOrFail($id);
+    if (empty($dataSource)) {
+      return response()->json(['error' => 'Data source not found'], 400);
+    }
+    $dataSource->parameters()->delete();
+
     DataSource::destroy($id);
     return response()->json(['message' => 'Data source deleted']);
   }
 
-  public function listTables()
+  public function listTables(Request $request)
   {
+
+    
+    $headers = $request->header('x-tenant');
+
+    if(!empty($headers)){
+        tenancy()->initialize($headers);
+    }
+
     $tables = DB::select("SHOW TABLES");
-    $databaseName = env('DB_DATABASE');
+    // $databaseName = env('DB_DATABASE');
 
     // Laravel biasanya mengembalikan array dengan key yang berbeda tergantung pada driver
     $tableList = [];
@@ -94,8 +165,14 @@ class DataSourceController extends Controller
     return response()->json($tableList);
   }
 
-  public function listColumns($table)
+  public function listColumns(Request $request, $table)
   {
+    $headers = $request->header('x-tenant');
+
+    if(!empty($headers)){
+        tenancy()->initialize($headers);
+    }
+
     try {
       $columns = DB::select("SHOW COLUMNS FROM `$table`");
 
@@ -119,8 +196,18 @@ class DataSourceController extends Controller
 
   public function executeQuery(Request $request, $id)
   {
-    $dataSource = DataSource::with('parameters')->findOrFail($id);
+    $headers = $request->header('x-tenant');
+// dd($request->all());
+
+    $dataSource = DataSource::with('parameters')->where('name', $id)->first();;
+    if (empty($dataSource)) {
+      return response()->json(['error' => 'Data source not found'], 400);
+    }
     $queryParams = [];
+
+    if(!empty($headers)){
+        tenancy()->initialize($headers);
+    }
 
     foreach ($dataSource->parameters as $param) {
       $paramName = $param->param_name;
@@ -162,16 +249,31 @@ class DataSourceController extends Controller
       $query = "SELECT $columns FROM {$dataSource->table_name} WHERE 1=1";
 
       foreach ($queryParams as $key => $value) {
+
         $query .= " AND $key = :$key";
       }
     }
 
     $cacheKey = 'data_source_' . $id . '_query_' . md5($query . json_encode($queryParams));
-
-    $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($query, $queryParams) {
-      return DB::select($query, $queryParams);
+    $dataResult = DB::select($query, $queryParams);
+    if (!empty($request->page)) {
+        $dataResult = $this->arrayPaginator($dataResult, $request);
+    }
+    $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($dataResult) {
+      return $dataResult;
     });
 
     return response()->json($result);
+  }
+
+
+  public function arrayPaginator($array, $request)
+  {
+      $page = $request->page;
+      $perPage = 10;
+      $offset = ($page * $perPage) - $perPage;
+
+      return new LengthAwarePaginator(array_slice($array, $offset, $perPage, true), count($array), $perPage, $page,
+          ['path' => $request->url(), 'query' => $request->query()]);
   }
 }

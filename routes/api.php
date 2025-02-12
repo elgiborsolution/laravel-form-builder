@@ -10,4 +10,6 @@ Route::group(['prefix' => 'api', 'as' => 'api.'], function () {
     Route::get('data-source/{id}/query', [DataSourceController::class, 'executeQuery']);
 
     Route::apiResource('data-source', DataSourceController::class);
+
+    Route::apiResource('data-picker', DataPickerController::class);
 });
