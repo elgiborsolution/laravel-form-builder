@@ -23,6 +23,7 @@ class DataPickerController extends Controller
       $validateFilter = [
         'type' => ["required" , "string", "in:text,number,date,checkbox,dropdown,radio"],
         'label' => 'required|string',
+        'param_name' => 'required|string',
         'value' => 'nullable',
         'options' => 'nullable|array'
       ];
