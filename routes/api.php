@@ -2,6 +2,7 @@
 
 use Illuminate\Support\Facades\Route;
 use ESolution\DataSources\Controllers\DataSourceController;
+use ESolution\DataSources\Controllers\DataPickerController;
 
 Route::group(['prefix' => 'api', 'as' => 'api.'], function () {
     Route::get('data-source/tables', [DataSourceController::class, 'listTables']);

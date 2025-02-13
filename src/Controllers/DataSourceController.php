@@ -9,12 +9,22 @@ use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Pagination\Paginator;
+use Illuminate\Support\Collection;
 
 class DataSourceController extends Controller
 {
-  public function index()
+  public function index(Request $request)
   {
-    return response()->json(DataSource::with('parameters')->get());
+    $data = DataSource::with('parameters');
+    if(!empty($request->page)){
+        $data = $data->paginate(10);
+        return $data;
+    }else{
+
+        $data = $data->get();
+    }
+    return response()->json(['data' => $data], 200);
   }
 
   public function store(Request $request)
@@ -146,7 +156,7 @@ class DataSourceController extends Controller
   public function listTables(Request $request)
   {
 
-    
+
     $headers = $request->header('x-tenant');
 
     if(!empty($headers)){
@@ -240,40 +250,63 @@ class DataSourceController extends Controller
 
       $queryParams[$paramName] = $paramValue;
     }
-
+    $queryCount = null;
     if ($dataSource->use_custom_query && $dataSource->custom_query) {
       $query = $dataSource->custom_query;
     } else {
       $columnArray = json_decode($dataSource->columns, true);
       $columns = implode(',', $columnArray);
       $query = "SELECT $columns FROM {$dataSource->table_name} WHERE 1=1";
+      $queryCount = "SELECT count(*) as aggregate FROM {$dataSource->table_name} WHERE 1=1";
 
       foreach ($queryParams as $key => $value) {
 
-        $query .= " AND $key = :$key";
+        // $query .= " AND $key = :$key";
+        $query .= " AND $key = $value";
+        $queryCount .= " AND $key = $value";
       }
     }
 
-    $cacheKey = 'data_source_' . $id . '_query_' . md5($query . json_encode($queryParams));
-    $dataResult = DB::select($query, $queryParams);
-    if (!empty($request->page)) {
-        $dataResult = $this->arrayPaginator($dataResult, $request);
-    }
-    $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($dataResult) {
+    $cacheKey = 'data_source_' . $id . '_query_' . md5($query . json_encode($queryParams).($request->page??'0'));
+    // $dataResult = DB::select($query, $queryParams);
+
+    $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request) {
+      //if paginate
+      if (!empty($request->page)) {
+          if(empty($queryCount)){
+
+            $count = count(DB::select(DB::raw($query)));  
+          }else{
+
+            $data_count = DB::select(DB::raw($queryCount));
+            $count = $data_count[0]->aggregate;  
+          }
+
+          $per_page = 10; //define how many items for a page
+          $pages = ceil($count/$per_page);
+          $page = ($request->page=="") ?"1" :$request->page;
+          $start    = ($page - 1) * $per_page;  
+          $query.= ' LIMIT ' . $start . ', ' . $per_page;
+
+          $size = 10;
+          $data = DB::select(DB::raw($query));
+          $dataResult = $this->paginate($data , $count , $per_page , $request->page);
+
+      }else{
+
+        $dataResult = DB::select(DB::raw($query));
+      }
       return $dataResult;
     });
 
     return response()->json($result);
   }
 
+  public function paginate($items, $total , $perPage = 5, $page = 1, $options = [])
+   {
+    // $page = $page ?: (Paginator::resolveCurrentPage() ?: 1);
+    $items = $items instanceof Collection ? $items : Collection::make($items);
+    return new LengthAwarePaginator($items,  $total, $perPage, $page, $options);
+   }
 
-  public function arrayPaginator($array, $request)
-  {
-      $page = $request->page;
-      $perPage = 10;
-      $offset = ($page * $perPage) - $perPage;
-
-      return new LengthAwarePaginator(array_slice($array, $offset, $perPage, true), count($array), $perPage, $page,
-          ['path' => $request->url(), 'query' => $request->query()]);
-  }
 }
