@@ -19,10 +19,16 @@ class DataSourceController extends Controller
     $data = DataSource::with('parameters');
     if(!empty($request->page)){
         $data = $data->paginate(10);
+        foreach ($data as $key => $value) {
+          $data[$key]->columns = json_decode($value->columns);
+        }
         return $data;
     }else{
 
         $data = $data->get();
+        foreach ($data as $key => $value) {
+          $data[$key]->columns = json_decode($value->columns);
+        }
     }
     return response()->json(['data' => $data], 200);
   }
@@ -30,12 +36,12 @@ class DataSourceController extends Controller
   public function store(Request $request)
   {
     $validated = $request->validate([
+      'use_custom_query' => 'required|boolean',
       'name' => 'required|string|unique:data_sources,name',
-      'table_name' => 'required|string',
-      'use_custom_query' => 'boolean',
-      'columns' => 'required|array',
-      'parameters' => 'required|array',
-      'custom_query' => 'nullable|string'
+      'table_name' =>  ['nullable', 'required_if:use_custom_query,0', "string"],
+      'columns' => ['nullable', 'required_if:use_custom_query,0', "array"],
+      'parameters' => ['nullable', "array"],
+      'custom_query' => ['nullable', 'required_if:use_custom_query,1', "string"],
     ]);
 
     if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
@@ -49,7 +55,7 @@ class DataSourceController extends Controller
       'is_required' => 'nullable|integer',
     ];
     $dataParam = [];
-    foreach ($request->parameters as $key => $value) {
+    foreach ($request->parameters??[] as $key => $value) {
 
         $validator = Validator::make($value, $validateParam);
 
@@ -63,7 +69,7 @@ class DataSourceController extends Controller
 
     $dataSource = DataSource::create([
       'name' => $validated['name'],
-      'table_name' => $validated['table_name'],
+      'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
       'columns' => json_encode($validated['columns']),
       'custom_query' => $validated['custom_query'] ?? null
@@ -80,6 +86,10 @@ class DataSourceController extends Controller
   public function show($id)
   {
     $dataSource = DataSource::with(['parameters'])->findOrFail($id);
+    if (empty($dataSource)) {
+      return response()->json(['error' => 'Data source not found'], 400);
+    }
+    $dataSource->columns = json_decode($dataSource->columns);
     return response()->json($dataSource);
   }
 
@@ -92,10 +102,11 @@ class DataSourceController extends Controller
     }
     $validated = $request->validate([
       'name' => 'required|string|unique:data_sources,name,'. $dataSource->id ,
-      'table_name' => 'required|string',
       'use_custom_query' => 'boolean',
-      'columns' => 'required|array',
-      'custom_query' => 'nullable|string'
+      'table_name' =>  ['nullable', 'required_if:use_custom_query,0', "string"],
+      'columns' => ['nullable', 'required_if:use_custom_query,0', "array"],
+      'parameters' => ['nullable', "array"],
+      'custom_query' => ['nullable', 'required_if:use_custom_query,1', "string"],
     ]);
 
     if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
@@ -123,9 +134,9 @@ class DataSourceController extends Controller
 
     $dataSource->update([
       'name' => $validated['name'],
-      'table_name' => $validated['table_name'],
+      'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
-      'columns' => json_encode($validated['columns']),
+      'columns' => json_encode($validated['columns']??[]),
       'custom_query' => $validated['custom_query'] ?? null
     ]);
 
@@ -258,20 +269,40 @@ class DataSourceController extends Controller
       $columns = implode(',', $columnArray);
       $query = "SELECT $columns FROM {$dataSource->table_name} WHERE 1=1";
       $queryCount = "SELECT count(*) as aggregate FROM {$dataSource->table_name} WHERE 1=1";
-
+// dd($queryParams);
       foreach ($queryParams as $key => $value) {
 
         // $query .= " AND $key = :$key";
-        $query .= " AND $key = $value";
-        $queryCount .= " AND $key = $value";
+        if(!empty($value) && $value != ''){
+
+          $query .= " AND $key = $value";
+          $queryCount .= " AND $key = $value";
+        }
       }
     }
 
     $cacheKey = 'data_source_' . $id . '_query_' . md5($query . json_encode($queryParams).($request->page??'0'));
     // $dataResult = DB::select($query, $queryParams);
+    if(!empty($request->isDebug) && $request->isDebug){
 
-    $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request) {
-      //if paginate
+
+          $dataResult = $this->makeQuery($queryCount, $query, $request, $dataSource);
+          $result = $dataResult;
+
+    }else{     
+
+        $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request, $dataSource) {
+          
+            $dataResult = $this->makeQuery($queryCount, $query, $request);
+            return $dataResult;
+        }); 
+    }
+
+    return response()->json($result);
+  }
+
+  public function makeQuery($queryCount, $query, $request, $dataSource){
+
       if (!empty($request->page)) {
           if(empty($queryCount)){
 
@@ -282,24 +313,42 @@ class DataSourceController extends Controller
             $count = $data_count[0]->aggregate;  
           }
 
-          $per_page = 10; //define how many items for a page
+          $per_page = $request->per_page??10; //define how many items for a page
           $pages = ceil($count/$per_page);
           $page = ($request->page=="") ?"1" :$request->page;
           $start    = ($page - 1) * $per_page;  
           $query.= ' LIMIT ' . $start . ', ' . $per_page;
 
-          $size = 10;
           $data = DB::select(DB::raw($query));
           $dataResult = $this->paginate($data , $count , $per_page , $request->page);
 
       }else{
 
-        $dataResult = DB::select(DB::raw($query));
-      }
-      return $dataResult;
-    });
+        $data = DB::select(DB::raw($query));
 
-    return response()->json($result);
+        $dataResult = ['data'=>$data];
+
+      }
+
+        
+      //if debugging / testing
+      if(!empty($request->isDebug) && $request->isDebug){
+
+            $dataExplain = DB::select(DB::raw('explain '.$query));
+            if($dataSource->use_custom_query == 1){
+
+              $custom = collect(['data_index' => [], 'data_explain'=> $dataExplain, 'query_sql'=>$query]);
+              $dataResult = $custom->merge($dataResult);
+
+            }else if($dataSource->use_custom_query == 0){
+                
+              $dataIndex = DB::select(DB::raw('show index from '.$dataSource->table_name));
+              $custom = collect(['data_index' => $dataIndex, 'data_explain'=> $dataExplain, 'query_sql'=>$query]);
+              $dataResult = $custom->merge($dataResult);
+            }
+      }
+
+      return $dataResult;
   }
 
   public function paginate($items, $total , $perPage = 5, $page = 1, $options = [])
