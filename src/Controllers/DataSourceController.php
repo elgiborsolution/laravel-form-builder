@@ -293,7 +293,7 @@ class DataSourceController extends Controller
 
         $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request, $dataSource) {
           
-            $dataResult = $this->makeQuery($queryCount, $query, $request);
+            $dataResult = $this->makeQuery($queryCount, $query, $request, $dataSource);
             return $dataResult;
         }); 
     }
