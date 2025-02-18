@@ -275,13 +275,13 @@ class DataSourceController extends Controller
         // $query .= " AND $key = :$key";
         if(!empty($value) && $value != ''){
 
-          $query .= " AND $key = $value";
-          $queryCount .= " AND $key = $value";
+          $query .= " AND $key = '".$value."'";
+          $queryCount .= " AND $key = '".$value."'";
         }
       }
     }
 
-    $cacheKey = 'data_source_' . $id . '_query_' . md5($query . json_encode($queryParams).($request->page??'0'));
+    $cacheKey = 'data_source_q' . $id . '_query_' . md5($query . json_encode($queryParams).($request->page??'0'));
     // $dataResult = DB::select($query, $queryParams);
     if(!empty($request->isDebug) && $request->isDebug){
 
