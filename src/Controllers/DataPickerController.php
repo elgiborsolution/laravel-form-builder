@@ -22,30 +22,34 @@ class DataPickerController extends Controller
       $dataPicker[$key]['is_central'] = true;
     }
 
-    $headers = $request->header('x-tenant');
+    // if it has tenant
     if(!empty($headers)){
         tenancy()->initialize($headers);
-        $dataPickerInTenant = DB::table('data_pickers')->get();
-        $dataPickerInTenantMap = [];
-        foreach ($dataPickerInTenant as $key => $value) { 
-          $dataArray = json_decode(json_encode($value, true), true);
-          $dataArray['filters'] = json_decode($dataArray['filters']);
-          $dataArray['columns'] = json_decode($dataArray['columns']);
-          $dataArray['params'] = json_decode($dataArray['params']);
-          $dataArray['is_central'] = false;
+        //if the tenant has table
+        if(Schema::hasTable('data_pickers')){
+          $dataPickerInTenant = DB::table('data_pickers')->get();
+          $dataPickerInTenantMap = [];
+          foreach ($dataPickerInTenant as $key => $value) { 
+            $dataArray = json_decode(json_encode($value, true), true);
+            $dataArray['filters'] = json_decode($dataArray['filters']);
+            $dataArray['columns'] = json_decode($dataArray['columns']);
+            $dataArray['params'] = json_decode($dataArray['params']);
+            $dataArray['is_central'] = false;
 
-          $dataPickerInTenantMap[$value->code] = $dataArray;
-        }
-       
-        foreach ($dataPicker as $key => $value) {
+            $dataPickerInTenantMap[$value->code] = $dataArray;
+          }
+         
+          foreach ($dataPicker as $key => $value) {
 
-          if(!empty($dataPickerInTenantMap[$value['code']])){
+            if(!empty($dataPickerInTenantMap[$value['code']])){
 
-              // replace central data with data tenant
-              $dataPicker[$key] = $dataPickerInTenantMap[$value['code']];
+                // replace central data with data tenant
+                $dataPicker[$key] = $dataPickerInTenantMap[$value['code']];
+            }
+
           }
 
-        }
+        }//end if tenant has table
         
     }
 
@@ -60,7 +64,7 @@ class DataPickerController extends Controller
         'type' => ["required" , "string", "in:text,number,date,checkbox,dropdown,radio"],
         'label' => 'required|string',
         'name' => 'required|string',
-        'operator' => ["required" , "string", "in:=,>,<,<=,>=,like,or"],
+        'operator' => ["required" , "string", "in:=,>,<,<=,>=,like,LIKE"],
         'value' => 'nullable',
         'options' => 'nullable|array'
       ];
