@@ -14,6 +14,15 @@ use Illuminate\Support\Collection;
 
 class DataSourceController extends Controller
 {
+
+  /**
+  * Display List data source configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
+
   public function index(Request $request)
   {
     $data = DataSource::with('parameters');
@@ -33,6 +42,14 @@ class DataSourceController extends Controller
     return response()->json(['data' => $data], 200);
   }
 
+
+  /**
+  * Create new data source configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function store(Request $request)
   {
     $validated = $request->validate([
@@ -100,7 +117,13 @@ class DataSourceController extends Controller
     return response()->json($dataSource, 201);
   }
 
-  // SHOW a single data source
+  /**
+  * Show some data source configuration
+  *
+  * @param DataSource $id
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function show($id)
   {
     $dataSource = DataSource::with(['parameters'])->findOrFail($id);
@@ -111,7 +134,13 @@ class DataSourceController extends Controller
     return response()->json($dataSource);
   }
 
-  // UPDATE a data source
+  /**
+  * Update data source configuration
+  *
+  * @param Request $request, DataSource $id
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function update(Request $request, $id)
   {
     $dataSource = DataSource::findOrFail($id);
@@ -188,7 +217,13 @@ class DataSourceController extends Controller
     return response()->json($dataSource->load(['parameters']));
   }
 
-  // DELETE a data source
+  /**
+  * Delete data source configuration
+  *
+  * @param DataSource $id
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function destroy($id)
   {
     $dataSource = DataSource::findOrFail($id);
@@ -201,6 +236,13 @@ class DataSourceController extends Controller
     return response()->json(['message' => 'Data source deleted']);
   }
 
+  /**
+  * Display a list of tables in the database
+  *
+  * @param Request $request, DataSource $id
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function listTables(Request $request)
   {
 
@@ -223,6 +265,13 @@ class DataSourceController extends Controller
     return response()->json($tableList);
   }
 
+  /**
+  * Display a list of columns in a table
+  *
+  * @param Request $request, String $table (table name)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function listColumns(Request $request, $table)
   {
     $headers = $request->header('x-tenant');
@@ -252,6 +301,14 @@ class DataSourceController extends Controller
   }
 
 
+
+  /**
+  * Run a datasource command
+  *
+  * @param Request $request, String $id (name of datasource)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function executeQuery(Request $request, $id)
   {
 
@@ -365,6 +422,13 @@ class DataSourceController extends Controller
     return response()->json($result);
   }
 
+  /**
+  * Add a query for pagination, explain the query, and display the index
+  *
+  * @param String $queryCount (query for get count data), String $query (query from data source), Request $request, DataSource $dataSource
+  *
+  * @return Array
+  */
   public function makeQuery($queryCount, $query, $request, $dataSource){
 
       try {
@@ -421,6 +485,13 @@ class DataSourceController extends Controller
       }
   }
 
+  /**
+  * Display as pagination format
+  *
+  * @param Object|Array $items, Integer $total , Integer $perPage = 5, Integer $page = 1
+  *
+  * @return Illuminate\Pagination\LengthAwarePaginator
+  */
   public function paginate($items, $total , $perPage = 5, $page = 1, $options = [])
    {
     // $page = $page ?: (Paginator::resolveCurrentPage() ?: 1);
@@ -429,6 +500,13 @@ class DataSourceController extends Controller
    }
 
 
+  /**
+  * Validate detail param when create new or update data source configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse || NUll
+  */
   public function validateDetail($request)
   {
 
@@ -450,6 +528,13 @@ class DataSourceController extends Controller
       return null;
   }
 
+  /**
+  * Setting format value
+  *
+  * @param String type, String $paramValue, Boolean $islike (is it 'like' operation)
+  *
+  * @return String
+  */
   public function findFormatValue($type, $paramValue, $islike=false)
   {
 
@@ -480,6 +565,13 @@ class DataSourceController extends Controller
   }
 
 
+  /**
+  * Find column list in a custom query 
+  *
+  * @param Request $request
+  *
+  * @return Array
+  */
   public function findAttributeSQlBuilder($request, $query)
   {
 

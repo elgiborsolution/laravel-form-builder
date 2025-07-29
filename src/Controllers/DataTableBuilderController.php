@@ -12,6 +12,14 @@ use Illuminate\Support\Facades\Schema;
 
 class DataTableBuilderController extends Controller
 {
+
+  /**
+  * Display list data table builder configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function index(Request $request)
   {
     $dataTableBuilder = DataTableBuilder::get()->toArray();
@@ -61,6 +69,13 @@ class DataTableBuilderController extends Controller
   }
 
 
+  /**
+  * Validate detail param when create new or update data table builder configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse || NUll
+  */
   public function validateDetail($request)
   {
 
@@ -130,6 +145,14 @@ class DataTableBuilderController extends Controller
       return null;
   }
 
+
+  /**
+  * Create new data table builder configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function store(Request $request)
   {
     $validated = $request->validate([
@@ -161,7 +184,14 @@ class DataTableBuilderController extends Controller
     return response()->json(["status" => 200, 'message' => 'Data table builder created', 'data'=>$dataTableBuilder], 201);
   }
 
-  // SHOW a single Data table builder
+
+  /**
+  * Show some data table builder configuration
+  *
+  * @param Request $request, String $id (DataTableBuilder code)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function show(Request $request, $id)
   {
 
@@ -189,7 +219,14 @@ class DataTableBuilderController extends Controller
     return response()->json(["status" => 200, 'data'=>$dataTableBuilder], 200);
   }
 
-  // UPDATE a Data table builder
+
+  /**
+  * Update data table builder configuration
+  *
+  * @param Request $request, String $id (DataTableBuilder code)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function update(Request $request, $id)
   {
     $dataTableBuilder = DataTableBuilder::where('code', $id)->first();
@@ -251,7 +288,13 @@ class DataTableBuilderController extends Controller
     return response()->json(["status" => 200, 'message' => 'Data table builder updated', 'data'=>$dataTableBuilder], 201);
   }
 
-  // DELETE a Data table builder
+  /**
+  * Delete data table builder configuration
+  *
+  * @param Request $request, String $id (DataTableBuilder code)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function destroy(Request $request, $id)
   {
     $dataTableBuilder = DataTableBuilder::where('code', $id)->first();

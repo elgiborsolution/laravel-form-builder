@@ -11,8 +11,17 @@ use Illuminate\Pagination\LengthAwarePaginator;
 
 class DataPickerController extends Controller
 {
+
+  /**
+  * Display list data picker configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function index(Request $request)
   {
+    $headers = $request->header('x-tenant');
     $dataPicker = DataPicker::get()->toArray();
     foreach ($dataPicker as $key => $value) {
       
@@ -57,6 +66,13 @@ class DataPickerController extends Controller
   }
 
 
+  /**
+  * Validate detail param when create new or update data picker configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse || NUll
+  */
   public function validateDetail($request)
   {
 
@@ -108,6 +124,14 @@ class DataPickerController extends Controller
       return null;
   }
 
+
+  /**
+  * Create new data picker configuration
+  *
+  * @param Request $request
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function store(Request $request)
   {
     $validated = $request->validate([
@@ -137,7 +161,13 @@ class DataPickerController extends Controller
     return response()->json(["status" => 200, 'message' => 'data picker created', 'data'=>$dataPicker], 201);
   }
 
-  // SHOW a single data picker
+  /**
+  * Show some data picker configuration
+  *
+  * @param Request $request, String $id (DataPicker code)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function show(Request $request, $id)
   {
 
@@ -161,7 +191,14 @@ class DataPickerController extends Controller
     return response()->json(["status" => 200, 'data'=>$dataPicker], 200);
   }
 
-  // UPDATE a data picker
+
+  /**
+  * Update data picker configuration
+  *
+  * @param Request $request, String $id (DataPicker code)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function update(Request $request, $id)
   {
     $dataPicker = DataPicker::where('code', $id)->first();
@@ -213,7 +250,14 @@ class DataPickerController extends Controller
     return response()->json(["status" => 200, 'message' => 'data picker updated', 'data'=>$dataPicker], 201);
   }
 
-  // DELETE a data picker
+
+  /**
+  * Delete data picker configuration
+  *
+  * @param Request $request, String $id (DataPicker code)
+  *
+  * @return \Illuminate\Http\JsonResponse
+  */
   public function destroy(Request $request, $id)
   {
     $dataPicker = DataPicker::where('code', $id)->first();
@@ -240,14 +284,4 @@ class DataPickerController extends Controller
     return response()->json(['message' => 'Data picker deleted']);
   }
 
-  public function arrayPaginator($array, $request)
-  {
-      $array = json_decode(json_encode($array, true), true);
-      $page = $request->page;
-      $perPage = 10;
-      $offset = ($page * $perPage) - $perPage;
-
-      return new LengthAwarePaginator(array_slice($array, $offset, $perPage, true), count($array), $perPage, $page,
-          ['path' => $request->url(), 'query' => $request->query()]);
-  }
 }

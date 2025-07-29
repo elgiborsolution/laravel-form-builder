@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Route;
 use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Controllers\DataPickerController;
 use ESolution\DataSources\Controllers\DataTableBuilderController;
+use ESolution\DataSources\Controllers\DataAPIBuilderController;
 
 
 Route::group(['prefix' => 'api', 'as' => 'api.'], function () {
@@ -17,4 +18,6 @@ Route::group(['prefix' => 'api', 'as' => 'api.'], function () {
     Route::apiResource('data-picker', DataPickerController::class);
 
     Route::apiResource('table-builder', DataTableBuilderController::class);
+
+    Route::apiResource('api-config', DataAPIBuilderController::class);
 });

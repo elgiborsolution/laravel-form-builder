@@ -4,7 +4,7 @@ namespace ESolution\DataSources\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
-class DataSourceParameter extends Model
+class ApiListener extends Model
 {
     use HasFactory;
 
@@ -14,16 +14,16 @@ class DataSourceParameter extends Model
      *
      * @var array
      */
-    protected $fillable = ['data_source_id', 'param_name', 'param_type', 'param_default_value', 'is_required'];
+    protected $fillable = ['api_config_id', 'permission_string'];
 
     /**
-     * Define a relationship with the DataSource model.
-     * Each DataSourceParameter belongs to a specific DataSource.
+     * Define a relationship with the ApiConfig model.
+     * Each API Listener belongs to a specific API Configuration.
      *
      * @return \Illuminate\Database\Eloquent\Relations\BelongsTo
      */
-    public function dataSource()
+    public function apiConfig()
     {
-        return $this->belongsTo(DataSource::class);
+        return $this->belongsTo(ApiConfig::class);
     }
 }
