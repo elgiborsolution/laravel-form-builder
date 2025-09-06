@@ -1,7 +1,6 @@
 {
   "name": "elgibor-solution/laravel-form-builder",
   "description": "A Laravel package for managing form builder resources.",
-  "version": "1.0.1",
   "type": "library",
   "license": "Apache-2.0",
   "autoload": {
