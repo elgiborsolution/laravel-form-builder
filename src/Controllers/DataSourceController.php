@@ -3,17 +3,18 @@ namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
+use ESolution\DataSources\Services\DataQueryService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Pagination\LengthAwarePaginator;
-use Illuminate\Pagination\Paginator;
-use Illuminate\Support\Collection;
 
 class DataSourceController extends Controller
 {
+  public function __construct(
+    protected DataQueryService $dataQueryService
+  ) {
+  }
 
   /**
   * Display List data source configuration
@@ -311,257 +312,17 @@ class DataSourceController extends Controller
   */
   public function executeQuery(Request $request, $id)
   {
-
     $headers = $request->header('x-tenant');
-    if(!empty($request->params) && is_string($request->params)){
-      $params = json_decode($request->params, true);
-      $request->merge(['params' => $params]);
-      // dd($params);
-    }
-
-    $validator = Validator::make($request->all(), ['params' => 'nullable|array']);
-
-    if ($validator->fails())return response()->json(['error'=>$validator->errors(), 'message'=>$validator->errors()->first()], 422);
-
-    $invalid = $this->validateDetail($request);
-
-    if (!empty($invalid)) {
-       return $invalid;
-    }
-
-
-
     $dataSource = DataSource::with('parameters')->where('name', $id)->first();;
     if (empty($dataSource)) {
       return response()->json(['error' => 'Data source not found'], 422);
     }
-    $queryParams = [];
-    $queryParamWithOperator = [];
-    $paramsWithOperator = $request->params??[];
-    foreach ($paramsWithOperator as $key => $value) {
-      $paramsWithOperator[$value['param_name']] = $value;
-    }
+
     if(!empty($headers)){
         tenancy()->initialize($headers);
     }
 
-
-    foreach ($dataSource->parameters as $param) {
-      //strict filter
-      $paramName = $param->param_name;
-      $paramValue = $request->get($paramName, $param->param_default_value);
-
-      if ($param->is_required && $paramValue === null) {
-        return response()->json(['error' => "Parameter '$paramName' is required", 'message' => "Parameter '$paramName' is required"], 422);
-      }
-
-      $paramValue = $this->findFormatValue($param->param_type, $paramValue);
-
-      $queryParams[$paramName] = $paramValue;
-      //end strict filter
-
-      // dynamic filter
-      if(count($paramsWithOperator) > 0){
-        $operatorParam = !empty($paramsWithOperator[$paramName])?$paramsWithOperator[$paramName]:null;
-        if(!empty($operatorParam)){
-
-           $paramOpValue = $this->findFormatValue($param->param_type, $operatorParam['param_value'], strtolower($operatorParam['param_operation']) == 'like');
-
-           $queryParamWithOperator[$paramName] = ['value' => $paramOpValue, 'operator' => $operatorParam['param_operation']];
-        } 
-      }
-      // end dynamic filter
-    }
-
-    $queryCount = null;
-    if ($dataSource->use_custom_query && $dataSource->custom_query) {
-      $customQuery = $dataSource->custom_query;
-      $query = "SELECT * FROM ({$customQuery}) tableCustom WHERE 1=1";
-      $queryCount = "SELECT count(*) as aggregate FROM ({$customQuery}) tableCustom WHERE 1=1";
-    } else {
-      $columnArray = json_decode($dataSource->columns, true);
-      $columns = implode(',', $columnArray);
-      $query = "SELECT $columns FROM {$dataSource->table_name} WHERE 1=1";
-      $queryCount = "SELECT count(*) as aggregate FROM {$dataSource->table_name} WHERE 1=1";
-    }
-
-    foreach ($queryParams as $key => $value) {
-        // $query .= " AND $key = :$key";
-        if(!empty($value) && $value != ''){
-
-          $query .= " AND $key = '".$value."'";
-          $queryCount .= " AND $key = '".$value."'";
-        }
-    }
-
-    foreach ($queryParamWithOperator as $key => $value) {
-          $query .= " AND $key ".$value['operator']." '".$value['value']."'";
-          $queryCount .= " AND $key ".$value['operator']." '".$value['value']."'";
-    }
-
-    $cacheKey = 'data_source_q' . $id . '_query_' . md5($query . json_encode($queryParams).'-'.json_encode($queryParamWithOperator).($request->page??'0'));
-    // $dataResult = DB::select($query, $queryParams);
-    if(!empty($request->isDebug) && $request->isDebug){
-
-
-          $dataResult = $this->makeQuery($queryCount, $query, $request, $dataSource);
-          $result = $dataResult;
-
-    }else{     
-
-        $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request, $dataSource) {
-          
-            $dataResult = $this->makeQuery($queryCount, $query, $request, $dataSource);
-            return $dataResult;
-        }); 
-    }
-    if(!empty($result['error'])){
-
-        return response()->json(['error'=>$result['error'], 'message'=>$result['error']], 400);
-    }
-    return response()->json($result);
-  }
-
-  /**
-  * Add a query for pagination, explain the query, and display the index
-  *
-  * @param String $queryCount (query for get count data), String $query (query from data source), Request $request, DataSource $dataSource
-  *
-  * @return Array
-  */
-  public function makeQuery($queryCount, $query, $request, $dataSource){
-
-      try {
-          if (!empty($request->page)) {
-              if(empty($queryCount)){
-
-                $count = count(DB::select(DB::raw($query)));  
-              }else{
-
-                $data_count = DB::select(DB::raw($queryCount));
-                $count = $data_count[0]->aggregate;  
-
-              }
-              // dd($query);
-
-              $per_page = $request->per_page??10; //define how many items for a page
-              $pages = ceil($count/$per_page);
-              $page = ($request->page=="") ?"1" :$request->page;
-              $start    = ($page - 1) * $per_page;  
-              $query.= ' LIMIT ' . $start . ', ' . $per_page;
-
-              $data = DB::select(DB::raw($query));
-              $dataResult = $this->paginate($data , $count , $per_page , $request->page);
-
-          }else{
-
-            $data = DB::select(DB::raw($query));
-
-            $dataResult = ['data'=>$data];
-
-          }
-
-            
-          //if debugging / testing
-          if(!empty($request->isDebug) && $request->isDebug){
-
-                $dataExplain = DB::select(DB::raw('explain '.$query));
-                if($dataSource->use_custom_query == 1){
-
-                  $custom = collect(['data_index' => [], 'data_explain'=> $dataExplain, 'query_sql'=>$query]);
-                  $dataResult = $custom->merge($dataResult);
-
-                }else if($dataSource->use_custom_query == 0){
-                    
-                  $dataIndex = DB::select(DB::raw('show index from '.$dataSource->table_name));
-                  $custom = collect(['data_index' => $dataIndex, 'data_explain'=> $dataExplain, 'query_sql'=>$query]);
-                  $dataResult = $custom->merge($dataResult);
-                }
-          }
-
-          return $dataResult;
-      } catch (\Exception $e) {
-            return ['error' => $e->getMessage()];
-      }
-  }
-
-  /**
-  * Display as pagination format
-  *
-  * @param Object|Array $items, Integer $total , Integer $perPage = 5, Integer $page = 1
-  *
-  * @return Illuminate\Pagination\LengthAwarePaginator
-  */
-  public function paginate($items, $total , $perPage = 5, $page = 1, $options = [])
-   {
-    // $page = $page ?: (Paginator::resolveCurrentPage() ?: 1);
-    $items = $items instanceof Collection ? $items : Collection::make($items);
-    return new LengthAwarePaginator($items,  $total, $perPage, $page, $options);
-   }
-
-
-  /**
-  * Validate detail param when create new or update data source configuration
-  *
-  * @param Request $request
-  *
-  * @return \Illuminate\Http\JsonResponse || NUll
-  */
-  public function validateDetail($request)
-  {
-
-      $validateFilter = [
-        'param_name' => 'required',
-        'param_operation' => 'required',
-        'param_value' => 'required'
-      ];
-      foreach ($request->params??[] as $key => $value) {
-
-          $validator = Validator::make($value, $validateFilter);
-
-          if ($validator->fails()) {
-              return response()->json(['error'=>$validator->errors(), 'message'=>'Invalid payload params at row '.strval(intval($key)+1)], 400);
-          }
-      }
-
-
-      return null;
-  }
-
-  /**
-  * Setting format value
-  *
-  * @param String type, String $paramValue, Boolean $islike (is it 'like' operation)
-  *
-  * @return String
-  */
-  public function findFormatValue($type, $paramValue, $islike=false)
-  {
-
-      switch ($type) {
-        case 'integer':
-          $paramValue = (int) $paramValue;
-          break;
-        case 'boolean':
-          $paramValue = filter_var($paramValue, FILTER_VALIDATE_BOOLEAN);
-          break;
-        case 'float':
-          $paramValue = (float) $paramValue;
-          break;
-        case 'date':
-          if (!strtotime($paramValue)) {
-            return response()->json(['error' => "Invalid date format for '$paramName'"], 422);
-          }
-          break;
-        case 'string':
-        default:
-          $paramValue = (string) $paramValue;
-          break;
-      }
-      if($islike){
-        $paramValue = '%'.$paramValue.'%';
-      }
-      return $paramValue;
+    return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
   }
 
 

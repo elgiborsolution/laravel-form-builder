@@ -1,28 +1,136 @@
 <?php
 namespace ESolution\DataSources\Providers;
 
+use ESolution\DataSources\Controllers\ApiController;
+use ESolution\DataSources\Controllers\DataAPIBuilderController;
+use ESolution\DataSources\Controllers\DataPickerController;
+use ESolution\DataSources\Controllers\DataSourceController;
+use ESolution\DataSources\Controllers\DataTableBuilderController;
+use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
+use Stancl\Tenancy\Middleware\InitializeTenancyByRequestData;
 
 class DataSourcesServiceProvider extends ServiceProvider
 {
-    public function register()
+    public function register(): void
     {
-        // Register model bindings, services, etc.
+        $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'datasources');
     }
 
-    public function boot()
+    public function boot(): void
     {
-        // Load migrations
-        $this->loadMigrationsFrom(__DIR__.'/../../database/migrations');
+        $this->loadMigrationsFrom(__DIR__ . '/../../database/migrations');
 
-        // Load routes
-        $this->loadRoutesFrom(__DIR__.'/../../routes/api.php');
+        if (! $this->app->routesAreCached()) {
+            $this->registerRoutes();
+        }
 
-	$this->loadRoutesFrom(__DIR__.'/../../routes/tenant.php');
-
-        // Publish migrations
         $this->publishes([
-            __DIR__.'/../../database/migrations' => database_path('migrations'),
-        ], 'migrations');
+            __DIR__ . '/../../config/datasources.php' => config_path('datasources.php'),
+        ], 'datasources-config');
+
+        $this->publishes([
+            __DIR__ . '/../../database/migrations' => database_path('migrations'),
+        ], 'datasources-migrations');
+    }
+
+    protected function registerRoutes(): void
+    {
+        $this->registerManagementRoutes();
+        $this->registerTenantRoutes();
+        $this->registerDynamicRoutes();
+    }
+
+    protected function registerManagementRoutes(): void
+    {
+        Route::middleware(config('datasources.routes.management.middleware', ['api']))
+            ->prefix($this->buildPrefix())
+            ->as(config('datasources.routes.name', 'datasources.'))
+            ->group(function (): void {
+                Route::get('data-source/tables', [DataSourceController::class, 'listTables'])
+                    ->name('management.data-source.tables');
+                Route::get('data-source/tables/{table}/columns', [DataSourceController::class, 'listColumns'])
+                    ->name('management.data-source.columns');
+                Route::get('data-source/{id}/query', [DataSourceController::class, 'executeQuery'])
+                    ->name('management.data-source.query');
+
+                Route::apiResource('data-source', DataSourceController::class)
+                    ->names($this->resourceRouteNames('management.data-source'));
+                Route::apiResource('data-picker', DataPickerController::class)
+                    ->names($this->resourceRouteNames('management.data-picker'));
+                Route::apiResource('table-builder', DataTableBuilderController::class)
+                    ->names($this->resourceRouteNames('management.table-builder'));
+                Route::apiResource('api-config', DataAPIBuilderController::class)
+                    ->names($this->resourceRouteNames('management.api-config'));
+            });
+    }
+
+    protected function registerTenantRoutes(): void
+    {
+        if (! config('datasources.routes.tenant.enabled', true)) {
+            return;
+        }
+
+        $middlewareClass = config(
+            'datasources.routes.tenant.initialize_middleware',
+            InitializeTenancyByRequestData::class
+        );
+
+        if (! class_exists($middlewareClass)) {
+            return;
+        }
+
+        $middleware = array_values(array_filter(array_merge(
+            config('datasources.routes.tenant.middleware', ['api']),
+            [$middlewareClass]
+        )));
+
+        Route::middleware($middleware)
+            ->prefix($this->buildPrefix())
+            ->as(config('datasources.routes.name', 'datasources.') . 'tenant.')
+            ->group(function (): void {
+                Route::get('data-source-tenant/tables', [DataSourceController::class, 'listTables'])
+                    ->name('data-source.tables');
+                Route::get('data-source-tenant/tables/{table}/columns', [DataSourceController::class, 'listColumns'])
+                    ->name('data-source.columns');
+                Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
+                    ->name('data-source.query');
+                Route::apiResource('data-source-tenant', DataSourceController::class)
+                    ->names($this->resourceRouteNames('data-source'));
+            });
+    }
+
+    protected function registerDynamicRoutes(): void
+    {
+        Route::middleware(config('datasources.routes.dynamic.middleware', ['api']))
+            ->prefix($this->buildPrefix(config('datasources.routes.dynamic.prefix')))
+            ->as(config('datasources.routes.name', 'datasources.') . 'dynamic.')
+            ->group(function (): void {
+                Route::any('{dynamicPath}', [ApiController::class, 'handleRequest'])
+                    ->where('dynamicPath', '.*')
+                    ->name('dispatch');
+            });
+    }
+
+    protected function buildPrefix(?string $extraPrefix = null): string
+    {
+        $segments = [
+            trim((string) config('datasources.routes.prefix', 'api'), '/'),
+            trim((string) config('datasources.routes.version'), '/'),
+            trim((string) $extraPrefix, '/'),
+        ];
+
+        return implode('/', array_values(array_filter($segments, static fn ($segment) => $segment !== '')));
+    }
+
+    protected function resourceRouteNames(string $prefix): array
+    {
+        return [
+            'index' => $prefix . '.index',
+            'store' => $prefix . '.store',
+            'show' => $prefix . '.show',
+            'update' => $prefix . '.update',
+            'destroy' => $prefix . '.destroy',
+        ];
     }
 }

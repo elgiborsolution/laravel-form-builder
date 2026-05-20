@@ -1,53 +1,62 @@
 <?php
 namespace ESolution\DataSources\Controllers;
 
+use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Support\DynamicApiConfigResolver;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Facades\Route;
-use ESolution\DataSources\Models\ApiConfig;
 
 class ApiController extends Controller
 {
+    public function __construct(
+        protected DynamicApiConfigResolver $resolver,
+        protected DataQueryService $dataQueryService
+    ) {
+    }
 
   /**
   * Handle API request based on the API configuration.
   *
   * @param Request $request
-  * @param int $id (optional)
+  * @param string $dynamicPath
   *
   * @return \Illuminate\Http\JsonResponse
   */
-  public function handleRequest(Request $request, $id=0)
+  public function handleRequest(Request $request, string $dynamicPath): JsonResponse
   {
-        $routeName = Route::currentRouteName(); // Get the route name
         $headers = $request->header('x-tenant');
+        $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
+        /** @var ApiConfig|null $apiConfigs */
+        $apiConfigs = $resolvedRoute['config'];
+        $id = $resolvedRoute['id'];
 
-        $apiConfigs = Cache::remember('api-configs-'.$routeName, 60, function () use($routeName) {
-                return ApiConfig::with('parentTable', 'childTables')->where('route_name', $routeName)->first();
-        });
-
-
-        if(empty($apiConfigs)){
-
-              return response()->json(['status' => 400, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 400);
+        if (empty($apiConfigs)) {
+              return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
         }
-        
+
         // if it has tenant
         if(!empty($headers)){
             tenancy()->initialize($headers);
         }
-        
 
         if($apiConfigs->method == 'POST'){
-
             return $this->store($request, $apiConfigs);
         }
 
+        if($apiConfigs->method == 'GET'){
+            return $this->dataQueryService->executeForApiConfig(
+                $request,
+                $apiConfigs,
+                'api_config_q' . $apiConfigs->id
+            );
+        }
+
         if($apiConfigs->method == 'PUT'){
-            if($id == 0){
+            if(empty($id)){
 
               return response()->json(['status' => 400, 'error'=> 'primary_key is required', 'message'=>'primary_key is required'], 400);
             }
@@ -57,7 +66,7 @@ class ApiController extends Controller
 
 
         if($apiConfigs->method == 'DELETE'){
-            if($id == 0){
+            if(empty($id)){
 
               return response()->json(['status' => 400, 'error'=> 'primary_key is required', 'message'=>'primary_key is required'], 400);
             }

@@ -2,6 +2,7 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -12,9 +13,16 @@ use Illuminate\Support\Facades\Schema;
 use ESolution\DataSources\Models\ApiTable;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Validation\Rule;
+use Illuminate\Support\Str;
 
 class DataAPIBuilderController extends Controller
 {
+    public function __construct(
+        protected DynamicApiConfigResolver $resolver
+    ) {
+    }
+
     /**
      * Display a list of API Builder configurations.
      *
@@ -87,11 +95,11 @@ class DataAPIBuilderController extends Controller
           ];
           
 
-          if($request->method != 'DELETE'){
+          if(!in_array($request->method, ['DELETE', 'GET'], true)){
             $validateParentTable['data_params'] = 'required|array';
             $validateChildTable['data_params'] = 'required|array';
           }else{
-            $validateParentTable['data_params'] = 'nullable|array';
+            $validateParentTable['data_params'] = $request->method == 'GET' ? 'required|array' : 'nullable|array';
             $validateChildTable['data_params'] = 'nullable|array';
 
           }
@@ -126,6 +134,13 @@ class DataAPIBuilderController extends Controller
     
   public function store(Request $request)
   {
+     $request->merge([
+        'method' => strtoupper((string) $request->input('method')),
+        'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
+        'route_name' => $request->filled('route_name')
+            ? $request->input('route_name')
+            : $this->buildRouteName($request->input('endpoint'), $request->input('method')),
+     ]);
 
      $eventClass = "App\\Events\\AfterRunnerApiBuiderEvent";
 
@@ -134,10 +149,21 @@ class DataAPIBuilderController extends Controller
      } 
 
     $validated = $request->validate([
-      'route_name' => 'required|string|unique:api_configs,route_name',
-      'endpoint' => 'required|string',
-      'method' => ["required" , "string", "in:POST,PUT,DELETE"],
-      'params' => ['nullable', 'required_if:PUT,POST', "array"],
+      'route_name' => ['required', 'string', Rule::unique('api_configs', 'route_name')],
+      'endpoint' => [
+          'required',
+          'string',
+          function (string $attribute, mixed $value, \Closure $fail): void {
+              if ($this->resolver->isReservedEndpoint((string) $value)) {
+                  $fail('The endpoint conflicts with a reserved package route.');
+              }
+          },
+          Rule::unique('api_configs', 'endpoint')->where(
+              fn ($query) => $query->where('method', strtoupper((string) $request->input('method')))
+          ),
+      ],
+      'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
+      'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
       'parent_table' => 'required|array',
       'child_tables' => 'nullable|array',
       'enabled' => 'nullable|boolean',
@@ -159,8 +185,9 @@ class DataAPIBuilderController extends Controller
               'route_name' => $validated['route_name'],
               'endpoint' => $validated['endpoint'],
               'method' => $validated['method'],
-              'params' => ($validated['params']),
-              'enabled' => (!empty($validated['enabled'])?$validated['enabled']:true)
+              'params' => ($validated['params'] ?? []),
+              'enabled' => array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true,
+              'description' => $validated['description'] ?? null,
             ]);
 
             $parentTable = new ApiTable([
@@ -199,6 +226,7 @@ class DataAPIBuilderController extends Controller
 
             \DB::commit();
               Cache::forget('list-api-configs');
+              $this->resolver->forget($validated['endpoint'], $validated['method']);
              return response()->json(["status" => 200, 'message' => 'Data api builder created', 'data'=>$dataApiBuilder], 201);
         } catch (\Exception $e) {
 
@@ -243,6 +271,13 @@ class DataAPIBuilderController extends Controller
     
   public function update(Request $request, $id)
   {
+     $request->merge([
+        'method' => strtoupper((string) $request->input('method')),
+        'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
+        'route_name' => $request->filled('route_name')
+            ? $request->input('route_name')
+            : $this->buildRouteName($request->input('endpoint'), $request->input('method')),
+     ]);
 
      $eventClass = "App\\Events\\AfterRunnerApiBuiderEvent";
 
@@ -254,11 +289,25 @@ class DataAPIBuilderController extends Controller
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
     }
 
+    $originalEndpoint = $dataApiBuilder->endpoint;
+    $originalMethod = $dataApiBuilder->method;
+
     $validated = $request->validate([
-      'route_name' => 'required|string|unique:api_configs,route_name,'.$dataApiBuilder->id,
-      'endpoint' => 'required|string',
-      'method' => ["required" , "string", "in:POST,PUT,DELETE"],
-      'params' => ['nullable', 'required_if:PUT,POST', "array"],
+      'route_name' => ['required', 'string', Rule::unique('api_configs', 'route_name')->ignore($dataApiBuilder->id)],
+      'endpoint' => [
+          'required',
+          'string',
+          function (string $attribute, mixed $value, \Closure $fail): void {
+              if ($this->resolver->isReservedEndpoint((string) $value)) {
+                  $fail('The endpoint conflicts with a reserved package route.');
+              }
+          },
+          Rule::unique('api_configs', 'endpoint')
+              ->where(fn ($query) => $query->where('method', strtoupper((string) $request->input('method'))))
+              ->ignore($dataApiBuilder->id),
+      ],
+      'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
+      'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
       'parent_table' => 'required|array',
       'child_tables' => 'nullable|array',
       'enabled' => 'nullable|boolean',
@@ -279,8 +328,9 @@ class DataAPIBuilderController extends Controller
               'route_name' => $validated['route_name'],
               'endpoint' => $validated['endpoint'],
               'method' => $validated['method'],
-              'params' => ($validated['params']),
-              'enabled' => (!empty($validated['enabled'])?$validated['enabled']:true)
+              'params' => ($validated['params'] ?? []),
+              'enabled' => array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true,
+              'description' => $validated['description'] ?? null,
             ]);
 
             $parentTable = [
@@ -322,6 +372,8 @@ class DataAPIBuilderController extends Controller
 
             \DB::commit();
             Cache::forget('list-api-configs');
+            $this->resolver->forget($originalEndpoint, $originalMethod);
+            $this->resolver->forget($validated['endpoint'], $validated['method']);
             return response()->json(["status" => 200, 'message' => 'Data api builder updated', 'data'=>$dataApiBuilder], 200);
         } catch (\Exception $e) {
 
@@ -354,10 +406,23 @@ class DataAPIBuilderController extends Controller
 
 
         $headers = $request->header('x-tenant');
+        $this->resolver->forget($dataApiBuilder->endpoint, $dataApiBuilder->method);
         $dataApiBuilder->delete();
 
         Cache::forget('list-api-configs');
         return response()->json(['message' => 'Data api builder deleted']);
+      }
+
+      protected function buildRouteName(?string $endpoint, ?string $method): string
+      {
+            $endpoint = $this->resolver->normalizeEndpoint($endpoint);
+
+            return 'generated.' . strtolower((string) $method) . '.' . Str::of($endpoint)
+                ->replace('/', '.')
+                ->replace('-', '.')
+                ->snake()
+                ->trim('.')
+                ->value();
       }
 
       public function getListenerName($routeName)
