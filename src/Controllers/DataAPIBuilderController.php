@@ -168,6 +168,8 @@ class DataAPIBuilderController extends Controller
       'child_tables' => 'nullable|array',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
+      'middlewares' => 'nullable|array',
+      'middlewares.*' => 'nullable|string',
     ]);
 
 
@@ -188,6 +190,7 @@ class DataAPIBuilderController extends Controller
               'params' => ($validated['params'] ?? []),
               'enabled' => array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true,
               'description' => $validated['description'] ?? null,
+              'middlewares' => $this->normalizeMiddlewares($validated['middlewares'] ?? null),
             ]);
 
             $parentTable = new ApiTable([
@@ -312,6 +315,8 @@ class DataAPIBuilderController extends Controller
       'child_tables' => 'nullable|array',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
+      'middlewares' => 'nullable|array',
+      'middlewares.*' => 'nullable|string',
     ]);
 
     $invalid = $this->validateDetail($request);
@@ -331,6 +336,7 @@ class DataAPIBuilderController extends Controller
               'params' => ($validated['params'] ?? []),
               'enabled' => array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true,
               'description' => $validated['description'] ?? null,
+              'middlewares' => $this->normalizeMiddlewares($validated['middlewares'] ?? null),
             ]);
 
             $parentTable = [
@@ -423,6 +429,20 @@ class DataAPIBuilderController extends Controller
                 ->snake()
                 ->trim('.')
                 ->value();
+      }
+
+      protected function normalizeMiddlewares(?array $middlewares): ?array
+      {
+            if (empty($middlewares)) {
+                return null;
+            }
+
+            $normalized = array_values(array_filter(
+                array_map(static fn ($middleware) => is_string($middleware) ? trim($middleware) : '', $middlewares),
+                static fn (string $middleware) => $middleware !== ''
+            ));
+
+            return $normalized === [] ? null : $normalized;
       }
 
       public function getListenerName($routeName)

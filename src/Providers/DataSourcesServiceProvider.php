@@ -102,13 +102,13 @@ class DataSourcesServiceProvider extends ServiceProvider
 
     protected function registerDynamicRoutes(): void
     {
-        Route::middleware(config('datasources.routes.dynamic.middleware', ['api']))
-            ->prefix($this->buildPrefix(config('datasources.routes.dynamic.prefix')))
+        Route::prefix($this->buildPrefix(config('datasources.routes.dynamic.prefix')))
             ->as(config('datasources.routes.name', 'datasources.') . 'dynamic.')
             ->group(function (): void {
                 Route::any('{dynamicPath}', [ApiController::class, 'handleRequest'])
                     ->where('dynamicPath', '.*')
-                    ->name('dispatch');
+                    ->name('dispatch')
+                    ->fallback();
             });
     }
 

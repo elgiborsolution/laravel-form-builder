@@ -6,6 +6,7 @@ use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Pipeline\Pipeline;
 use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
@@ -14,7 +15,8 @@ class ApiController extends Controller
 {
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
-        protected DataQueryService $dataQueryService
+        protected DataQueryService $dataQueryService,
+        protected Pipeline $pipeline
     ) {
     }
 
@@ -43,6 +45,15 @@ class ApiController extends Controller
             tenancy()->initialize($headers);
         }
 
+        return $this->runDynamicMiddlewarePipeline(
+            $request,
+            $apiConfigs,
+            fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
+        );
+  }
+
+  protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
+  {
         if($apiConfigs->method == 'POST'){
             return $this->store($request, $apiConfigs);
         }
@@ -75,6 +86,23 @@ class ApiController extends Controller
         }
 
         return response()->json(['data' => []], 200);
+  }
+
+  protected function runDynamicMiddlewarePipeline(Request $request, ApiConfig $apiConfig, \Closure $destination): JsonResponse
+  {
+        $middlewares = array_values(array_filter(array_merge(
+            config('datasources.routes.dynamic.middleware', []),
+            $apiConfig->middlewares ?? []
+        )));
+
+        if ($middlewares === []) {
+            return $destination($request);
+        }
+// dd($middlewares);
+        return $this->pipeline
+            ->send($request)
+            ->through($middlewares)
+            ->then(fn (Request $request) => $destination($request));
   }
 
 

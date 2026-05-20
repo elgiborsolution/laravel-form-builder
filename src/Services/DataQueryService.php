@@ -70,6 +70,32 @@ class DataQueryService
             return $invalid;
         }
 
+        if (!empty($definition['custom_query'])) {
+            try {
+                $definition['custom_query'] = $this->ensureStringQuery($definition['custom_query']);
+            } catch (\InvalidArgumentException $e) {
+                return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+            }
+        }
+
+        if (!empty($definition['table_name'])) {
+            try {
+                $definition['table_name'] = $this->ensureStringQuery($definition['table_name']);
+            } catch (\InvalidArgumentException $e) {
+                return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+            }
+        }
+
+        if (!empty($definition['columns']) && is_array($definition['columns'])) {
+            try {
+                foreach ($definition['columns'] as $key => $column) {
+                    $definition['columns'][$key] = $this->ensureStringQuery($column);
+                }
+            } catch (\InvalidArgumentException $e) {
+                return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+            }
+        }
+
         if (empty($definition['table_name']) && empty($definition['custom_query'])) {
             return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
         }
@@ -167,14 +193,19 @@ class DataQueryService
         ];
     }
 
-    protected function makeQuery(?string $queryCount, string $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
+    protected function makeQuery(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
     {
         try {
+            $query = $this->ensureStringQuery($query);
+            if ($queryCount !== null) {
+                $queryCount = $this->ensureStringQuery($queryCount);
+            }
+
             if (!empty($request->page)) {
                 if (empty($queryCount)) {
-                    $count = count(DB::select(DB::raw($query)));
+                    $count = count(DB::select($query));
                 } else {
-                    $dataCount = DB::select(DB::raw($queryCount));
+                    $dataCount = DB::select($queryCount);
                     $count = $dataCount[0]->aggregate;
                 }
 
@@ -183,27 +214,31 @@ class DataQueryService
                 $start = ($page - 1) * $perPage;
                 $query .= ' LIMIT ' . $start . ', ' . $perPage;
 
-                $data = DB::select(DB::raw($query));
+                $data = DB::select($query);
                 $dataResult = $this->paginate($data, $count, $perPage, $request->page);
             } else {
-                $data = DB::select(DB::raw($query));
+                $data = DB::select($query);
                 $dataResult = ['data' => $data];
             }
 
             if (!empty($request->isDebug) && $request->isDebug) {
-                $dataExplain = DB::select(DB::raw('explain ' . $query));
+                $explainQuery = $this->ensureStringQuery('explain ' . $query);
+                $dataExplain = DB::select($explainQuery);
 
                 if (!empty($definition['use_custom_query'])) {
                     $custom = collect(['data_index' => [], 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 } else {
-                    $dataIndex = DB::select(DB::raw('show index from ' . $definition['debug_index_table']));
+                    $indexQuery = $this->ensureStringQuery('show index from ' . $definition['debug_index_table']);
+                    $dataIndex = DB::select($indexQuery);
                     $custom = collect(['data_index' => $dataIndex, 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 }
             }
 
             return $dataResult;
+        } catch (\InvalidArgumentException $e) {
+            throw $e;
         } catch (\Exception $e) {
             return ['error' => $e->getMessage()];
         }
@@ -315,4 +350,30 @@ class DataQueryService
 
         return $normalized;
     }
+
+    protected function ensureStringQuery(mixed $query): string
+    {
+        if ($query instanceof \Illuminate\Database\Query\Expression) {
+            if (method_exists($query, 'getValue')) {
+                try {
+                    $query = $query->getValue(DB::getQueryGrammar());
+                } catch (\Throwable $e) {
+                    try {
+                        $query = $query->getValue();
+                    } catch (\Throwable $e2) {
+                        $query = (string) $query;
+                    }
+                }
+            } else {
+                $query = (string) $query;
+            }
+        }
+
+        if (!is_string($query)) {
+            throw new \InvalidArgumentException('Database query must be of type string, ' . (is_object($query) ? get_class($query) : gettype($query)) . ' given.');
+        }
+
+        return $query;
+    }
 }
+
