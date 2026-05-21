@@ -54,7 +54,7 @@ class DataSourcesServiceProvider extends ServiceProvider
                 Route::get('data-source/{id}/query', [DataSourceController::class, 'executeQuery'])
                     ->name('management.data-source.query');
                 Route::get('data-source/{id}', [DataSourceController::class, 'executeQuery'])
-                    ->name('management.data-source.query');
+                    ->name('management.data-source.api');
 
                 Route::apiResource('data-source', DataSourceController::class)
                     ->names($this->resourceRouteNames('management.data-source'));
@@ -92,13 +92,15 @@ class DataSourcesServiceProvider extends ServiceProvider
             ->as(config('datasources.routes.name', 'datasources.') . 'tenant.')
             ->group(function (): void {
                 Route::get('data-source-tenant/tables', [DataSourceController::class, 'listTables'])
-                    ->name('data-source.tables');
+                    ->name('data-source-tenant.tables');
                 Route::get('data-source-tenant/tables/{table}/columns', [DataSourceController::class, 'listColumns'])
-                    ->name('data-source.columns');
+                    ->name('data-source-tenant.columns');
                 Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
-                    ->name('data-source.query');
+                    ->name('data-source-tenant.query');
+                Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
+                    ->name('data-source-tenant.api');
                 Route::apiResource('data-source-tenant', DataSourceController::class)
-                    ->names($this->resourceRouteNames('data-source'));
+                    ->names($this->resourceRouteNames('data-source-tenant'));
             });
     }
 
