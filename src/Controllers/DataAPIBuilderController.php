@@ -34,13 +34,847 @@ class DataAPIBuilderController extends Controller
       {
 
         $dataApiBuilder = Cache::remember('list-api-configs', 60, function (){
-                return  ApiConfig::with('parentTable', 'childTables')->get()->toArray();
+                return  ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->get()->toArray();
         });
 
           return response()->json(['data' => $dataApiBuilder], 200);
       }
 
+    /**
+     * Export API configuration records as a pretty printed JSON file.
+     *
+     * @param Request $request
+     * @return \Symfony\Component\HttpFoundation\StreamedResponse
+     */
+    public function export(Request $request)
+    {
+        $ids = $this->normalizeSelectedIds($request->input('ids', []));
 
+        $query = ApiConfig::query()
+            ->with(['parentTable', 'childTables', 'permission', 'hook'])
+            ->orderBy('id');
+
+        if (! empty($ids)) {
+            $query->whereIn('id', $ids);
+        }
+
+        $payload = $query
+            ->get()
+            ->map(fn (ApiConfig $config): array => $this->serializeApiConfig($config))
+            ->values()
+            ->all();
+
+        $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+
+        if ($json === false) {
+            return response()->json([
+                'message' => 'Failed to generate export file.',
+            ], 500);
+        }
+
+        $filename = 'api-configs-' . now()->format('Y-m-d_His') . '.json';
+
+        return response()->streamDownload(
+            static function () use ($json): void {
+                echo $json;
+            },
+            $filename,
+            [
+                'Content-Type' => 'application/json',
+            ]
+        );
+    }
+
+    /**
+     * Import API configuration records from a JSON file.
+     *
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function import(Request $request)
+    {
+        $rows = $this->normalizeImportRowsFromRequest($request);
+
+        if ($rows === null) {
+            return response()->json([
+                'message' => 'Invalid JSON structure',
+            ], 422);
+        }
+
+        \Log::info('Import payload', ['rows' => $rows]);
+
+        $validator = Validator::make(['rows' => $rows], [
+            'rows' => ['required', 'array'],
+            'rows.*' => ['required', 'array'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Invalid JSON structure',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $summary = [
+            'selected' => count($rows),
+            'imported' => 0,
+            'skipped' => 0,
+            'failed' => 0,
+        ];
+
+        $errors = [];
+        $processedKeys = [];
+
+        DB::beginTransaction();
+
+        try {
+            foreach ($rows as $rowIndex => $row) {
+                $result = $this->importApiConfigRow(
+                    $row,
+                    $summary,
+                    $processedKeys,
+                    'import.json',
+                    $rowIndex + 1
+                );
+
+                if ($result !== null && isset($result['error'])) {
+                    $errors[] = $result['error'];
+                }
+            }
+
+            DB::commit();
+        } catch (\Throwable $exception) {
+            DB::rollBack();
+
+            \Log::error('IMPORT API CONFIGS => ' . $exception->getMessage());
+            \Log::error('IMPORT API CONFIGS => ' . (tenant()->id ?? 'tenant not found'));
+            \Log::error('IMPORT API CONFIGS => ' . $exception->getTraceAsString());
+
+            return response()->json([
+                'message' => 'Failed to import API configurations.',
+                'error' => $exception->getMessage(),
+            ], 422);
+        }
+
+        Cache::forget('list-api-configs');
+
+        return response()->json([
+            'status' => 200,
+            'message' => 'Import completed.',
+            'selected' => $summary['selected'],
+            'imported' => $summary['imported'],
+            'skipped' => $summary['skipped'],
+            'failed' => $summary['failed'],
+            'summary' => $summary,
+            'errors' => $errors,
+        ], 200);
+    }
+
+    /**
+     * Normalize selected record ids from request input.
+     *
+     * @param mixed $ids
+     * @return array<int, int|string>
+     */
+    protected function normalizeSelectedIds(mixed $ids): array
+    {
+        if (! is_array($ids)) {
+            return [];
+        }
+
+        return array_values(array_filter(
+            array_map(static function (mixed $id): int|string|null {
+                if (! is_int($id) && ! is_string($id)) {
+                    return null;
+                }
+
+                $trimmed = trim((string) $id);
+
+                if ($trimmed === '') {
+                    return null;
+                }
+
+                return ctype_digit($trimmed) ? (int) $trimmed : $trimmed;
+            }, $ids),
+            static fn (mixed $id): bool => $id !== null
+        ));
+    }
+
+    /**
+     * Normalize imported rows from request payload or uploaded JSON file.
+     *
+     * @param Request $request
+     * @return array<int, array<string, mixed>>|null
+     */
+    protected function normalizeImportRowsFromRequest(Request $request): ?array
+    {
+        $rows = $request->input('rows');
+
+        if (is_string($rows) && trim($rows) !== '') {
+            try {
+                $rows = json_decode($rows, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid rows JSON string', [
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return null;
+            }
+        } elseif ($request->hasFile('file')) {
+            $file = $request->file('file');
+            $contents = @file_get_contents($file->getRealPath());
+
+            if ($contents === false || trim($contents) === '') {
+                \Log::warning('IMPORT API CONFIGS => empty upload file', [
+                    'file_name' => $file->getClientOriginalName(),
+                ]);
+
+                return null;
+            }
+
+            try {
+                $rows = json_decode($contents, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid uploaded JSON file', [
+                    'file_name' => $file->getClientOriginalName(),
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return null;
+            }
+        } elseif (is_array($rows)) {
+            // Keep as-is.
+        } else {
+            return null;
+        }
+
+        if (! is_array($rows)) {
+            return null;
+        }
+
+        if (array_key_exists('rows', $rows) && is_array($rows['rows'])) {
+            $rows = $rows['rows'];
+        }
+
+        if ($rows === []) {
+            return [];
+        }
+
+        if (! $this->isSequentialArray($rows)) {
+            return null;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Resolve import rows from uploaded file or JSON payload.
+     *
+     * @param Request $request
+     * @return array<int, array<string, mixed>>|null
+     */
+    protected function resolveImportBatches(Request $request): ?array
+    {
+        $payload = $this->decodeImportPayload($request);
+
+        if ($payload !== null) {
+            $batches = $this->normalizeImportBatches($payload);
+
+            if ($batches !== null) {
+                return $batches;
+            }
+        }
+
+        $uploadedFiles = $request->file('files');
+
+        if ($uploadedFiles === null) {
+            $uploadedFiles = $request->file('file');
+        }
+
+        if ($uploadedFiles === null) {
+            \Log::warning('IMPORT API CONFIGS => missing rows payload and uploaded files');
+
+            return null;
+        }
+
+        if (! is_array($uploadedFiles)) {
+            $uploadedFiles = [$uploadedFiles];
+        }
+
+        $batches = [];
+
+        foreach ($uploadedFiles as $file) {
+            $contents = @file_get_contents($file->getRealPath());
+
+            if ($contents === false || trim($contents) === '') {
+                \Log::warning('IMPORT API CONFIGS => empty upload file', [
+                    'file_name' => $file->getClientOriginalName(),
+                ]);
+                return null;
+            }
+
+            try {
+                $decoded = json_decode($contents, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid JSON file', [
+                    'file_name' => $file->getClientOriginalName(),
+                    'error' => $exception->getMessage(),
+                ]);
+                return null;
+            }
+
+            $normalized = $this->normalizeImportBatches($decoded, $file->getClientOriginalName() ?: 'import.json');
+
+            if ($normalized === null) {
+                \Log::warning('IMPORT API CONFIGS => invalid JSON structure in file', [
+                    'file_name' => $file->getClientOriginalName(),
+                ]);
+                return null;
+            }
+
+            $batches = array_merge($batches, $normalized);
+        }
+
+        return $batches;
+    }
+
+    /**
+     * Decode the import payload from request rows/data fields.
+     *
+     * @param Request $request
+     * @return mixed
+     */
+    protected function decodeImportPayload(Request $request): mixed
+    {
+        foreach (['payload', 'rows', 'data'] as $key) {
+            $value = $request->input($key);
+
+            if (is_string($value) && trim($value) !== '') {
+                try {
+                    return json_decode($value, true, 512, JSON_THROW_ON_ERROR);
+                } catch (\JsonException $exception) {
+                    \Log::warning('IMPORT API CONFIGS => invalid JSON payload', [
+                        'field' => $key,
+                        'error' => $exception->getMessage(),
+                    ]);
+
+                    return null;
+                }
+            }
+
+            if (is_array($value)) {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Normalize an incoming payload into file batches.
+     *
+     * @param mixed $payload
+     * @param string|null $fallbackFileName
+     * @return array<int, array{file_name: string, rows: array<int, array<string, mixed>>}>|null
+     */
+    protected function normalizeImportBatches(mixed $payload, ?string $fallbackFileName = null): ?array
+    {
+        if (! is_array($payload)) {
+            return null;
+        }
+
+        if ($payload === []) {
+            return [];
+        }
+
+        if ($this->isAssocArray($payload)) {
+            if (isset($payload['files']) && is_array($payload['files'])) {
+                $batches = [];
+
+                foreach ($payload['files'] as $index => $filePayload) {
+                    $batch = $this->normalizeImportBatch($filePayload, $fallbackFileName, $index);
+
+                    if ($batch === null) {
+                        return null;
+                    }
+
+                    $batches[] = $batch;
+                }
+
+                return $batches;
+            }
+
+            if ($this->looksLikeApiConfigPayload($payload)) {
+                return [
+                    [
+                        'file_name' => $fallbackFileName ?: 'import.json',
+                        'rows' => [$payload],
+                    ],
+                ];
+            }
+
+            return null;
+        }
+
+        $batches = [];
+
+        foreach ($payload as $index => $item) {
+            if (! is_array($item)) {
+                return null;
+            }
+
+            if (isset($item['rows']) || isset($item['data']) || isset($item['items']) || isset($item['file_name']) || isset($item['source_file'])) {
+                $batch = $this->normalizeImportBatch($item, $fallbackFileName, $index);
+
+                if ($batch === null) {
+                    return null;
+                }
+
+                $batches[] = $batch;
+                continue;
+            }
+
+            $batch = $this->normalizeImportBatch([
+                'file_name' => $fallbackFileName ?: 'import.json',
+                'rows' => $payload,
+            ], $fallbackFileName, $index);
+
+            return $batch === null ? null : [$batch];
+        }
+
+        return $batches;
+    }
+
+    /**
+     * Normalize a single batch entry.
+     *
+     * @param mixed $batch
+     * @param string|null $fallbackFileName
+     * @param int|string $index
+     * @return array{file_name: string, rows: array<int, array<string, mixed>>}|null
+     */
+    protected function normalizeImportBatch(mixed $batch, ?string $fallbackFileName = null, int|string $index = 0): ?array
+    {
+        if (! is_array($batch)) {
+            return null;
+        }
+
+        $fileName = $fallbackFileName ?: 'import.json';
+
+        if (isset($batch['file_name']) && is_string($batch['file_name']) && trim($batch['file_name']) !== '') {
+            $fileName = trim($batch['file_name']);
+        } elseif (isset($batch['source_file']) && is_string($batch['source_file']) && trim($batch['source_file']) !== '') {
+            $fileName = trim($batch['source_file']);
+        } elseif ($fallbackFileName !== null) {
+            $fileName = $fallbackFileName;
+        } elseif (is_int($index) || is_string($index)) {
+            $fileName = 'import-' . $index . '.json';
+        }
+
+        $rows = $batch['rows'] ?? $batch['data'] ?? $batch['items'] ?? null;
+
+        if ($rows === null && $this->looksLikeApiConfigPayload($batch)) {
+            $rows = $this->expandLegacyApiConfigPayload($batch);
+        }
+
+        if (is_string($rows) && trim($rows) !== '') {
+            try {
+                $rows = json_decode($rows, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid nested rows JSON', [
+                    'file_name' => $fileName,
+                    'error' => $exception->getMessage(),
+                ]);
+
+                return null;
+            }
+        }
+
+        if (! is_array($rows)) {
+            return null;
+        }
+
+        if ($rows === []) {
+            return [
+                'file_name' => $fileName,
+                'rows' => [],
+            ];
+        }
+
+        if (! $this->isSequentialArray($rows)) {
+            $rows = [$rows];
+        }
+
+        return [
+            'file_name' => $fileName,
+            'rows' => $rows,
+        ];
+    }
+
+    /**
+     * Determine whether the payload looks like a single API config object.
+     *
+     * @param array<string, mixed> $payload
+     * @return bool
+     */
+    protected function looksLikeApiConfigPayload(array $payload): bool
+    {
+        return isset($payload['route_name'], $payload['endpoint'], $payload['method'])
+            || isset($payload['name'], $payload['base_url'])
+            || isset($payload['endpoints']) && is_array($payload['endpoints']);
+    }
+
+    /**
+     * Expand a legacy API config payload into one or more rows.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<int, array<string, mixed>>
+     */
+    protected function expandLegacyApiConfigPayload(array $payload): array
+    {
+        if (! isset($payload['endpoints']) || ! is_array($payload['endpoints']) || $payload['endpoints'] === []) {
+            return [$this->normalizeLegacyApiConfigPayload($payload)];
+        }
+
+        $rows = [];
+
+        foreach ($payload['endpoints'] as $endpointRow) {
+            if (! is_array($endpointRow)) {
+                continue;
+            }
+
+            $rows[] = $this->normalizeLegacyApiConfigPayload(array_merge($payload, $endpointRow));
+        }
+
+        return $rows === [] ? [$this->normalizeLegacyApiConfigPayload($payload)] : $rows;
+    }
+
+    /**
+     * Normalize legacy API config aliases to the persisted shape.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    protected function normalizeLegacyApiConfigPayload(array $payload): array
+    {
+        if (! isset($payload['route_name']) && isset($payload['name'])) {
+            $payload['route_name'] = $payload['name'];
+        }
+
+        if (! isset($payload['endpoint']) && isset($payload['base_url'])) {
+            $payload['endpoint'] = $payload['base_url'];
+        }
+
+        if (! isset($payload['method'])) {
+            $payload['method'] = 'GET';
+        }
+
+        if (! isset($payload['description']) && isset($payload['name'])) {
+            $payload['description'] = $payload['name'];
+        }
+
+        if (isset($payload['middlewares']) && is_string($payload['middlewares']) && trim($payload['middlewares']) !== '') {
+            try {
+                $payload['middlewares'] = json_decode($payload['middlewares'], true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid middlewares JSON', [
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        if (! isset($payload['middlewares']) && isset($payload['headers']) && is_array($payload['headers'])) {
+            $payload['middlewares'] = $payload['headers'];
+        }
+
+        if (isset($payload['params']) && is_string($payload['params']) && trim($payload['params']) !== '') {
+            try {
+                $payload['params'] = json_decode($payload['params'], true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid params JSON', [
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        if (isset($payload['params']) && is_object($payload['params'])) {
+            $payload['params'] = json_decode(json_encode($payload['params']), true);
+        }
+
+        if (! isset($payload['params']) && isset($payload['rules']) && is_array($payload['rules'])) {
+            $payload['params'] = $payload['rules'];
+        }
+
+        if (isset($payload['enabled']) && is_string($payload['enabled'])) {
+            $normalizedEnabled = filter_var($payload['enabled'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+            if ($normalizedEnabled !== null) {
+                $payload['enabled'] = $normalizedEnabled;
+            } elseif (is_numeric($payload['enabled'])) {
+                $payload['enabled'] = (int) $payload['enabled'];
+            }
+        }
+
+        if (! isset($payload['enabled']) && isset($payload['status'])) {
+            $payload['enabled'] = (bool) $payload['status'];
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Determine whether the array is sequential.
+     *
+     * @param array<mixed> $value
+     * @return bool
+     */
+    protected function isSequentialArray(array $value): bool
+    {
+        return array_keys($value) === range(0, count($value) - 1);
+    }
+
+    /**
+     * Determine whether the array is associative.
+     *
+     * @param array<mixed> $value
+     * @return bool
+     */
+    protected function isAssocArray(array $value): bool
+    {
+        return ! $this->isSequentialArray($value);
+    }
+
+    protected function importApiConfigRow(array $row, array &$batchSummary, array &$processedKeys, string $fileName, int $rowNumber): ?array
+    {
+        $payload = array_key_exists('data', $row) && is_array($row['data']) ? $row['data'] : $row;
+        $payload = $this->normalizeLegacyApiConfigPayload($payload);
+
+        if (! is_array($payload)) {
+            $batchSummary['failed']++;
+            $batchSummary['errors'][] = [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => 'Row must be a JSON object.',
+            ];
+
+            return [
+                'error' => [
+                    'file_name' => $fileName,
+                    'row' => $rowNumber,
+                    'message' => 'Row must be a JSON object.',
+                ],
+            ];
+        }
+
+        $validator = Validator::make($payload, [
+            'route_name' => ['required', 'string'],
+            'endpoint' => ['required', 'string'],
+            'method' => ['required', 'string'],
+            'description' => ['nullable', 'string'],
+            'middlewares' => ['nullable', 'array'],
+            'params' => ['nullable', 'array'],
+            'enabled' => ['required', function (string $attribute, mixed $value, \Closure $fail): void {
+                if (! is_bool($value) && ! is_int($value)) {
+                    $fail('The enabled field must be a boolean or integer.');
+                }
+            }],
+            'parent_table' => ['nullable', 'array'],
+            'child_tables' => ['nullable', 'array'],
+            'permission' => ['nullable'],
+            'hook' => ['nullable'],
+        ]);
+
+        if ($validator->fails()) {
+            $batchSummary['failed']++;
+            $batchSummary['errors'][] = [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => $validator->errors()->first(),
+            ];
+
+            return [
+                'error' => [
+                    'file_name' => $fileName,
+                    'row' => $rowNumber,
+                    'message' => $validator->errors()->first(),
+                ],
+            ];
+        }
+
+        $routeName = trim((string) $payload['route_name']);
+        $endpoint = $this->resolver->normalizeEndpoint((string) $payload['endpoint']);
+        $method = strtoupper((string) $payload['method']);
+        $duplicateKey = implode('|', [$routeName, $endpoint, $method]);
+
+        if (isset($processedKeys[$duplicateKey])) {
+            $batchSummary['skipped']++;
+
+            return null;
+        }
+
+        if ($this->resolver->isReservedEndpoint($endpoint)) {
+            $batchSummary['failed']++;
+            $batchSummary['errors'][] = [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => 'The endpoint conflicts with a reserved package route.',
+            ];
+
+            return [
+                'error' => [
+                    'file_name' => $fileName,
+                    'row' => $rowNumber,
+                    'message' => 'The endpoint conflicts with a reserved package route.',
+                ],
+            ];
+        }
+
+        $config = ApiConfig::query()
+            ->with(['parentTable', 'childTables', 'permission', 'hook'])
+            ->where('route_name', $routeName)
+            ->where('endpoint', $endpoint)
+            ->where('method', $method)
+            ->first();
+
+        $originalEndpoint = $config?->endpoint;
+        $originalMethod = $config?->method;
+
+        if (! $config) {
+            $config = new ApiConfig();
+        }
+
+        $config->fill([
+            'route_name' => $routeName,
+            'endpoint' => $endpoint,
+            'method' => $method,
+            'description' => array_key_exists('description', $payload) ? $payload['description'] : null,
+            'middlewares' => $this->normalizeMiddlewares($payload['middlewares'] ?? null),
+            'params' => $payload['params'] ?? null,
+            'enabled' => (bool) $payload['enabled'],
+        ]);
+        $config->save();
+
+        $this->syncApiConfigRelations($config, $payload);
+
+        Cache::forget('list-api-configs');
+        $this->resolver->forget($endpoint, $method);
+
+        if ($originalEndpoint && $originalMethod && ($originalEndpoint !== $endpoint || $originalMethod !== $method)) {
+            $this->resolver->forget($originalEndpoint, $originalMethod);
+        }
+
+        $processedKeys[$duplicateKey] = true;
+
+        $batchSummary['imported']++;
+
+        return null;
+    }
+
+    protected function syncApiConfigRelations(ApiConfig $config, array $payload): void
+    {
+        $config->loadMissing('parentTable');
+        $parentTable = $config->parentTable;
+
+        if (array_key_exists('parent_table', $payload)) {
+            if (is_array($payload['parent_table']) && ! empty($payload['parent_table'])) {
+                $parentTable = $config->parentTable()->updateOrCreate(
+                    ['api_config_id' => $config->id],
+                    [
+                        'parent_id' => 0,
+                        'table_name' => $payload['parent_table']['table_name'] ?? '',
+                        'primary_key' => $payload['parent_table']['primary_key'] ?? 'id',
+                        'foreign_key' => $payload['parent_table']['foreign_key'] ?? null,
+                        'data_params' => $payload['parent_table']['data_params'] ?? [],
+                    ]
+                );
+            } elseif ($config->parentTable) {
+                $config->parentTable()->delete();
+                $parentTable = null;
+            }
+        }
+
+        if (array_key_exists('child_tables', $payload)) {
+            $config->childTables()->delete();
+
+            if (is_array($payload['child_tables']) && $payload['child_tables'] !== []) {
+                $children = [];
+                $parentId = $parentTable?->id ?? $config->parentTable?->id ?? 0;
+
+                foreach ($payload['child_tables'] as $childTable) {
+                    if (! is_array($childTable)) {
+                        continue;
+                    }
+
+                    $children[] = new ApiTable([
+                        'parent_id' => $parentId,
+                        'table_name' => $childTable['table_name'] ?? '',
+                        'foreign_key' => $childTable['foreign_key'] ?? null,
+                        'data_params' => $childTable['data_params'] ?? [],
+                    ]);
+                }
+
+                if ($children !== []) {
+                    $config->childTables()->saveMany($children);
+                }
+            }
+        }
+
+        if (array_key_exists('permission', $payload)) {
+            $config->permission()->delete();
+
+            if (is_array($payload['permission']) && ! empty($payload['permission']['permission_string'] ?? null)) {
+                $config->permission()->create([
+                    'permission_string' => $payload['permission']['permission_string'],
+                ]);
+            } elseif (is_string($payload['permission']) && trim($payload['permission']) !== '') {
+                $config->permission()->create([
+                    'permission_string' => trim($payload['permission']),
+                ]);
+            }
+        }
+
+        if (array_key_exists('hook', $payload)) {
+            $config->hook()->delete();
+
+            if (is_array($payload['hook']) && ! empty($payload['hook'])) {
+                $config->hook()->create([
+                    'action_type' => $payload['hook']['action_type'] ?? null,
+                    'listener_class' => $payload['hook']['listener_class'] ?? null,
+                ]);
+            }
+        }
+    }
+
+    protected function serializeApiConfig(ApiConfig $config): array
+    {
+        return [
+            'route_name' => $config->route_name,
+            'endpoint' => $config->endpoint,
+            'method' => $config->method,
+            'description' => $config->description,
+            'middlewares' => $config->middlewares,
+            'params' => $config->params,
+            'enabled' => (bool) $config->enabled,
+            'parent_table' => $config->parentTable ? $this->serializeApiTable($config->parentTable) : null,
+            'child_tables' => $config->childTables->map(fn (ApiTable $table): array => $this->serializeApiTable($table))->values()->all(),
+            'permission' => $config->permission ? [
+                'permission_string' => $config->permission->permission_string,
+            ] : null,
+            'hook' => $config->hook ? [
+                'action_type' => $config->hook->action_type,
+                'listener_class' => $config->hook->listener_class,
+            ] : null,
+        ];
+    }
+
+    protected function serializeApiTable(ApiTable $table): array
+    {
+        return [
+            'table_name' => $table->table_name,
+            'primary_key' => $table->primary_key,
+            'foreign_key' => $table->foreign_key,
+            'data_params' => $table->data_params,
+        ];
+    }
 
     /**
      * Validate the details of an API Builder request.
@@ -255,7 +1089,10 @@ class DataAPIBuilderController extends Controller
   {
 
     $headers = $request->header('x-tenant');
-    $dataApiBuilder = ApiConfig::with('parentTable', 'childTables')->where('code', $id)->first();
+    $dataApiBuilder = ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->where('id', $id)->first();
+    if (empty($dataApiBuilder)) {
+        $dataApiBuilder = ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->where('code', $id)->first();
+    }
     if (empty($dataApiBuilder)) {
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
     }

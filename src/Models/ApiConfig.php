@@ -31,22 +31,22 @@ class ApiConfig extends Model
      * Define a relationship with the ApiPermission model.
      * Each API config belongs to a specific API permission.
      *
-     * @return \Illuminate\Database\Eloquent\Relations\BelongsTo
+     * @return \Illuminate\Database\Eloquent\Relations\HasOne
      */
     public function permission()
     {
-        return $this->belongsTo(ApiPermission::class);
+        return $this->hasOne(ApiPermission::class);
     }
 
     /**
      * Define a relationship with the ApiHook model.
      * Each API config is linked to a specific API hook.
      *
-     * @return \Illuminate\Database\Eloquent\Relations\BelongsTo
+     * @return \Illuminate\Database\Eloquent\Relations\HasOne
      */
     public function hook()
     {
-        return $this->belongsTo(ApiHook::class);
+        return $this->hasOne(ApiHook::class);
     }
 
     /**

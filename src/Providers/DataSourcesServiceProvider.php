@@ -55,6 +55,14 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-source.query');
                 Route::get('data-source/{id}', [DataSourceController::class, 'executeQuery'])
                     ->name('management.data-source.api');
+                Route::post('data-source/export', [DataSourceController::class, 'export'])
+                    ->name('management.data-source.export');
+                Route::post('data-source/import', [DataSourceController::class, 'import'])
+                    ->name('management.data-source.import');
+                Route::post('data-api-builder/export', [DataAPIBuilderController::class, 'export'])
+                    ->name('management.data-api-builder.export');
+                Route::post('data-api-builder/import', [DataAPIBuilderController::class, 'import'])
+                    ->name('management.data-api-builder.import');
 
                 Route::apiResource('data-source', DataSourceController::class)
                     ->names($this->resourceRouteNames('management.data-source'));

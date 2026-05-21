@@ -6,8 +6,11 @@ use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
 
 class DataSourceController extends Controller
 {
@@ -28,19 +31,246 @@ class DataSourceController extends Controller
   {
     $data = DataSource::with('parameters');
     if(!empty($request->page)){
-        $data = $data->paginate(10);
-        foreach ($data as $key => $value) {
-          $data[$key]->columns = json_decode($value->columns);
-        }
-        return $data;
+      return $data->paginate(10);
     }else{
-
-        $data = $data->get();
-        foreach ($data as $key => $value) {
-          $data[$key]->columns = json_decode($value->columns);
-        }
+      $data = $data->get();
     }
     return response()->json(['data' => $data], 200);
+  }
+
+  /**
+   * Export data source configurations as a pretty printed JSON file.
+   *
+   * @param Request $request
+   * @return \Symfony\Component\HttpFoundation\StreamedResponse
+   */
+  public function export(Request $request)
+  {
+    $ids = $this->normalizeSelectedIds($request->input('ids', []));
+    $columns = $this->exportableColumns();
+
+    $query = DataSource::query()->orderBy('id');
+
+    if (! empty($ids)) {
+      $query->whereIn('id', $ids);
+    }
+
+    $payload = $query->get($columns)
+      ->map(static function (DataSource $dataSource) use ($columns): array {
+        $row = [];
+
+        foreach ($columns as $column) {
+          $row[$column] = $dataSource->getAttribute($column);
+        }
+
+        return $row;
+      })
+      ->values()
+      ->all();
+
+    $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+
+    if ($json === false) {
+      return response()->json([
+        'message' => 'Failed to generate export file.',
+      ], 500);
+    }
+
+    $filename = 'data-sources-' . now()->format('Y-m-d_His') . '.json';
+
+    return response()->streamDownload(
+      static function () use ($json): void {
+        echo $json;
+      },
+      $filename,
+      [
+        'Content-Type' => 'application/json',
+      ]
+    );
+  }
+
+  /**
+   * Import data source configurations from JSON payload or uploaded file.
+   *
+   * @param Request $request
+   * @return \Illuminate\Http\JsonResponse
+   */
+  public function import(Request $request)
+  {
+    Log::info('IMPORT START', ['payload' => $request->all()]);
+
+    $rows = $request->input('rows');
+
+    if (is_string($rows)) {
+      try {
+        $rows = json_decode($rows, true, 512, JSON_THROW_ON_ERROR);
+      } catch (\JsonException $exception) {
+        return response()->json([
+          'message' => 'Invalid JSON format in rows payload',
+        ], 422);
+      }
+    }
+
+    if (! is_array($rows)) {
+      return response()->json([
+        'message' => 'Invalid import format: rows must be array',
+      ], 422);
+    }
+
+    Log::info('ROWS COUNT', ['count' => count($rows ?? [])]);
+    Log::info('ROWS DATA', ['rows' => $rows]);
+
+    $validation = Validator::make(['rows' => $rows], [
+      'rows' => ['required', 'array'],
+      'rows.*' => ['required', 'array'],
+    ]);
+
+    if ($validation->fails()) {
+      return response()->json([
+        'message' => $validation->errors()->first('rows') ?: 'Invalid import format: rows must be array',
+        'errors' => $validation->errors()->toArray(),
+      ], 422);
+    }
+
+    $summary = [
+      'selected' => count($rows),
+      'imported' => 0,
+      'skipped' => 0,
+      'failed' => 0,
+    ];
+
+    $errors = [];
+    $duplicateColumns = $this->duplicateColumns();
+    $insertedCount = 0;
+
+    try {
+      if (empty($rows)) {
+        return response()->json([
+          'message' => 'No data to import',
+        ], 422);
+      }
+
+      DB::beginTransaction();
+
+      foreach ($rows as $index => $row) {
+        $rowNumber = $index + 1;
+
+        Log::info('INSERT ROW', [
+          'row_number' => $rowNumber,
+          'row' => $row,
+        ]);
+
+        if (! is_array($row)) {
+          $summary['failed']++;
+          $errors[] = [
+            'row' => $rowNumber,
+            'message' => 'Row must be a JSON object.',
+          ];
+          continue;
+        }
+
+        $useCustomQuery = filter_var($row['use_custom_query'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        $row['use_custom_query'] = $useCustomQuery;
+        $row['columns'] = $this->normalizeColumnsInput($row['columns'] ?? []);
+
+        $validated = Validator::make($row, [
+          'name' => ['required', 'string'],
+          'use_custom_query' => ['required', 'boolean'],
+          'table_name' => [
+            'nullable',
+            Rule::requiredIf(fn () => ! $useCustomQuery),
+            'string',
+          ],
+          'columns' => ['required', 'array'],
+          'columns.*' => ['string'],
+          'custom_query' => ['nullable', 'string'],
+        ]);
+
+        if ($validated->fails()) {
+          $summary['failed']++;
+          $errors[] = [
+            'row' => $rowNumber,
+            'message' => $validated->errors()->first(),
+          ];
+          continue;
+        }
+
+        if (! empty($row['custom_query']) && ! DataSource::validateQuery((string) $row['custom_query'])) {
+          $summary['failed']++;
+          $errors[] = [
+            'row' => $rowNumber,
+            'message' => 'Only SELECT queries are allowed.',
+          ];
+          continue;
+        }
+
+        if ($this->hasDuplicateDataSource($row, $duplicateColumns)) {
+          $summary['skipped']++;
+          continue;
+        }
+
+        $data = [
+          'name' => $row['name'] ?? null,
+          'table_name' => $row['table_name'] ?? '',
+          'use_custom_query' => $useCustomQuery,
+          'columns' => $row['columns'] ?? [],
+          'custom_query' => $row['custom_query'] ?? null,
+        ];
+
+        try {
+          $dataSource = DataSource::create($data);
+          if ($dataSource && $dataSource->exists) {
+            $insertedCount++;
+            $summary['imported']++;
+          } else {
+            $summary['failed']++;
+            $errors[] = [
+              'row' => $rowNumber,
+              'message' => 'Insert did not persist the record.',
+            ];
+          }
+        } catch (\Throwable $exception) {
+          $summary['failed']++;
+          $errors[] = [
+            'row' => $rowNumber,
+            'message' => $exception->getMessage(),
+          ];
+          throw $exception;
+        }
+      }
+
+      DB::commit();
+    } catch (\Throwable $exception) {
+      DB::rollBack();
+
+      Log::error('IMPORT FAILED', [
+        'message' => $exception->getMessage(),
+        'trace' => $exception->getTraceAsString(),
+      ]);
+
+      return response()->json([
+        'message' => 'Import failed',
+        'error' => $exception->getMessage(),
+      ], 500);
+    }
+
+    Log::info('IMPORT COMPLETE', [
+      'selected' => $summary['selected'],
+      'inserted' => $insertedCount,
+      'imported' => $summary['imported'],
+      'skipped' => $summary['skipped'],
+      'failed' => $summary['failed'],
+    ]);
+
+    return response()->json([
+      'message' => 'Import success',
+      'selected' => $summary['selected'],
+      'inserted' => $insertedCount,
+      'imported' => $summary['imported'],
+      'skipped' => $summary['skipped'],
+      'failed' => $summary['failed'],
+      'errors' => $errors,
+    ], 200);
   }
 
 
@@ -53,13 +283,37 @@ class DataSourceController extends Controller
   */
   public function store(Request $request)
   {
+    $request->merge([
+      'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
+      'columns' => $this->normalizeColumnsInput($request->input('columns')),
+    ]);
+
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
       'name' => 'required|string|unique:data_sources,name',
-      'table_name' =>  ['nullable', 'required_if:use_custom_query,0', "string"],
-      'columns' => ['nullable', 'required_if:use_custom_query,0', "array"],
+      'table_name' => [
+        'nullable',
+        Rule::requiredIf(function () use ($request) {
+          return ! $request->boolean('use_custom_query');
+        }),
+        'string',
+      ],
+      'columns' => [
+        'nullable',
+        Rule::requiredIf(function () use ($request) {
+          return ! $request->boolean('use_custom_query');
+        }),
+        'array',
+      ],
+      'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
-      'custom_query' => ['nullable', 'required_if:use_custom_query,1', "string"],
+      'custom_query' => [
+        'nullable',
+        Rule::requiredIf(function () use ($request) {
+          return $request->boolean('use_custom_query');
+        }),
+        "string",
+      ],
     ]);
 
     if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
@@ -107,7 +361,7 @@ class DataSourceController extends Controller
       'name' => $validated['name'],
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
-      'columns' => json_encode($validated['columns']),
+      'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null
     ]);
 
@@ -131,7 +385,6 @@ class DataSourceController extends Controller
     if (empty($dataSource)) {
       return response()->json(['error' => 'Data source not found'], 422);
     }
-    $dataSource->columns = json_decode($dataSource->columns);
     return response()->json($dataSource);
   }
 
@@ -148,13 +401,37 @@ class DataSourceController extends Controller
     if (empty($dataSource)) {
       return response()->json(['error' => 'Data source not found'], 422);
     }
+    $request->merge([
+      'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
+      'columns' => $this->normalizeColumnsInput($request->input('columns')),
+    ]);
+
     $validated = $request->validate([
       'name' => 'required|string|unique:data_sources,name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
-      'table_name' =>  ['nullable', 'required_if:use_custom_query,0', "string"],
-      'columns' => ['nullable', 'required_if:use_custom_query,0', "array"],
+      'table_name' => [
+        'nullable',
+        Rule::requiredIf(function () use ($request) {
+          return ! $request->boolean('use_custom_query');
+        }),
+        'string',
+      ],
+      'columns' => [
+        'nullable',
+        Rule::requiredIf(function () use ($request) {
+          return $request->boolean('use_custom_query');
+        }),
+        'array',
+      ],
+      'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
-      'custom_query' => ['nullable', 'required_if:use_custom_query,1', "string"],
+      'custom_query' => [
+        'nullable',
+        Rule::requiredIf(function () use ($request) {
+          return $request->boolean('use_custom_query');
+        }),
+        "string",
+      ],
     ]);
 
     if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
@@ -203,7 +480,7 @@ class DataSourceController extends Controller
       'name' => $validated['name'],
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
-      'columns' => json_encode($validated['columns']??[]),
+      'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null
     ]);
 
@@ -235,6 +512,117 @@ class DataSourceController extends Controller
 
     DataSource::destroy($id);
     return response()->json(['message' => 'Data source deleted']);
+  }
+
+  /**
+   * Normalize selected record ids from request input.
+   *
+   * @param mixed $ids
+   * @return array<int, int|string>
+   */
+  protected function normalizeSelectedIds(mixed $ids): array
+  {
+    if (! is_array($ids)) {
+      return [];
+    }
+
+    return array_values(array_filter(
+      array_map(static function (mixed $id): int|string|null {
+        if (! is_int($id) && ! is_string($id)) {
+          return null;
+        }
+
+        $trimmed = trim((string) $id);
+
+        if ($trimmed === '') {
+          return null;
+        }
+
+        return ctype_digit($trimmed) ? (int) $trimmed : $trimmed;
+      }, $ids),
+      static fn (mixed $id): bool => $id !== null
+    ));
+  }
+
+  /**
+   * Get exportable columns from the data sources table.
+   *
+   * @return array<int, string>
+   */
+  protected function exportableColumns(): array
+  {
+    $columns = Schema::getColumnListing((new DataSource())->getTable());
+
+    return array_values(array_filter(
+      $columns,
+      static fn (string $column): bool => ! in_array($column, ['id', 'created_at', 'updated_at'], true)
+    ));
+  }
+
+  /**
+   * Determine the duplicate detection columns for data source imports.
+   *
+   * @return array<int, string>
+   */
+  protected function duplicateColumns(): array
+  {
+    $columns = Schema::getColumnListing((new DataSource())->getTable());
+
+    if (in_array('slug', $columns, true)) {
+      return ['slug'];
+    }
+
+    if (in_array('name', $columns, true)) {
+      return ['name'];
+    }
+
+    return [];
+  }
+
+  /**
+   * Check if the incoming row already exists.
+   *
+   * @param array<string, mixed> $row
+   * @param array<int, string> $duplicateColumns
+   * @return bool
+   */
+  protected function hasDuplicateDataSource(array $row, array $duplicateColumns): bool
+  {
+    if ($duplicateColumns === []) {
+      return false;
+    }
+
+    $query = DataSource::query();
+
+    foreach ($duplicateColumns as $column) {
+      if (! array_key_exists($column, $row) || $row[$column] === null || $row[$column] === '') {
+        return false;
+      }
+
+      $query->where($column, $row[$column]);
+    }
+
+    return $query->exists();
+  }
+
+  /**
+   * Normalize columns input so the rest of the controller can work with arrays only.
+   *
+   * @param mixed $columns
+   * @return array<int, mixed>
+   */
+  protected function normalizeColumnsInput(mixed $columns): array
+  {
+    if (is_string($columns)) {
+      $decoded = json_decode($columns, true);
+      $columns = is_array($decoded) ? $decoded : [];
+    }
+
+    if (! is_array($columns)) {
+      return [];
+    }
+
+    return $columns;
   }
 
   /**
