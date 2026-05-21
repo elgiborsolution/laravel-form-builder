@@ -97,7 +97,7 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('data-source-tenant.columns');
                 Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
                     ->name('data-source-tenant.query');
-                Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
+                Route::get('data-source-tenant/{id}', [DataSourceController::class, 'executeQuery'])
                     ->name('data-source-tenant.api');
                 Route::apiResource('data-source-tenant', DataSourceController::class)
                     ->names($this->resourceRouteNames('data-source-tenant'));
