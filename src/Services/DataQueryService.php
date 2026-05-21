@@ -156,7 +156,7 @@ class DataQueryService
         }
 
         $cacheKey = $definition['identifier'] . '_query_' . md5(
-            $query . json_encode($queryParams) . '-' . json_encode($queryParamWithOperator) . ($request->page ?? '0')
+            $query . json_encode($queryParams) . '-' . json_encode($queryParamWithOperator) . ($request->page ?? '0'). ($request->per_page ?? '0')
         );
 
         if (!empty($request->isDebug) && $request->isDebug) {
@@ -200,7 +200,6 @@ class DataQueryService
             if ($queryCount !== null) {
                 $queryCount = $this->ensureStringQuery($queryCount);
             }
-
             if (!empty($request->page)) {
                 if (empty($queryCount)) {
                     $count = count(DB::select($query));
