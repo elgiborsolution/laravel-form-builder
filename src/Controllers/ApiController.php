@@ -98,11 +98,36 @@ class ApiController extends Controller
         if ($middlewares === []) {
             return $destination($request);
         }
-// dd($middlewares);
+
+        $middlewares = $this->resolveMiddlewareDefinitions($middlewares);
+
         return $this->pipeline
             ->send($request)
             ->through($middlewares)
             ->then(fn (Request $request) => $destination($request));
+  }
+
+  /**
+   * Resolve middleware definitions using Laravel router middleware aliases and groups.
+   *
+   * @param array $middlewares
+   * @return array
+   */
+  protected function resolveMiddlewareDefinitions(array $middlewares): array
+  {
+        if (! app()->bound('router')) {
+            return $middlewares;
+        }
+
+        $router = app('router');
+
+        if (method_exists($router, 'resolveMiddleware')) {
+            return $router->resolveMiddleware($middlewares);
+        }
+
+        return collect($middlewares)
+            ->flatMap(fn ($middleware) => (array) $router->resolveMiddleware([$middleware]))
+            ->all();
   }
 
 
