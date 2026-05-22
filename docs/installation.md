@@ -31,6 +31,14 @@ Publish the package configuration:
 php artisan vendor:publish --provider="ESolution\DataSources\Providers\DataSourcesServiceProvider" --tag=datasources-config
 ```
 
+The published config includes the database connection setting:
+
+```php
+return [
+    'database_connection' => env('LARAVEL_FORM_BUILDER_DB_CONNECTION', env('DB_CONNECTION', 'mysql')),
+];
+```
+
 Publish the package migrations:
 
 ```bash
@@ -54,6 +62,16 @@ The migrations create the tables used by the builders, including:
 - `api_permissions`
 - `api_hooks`
 - `api_listeners`
+
+### Custom Database Connection
+
+If you want the package to store and read its tables from a different Laravel connection, set:
+
+```env
+LARAVEL_FORM_BUILDER_DB_CONNECTION=tenant
+```
+
+The package will then use the resolved connection for Eloquent models, query builder calls, raw queries, and migrations.
 
 ## Configure Routes
 
@@ -94,4 +112,3 @@ php artisan route:list | findstr api-config
 ```
 
 You should see management routes for data sources, data pickers, table builders, and API configs.
-

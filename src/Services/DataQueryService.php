@@ -4,16 +4,18 @@ namespace ESolution\DataSources\Services;
 
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 
 class DataQueryService
 {
+    protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'];
+
     public function executeForDataSource(Request $request, DataSource $dataSource, string $cacheKeyPrefix): JsonResponse
     {
         $definition = [
@@ -24,6 +26,7 @@ class DataQueryService
                     'type' => $param->param_type,
                     'required' => (bool) $param->is_required,
                     'default' => $param->param_default_value,
+                    'operator' => $param->operator ?? '=',
                 ];
             })->all(),
             'use_custom_query' => (bool) $dataSource->use_custom_query,
@@ -100,64 +103,47 @@ class DataQueryService
             return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
         }
 
-        $queryParams = [];
-        $queryParamWithOperator = [];
-        $paramsWithOperator = $request->params ?? [];
-
-        foreach ($paramsWithOperator as $value) {
-            if (!empty($value['param_name'])) {
-                $paramsWithOperator[$value['param_name']] = $value;
-            }
-        }
+        [$queryCount, $query] = $this->buildBaseQueries($definition);
+        $appliedFilters = [];
 
         foreach ($definition['parameters'] as $parameter) {
-            $paramName = $parameter['name'];
-            $paramValue = $request->get($paramName, $parameter['default']);
-
-            if ($parameter['required'] && $paramValue === null) {
-                return response()->json([
-                    'error' => "Parameter '$paramName' is required",
-                    'message' => "Parameter '$paramName' is required",
-                ], 422);
+            $field = (string) ($parameter['name'] ?? '');
+            if ($field === '') {
+                continue;
             }
 
-            $paramValue = $this->findFormatValue($parameter['type'], $paramValue);
-            $queryParams[$paramName] = $paramValue;
-
-            if (count($paramsWithOperator) > 0) {
-                $operatorParam = $paramsWithOperator[$paramName] ?? null;
-                if (!empty($operatorParam)) {
-                    $paramOpValue = $this->findFormatValue(
-                        $parameter['type'],
-                        $operatorParam['param_value'],
-                        strtolower((string) $operatorParam['param_operation']) === 'like'
-                    );
-
-                    $queryParamWithOperator[$paramName] = [
-                        'value' => $paramOpValue,
-                        'operator' => $operatorParam['param_operation'],
-                    ];
+            $operator = $this->normalizeFilterOperator((string) ($parameter['operator'] ?? '='));
+            $rawValue = $this->resolveFilterValue($request, $field, $parameter['default']);
+            if ($rawValue === null || $rawValue === '') {
+                if (($parameter['required'] ?? false) === true) {
+                    return response()->json([
+                        'error' => "Parameter '$field' is required",
+                        'message' => "Parameter '$field' is required",
+                    ], 422);
                 }
+
+                continue;
             }
+
+            $formattedValue = $this->findFormatValue(
+                $parameter['type'],
+                $rawValue,
+                false
+            );
+
+            $filterClause = $this->buildFilterClause($field, $operator, $formattedValue);
+            $query .= $filterClause;
+            $queryCount .= $filterClause;
+            $appliedFilters[] = [
+                'field' => $field,
+                'operator' => $operator,
+                'value' => $formattedValue,
+            ];
         }
 
-        [$queryCount, $query] = $this->buildBaseQueries($definition);
-
-        foreach ($queryParams as $key => $value) {
-            if (!empty($value) && $value != '') {
-                $query .= " AND $key = '" . $value . "'";
-                $queryCount .= " AND $key = '" . $value . "'";
-            }
-        }
-
-        foreach ($queryParamWithOperator as $key => $value) {
-            $query .= " AND $key " . $value['operator'] . " '" . $value['value'] . "'";
-            $queryCount .= " AND $key " . $value['operator'] . " '" . $value['value'] . "'";
-        }
-
-        $cacheKey = $definition['identifier'] . '_query_' . md5(
-            $query . json_encode($queryParams) . '-' . json_encode($queryParamWithOperator) . ($request->page ?? '0'). ($request->per_page ?? '0')
-        );
+        $cacheKey = DatabaseConnection::cachePrefix($definition['identifier'] . '_query_' . md5(
+            $query . '|' . $queryCount . '|' . json_encode($appliedFilters) . '|' . ($request->page ?? '0') . '|' . ($request->per_page ?? '0')
+        ));
 
         if (!empty($request->isDebug) && $request->isDebug) {
             $result = $this->makeQuery($queryCount, $query, $request, $definition);
@@ -202,9 +188,9 @@ class DataQueryService
             }
             if (!empty($request->page)) {
                 if (empty($queryCount)) {
-                    $count = count(DB::select($query));
+                    $count = count(DatabaseConnection::connection()->select($query));
                 } else {
-                    $dataCount = DB::select($queryCount);
+                    $dataCount = DatabaseConnection::connection()->select($queryCount);
                     $count = $dataCount[0]->aggregate;
                 }
 
@@ -213,23 +199,23 @@ class DataQueryService
                 $start = ($page - 1) * $perPage;
                 $query .= ' LIMIT ' . $start . ', ' . $perPage;
 
-                $data = DB::select($query);
+                $data = DatabaseConnection::connection()->select($query);
                 $dataResult = $this->paginate($data, $count, $perPage, $request->page);
             } else {
-                $data = DB::select($query);
+                $data = DatabaseConnection::connection()->select($query);
                 $dataResult = ['data' => $data];
             }
 
             if (!empty($request->isDebug) && $request->isDebug) {
                 $explainQuery = $this->ensureStringQuery('explain ' . $query);
-                $dataExplain = DB::select($explainQuery);
+                $dataExplain = DatabaseConnection::connection()->select($explainQuery);
 
                 if (!empty($definition['use_custom_query'])) {
                     $custom = collect(['data_index' => [], 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 } else {
                     $indexQuery = $this->ensureStringQuery('show index from ' . $definition['debug_index_table']);
-                    $dataIndex = DB::select($indexQuery);
+                    $dataIndex = DatabaseConnection::connection()->select($indexQuery);
                     $custom = collect(['data_index' => $dataIndex, 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 }
@@ -252,14 +238,18 @@ class DataQueryService
 
     protected function validateDetail(Request $request): ?JsonResponse
     {
-        $validateFilter = [
-            'param_name' => 'required',
-            'param_operation' => 'required',
-            'param_value' => 'required',
-        ];
+        foreach ($this->incomingFilters($request) as $key => $value) {
+            $normalizedFilter = [
+                'field' => $value['field'] ?? $value['param_name'] ?? $value['name'] ?? null,
+                'operator' => $value['operator'] ?? $value['param_operation'] ?? null,
+                'value' => $value['value'] ?? $value['param_value'] ?? null,
+            ];
 
-        foreach ($request->params ?? [] as $key => $value) {
-            $validator = Validator::make($value, $validateFilter);
+            $validator = Validator::make($normalizedFilter, [
+                'field' => 'required',
+                'operator' => 'required',
+                'value' => 'required',
+            ]);
 
             if ($validator->fails()) {
                 return response()->json([
@@ -267,9 +257,188 @@ class DataQueryService
                     'message' => 'Invalid payload params at row ' . strval(intval($key) + 1),
                 ], 400);
             }
+
+            $operator = strtoupper((string) $normalizedFilter['operator']);
+            if (! in_array($operator, self::ALLOWED_FILTER_OPERATORS, true)) {
+                return response()->json([
+                    'error' => "Invalid filter operator: {$operator}",
+                    'message' => "Invalid filter operator: {$operator}",
+                ], 400);
+            }
         }
 
         return null;
+    }
+
+    /**
+     * Resolve a filter payload for a given field from supported request shapes.
+     *
+     * @param Request $request
+     * @param string $field
+     * @return array<string, mixed>|null
+     */
+    protected function findFilterDefinition(Request $request, string $field): ?array
+    {
+        foreach ($this->incomingFilters($request) as $filter) {
+            if (! is_array($filter)) {
+                continue;
+            }
+
+            $filterField = (string) ($filter['field'] ?? $filter['param_name'] ?? $filter['name'] ?? '');
+
+            if ($filterField !== $field) {
+                continue;
+            }
+
+            return $filter;
+        }
+
+        return null;
+    }
+
+    /**
+     * Resolve the runtime value for a datasource field from query string or legacy filter payloads.
+     *
+     * @param Request $request
+     * @param string $field
+     * @param mixed $default
+     * @return mixed
+     */
+    protected function resolveFilterValue(Request $request, string $field, mixed $default = null): mixed
+    {
+        $value = $request->query($field);
+
+        if ($value === null) {
+            $value = $request->input($field);
+        }
+
+        if ($value !== null && $value !== '') {
+            return $value;
+        }
+
+        $rawFilter = $this->findFilterDefinition($request, $field);
+        if (is_array($rawFilter)) {
+            if (array_key_exists('value', $rawFilter) && $rawFilter['value'] !== null && $rawFilter['value'] !== '') {
+                return $rawFilter['value'];
+            }
+
+            if (array_key_exists('param_value', $rawFilter) && $rawFilter['param_value'] !== null && $rawFilter['param_value'] !== '') {
+                return $rawFilter['param_value'];
+            }
+        }
+
+        return $default;
+    }
+
+    /**
+     * Get incoming filters from either the new `filters` payload or the legacy `params` payload.
+     *
+     * @param Request $request
+     * @return array<int, array<string, mixed>>
+     */
+    protected function incomingFilters(Request $request): array
+    {
+        $filters = $request->input('filters', $request->input('params', []));
+
+        if (is_string($filters) && trim($filters) !== '') {
+            $decoded = json_decode($filters, true);
+            $filters = is_array($decoded) ? $decoded : [];
+        }
+
+        return is_array($filters) ? $filters : [];
+    }
+
+    /**
+     * Build a safe SQL filter clause using a whitelisted operator.
+     *
+     * @param string $field
+     * @param string $operator
+     * @param mixed $value
+     * @return string
+     */
+    protected function buildFilterClause(string $field, string $operator, mixed $value): string
+    {
+        $column = $this->sanitizeIdentifier($field);
+        $operator = $this->normalizeFilterOperator($operator);
+
+        return match ($operator) {
+            '=', '!=', '>', '<', '>=', '<=' => ' AND ' . $column . ' ' . $operator . ' ' . $this->quoteSqlValue($value),
+            'LIKE' => ' AND ' . $column . ' LIKE ' . $this->quoteSqlValue('%' . (string) $value . '%'),
+            'NOT LIKE' => ' AND ' . $column . ' NOT LIKE ' . $this->quoteSqlValue('%' . (string) $value . '%'),
+            default => ' AND ' . $column . ' = ' . $this->quoteSqlValue($value),
+        };
+    }
+
+    /**
+     * Validate and normalize a filter operator.
+     *
+     * @param string $operator
+     * @return string
+     */
+    protected function normalizeFilterOperator(string $operator): string
+    {
+        $operator = strtoupper(trim($operator));
+
+        if (! in_array($operator, self::ALLOWED_FILTER_OPERATORS, true)) {
+            throw new \InvalidArgumentException("Invalid filter operator: {$operator}");
+        }
+
+        return $operator;
+    }
+
+    /**
+     * Quote a SQL literal value using the active package connection.
+     *
+     * @param mixed $value
+     * @return string
+     */
+    protected function quoteSqlValue(mixed $value): string
+    {
+        if ($value === null) {
+            return 'NULL';
+        }
+
+        if (is_bool($value)) {
+            return $value ? '1' : '0';
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (string) $value;
+        }
+
+        $quoted = DatabaseConnection::connection()->getPdo()->quote((string) $value);
+
+        return $quoted !== false ? $quoted : "'" . str_replace("'", "''", (string) $value) . "'";
+    }
+
+    /**
+     * Sanitize a SQL identifier such as a column or dotted table.column reference.
+     *
+     * @param string $identifier
+     * @return string
+     */
+    protected function sanitizeIdentifier(string $identifier): string
+    {
+        $identifier = trim($identifier);
+
+        if ($identifier === '') {
+            throw new \InvalidArgumentException('Invalid filter field: empty identifier');
+        }
+
+        $segments = explode('.', $identifier);
+        $quotedSegments = [];
+
+        foreach ($segments as $segment) {
+            $segment = trim($segment, " \t\n\r\0\x0B`");
+
+            if ($segment === '' || ! preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $segment)) {
+                throw new \InvalidArgumentException("Invalid filter field: {$identifier}");
+            }
+
+            $quotedSegments[] = '`' . $segment . '`';
+        }
+
+        return implode('.', $quotedSegments);
     }
 
     protected function findFormatValue(string $type, mixed $paramValue, bool $isLike = false): mixed
@@ -355,7 +524,7 @@ class DataQueryService
         if ($query instanceof \Illuminate\Database\Query\Expression) {
             if (method_exists($query, 'getValue')) {
                 try {
-                    $query = $query->getValue(DB::getQueryGrammar());
+                    $query = $query->getValue(DatabaseConnection::connection()->getQueryGrammar());
                 } catch (\Throwable $e) {
                     try {
                         $query = $query->getValue();
@@ -375,4 +544,3 @@ class DataQueryService
         return $query;
     }
 }
-

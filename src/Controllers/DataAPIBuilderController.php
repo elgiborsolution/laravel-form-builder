@@ -3,15 +3,12 @@ namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Pagination\LengthAwarePaginator;
-use Illuminate\Support\Facades\Schema;
 use ESolution\DataSources\Models\ApiTable;
-use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Str;
@@ -33,7 +30,7 @@ class DataAPIBuilderController extends Controller
       public function index(Request $request)
       {
 
-        $dataApiBuilder = Cache::remember('list-api-configs', 60, function (){
+        $dataApiBuilder = Cache::remember($this->cacheKey('list-api-configs'), 60, function (){
                 return  ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->get()->toArray();
         });
 
@@ -125,7 +122,8 @@ class DataAPIBuilderController extends Controller
         $errors = [];
         $processedKeys = [];
 
-        DB::beginTransaction();
+        $connection = DatabaseConnection::connection();
+        $connection->beginTransaction();
 
         try {
             foreach ($rows as $rowIndex => $row) {
@@ -142,9 +140,9 @@ class DataAPIBuilderController extends Controller
                 }
             }
 
-            DB::commit();
+            $connection->commit();
         } catch (\Throwable $exception) {
-            DB::rollBack();
+            $connection->rollBack();
 
             \Log::error('IMPORT API CONFIGS => ' . $exception->getMessage());
             \Log::error('IMPORT API CONFIGS => ' . (tenant()->id ?? 'tenant not found'));
@@ -156,7 +154,7 @@ class DataAPIBuilderController extends Controller
             ], 422);
         }
 
-        Cache::forget('list-api-configs');
+        Cache::forget($this->cacheKey('list-api-configs'));
 
         return response()->json([
             'status' => 200,
@@ -755,7 +753,7 @@ class DataAPIBuilderController extends Controller
 
         $this->syncApiConfigRelations($config, $payload);
 
-        Cache::forget('list-api-configs');
+        Cache::forget($this->cacheKey('list-api-configs'));
         $this->resolver->forget($endpoint, $method);
 
         if ($originalEndpoint && $originalMethod && ($originalEndpoint !== $endpoint || $originalMethod !== $method)) {
@@ -983,7 +981,7 @@ class DataAPIBuilderController extends Controller
      } 
 
     $validated = $request->validate([
-      'route_name' => ['required', 'string', Rule::unique('api_configs', 'route_name')],
+      'route_name' => ['required', 'string', Rule::unique(DatabaseConnection::validationTable('api_configs'), 'route_name')],
       'endpoint' => [
           'required',
           'string',
@@ -992,7 +990,7 @@ class DataAPIBuilderController extends Controller
                   $fail('The endpoint conflicts with a reserved package route.');
               }
           },
-          Rule::unique('api_configs', 'endpoint')->where(
+          Rule::unique(DatabaseConnection::validationTable('api_configs'), 'endpoint')->where(
               fn ($query) => $query->where('method', strtoupper((string) $request->input('method')))
           ),
       ],
@@ -1016,7 +1014,8 @@ class DataAPIBuilderController extends Controller
 
         try {
 
-            \DB::beginTransaction();
+            $connection = DatabaseConnection::connection();
+            $connection->beginTransaction();
             $dataApiBuilder = ApiConfig::create([
               'route_name' => $validated['route_name'],
               'endpoint' => $validated['endpoint'],
@@ -1061,13 +1060,13 @@ class DataAPIBuilderController extends Controller
                  Artisan::call('make:listener '.$listenerName.' --event=AfterRunnerApiBuiderEvent');
              } 
 
-            \DB::commit();
-              Cache::forget('list-api-configs');
+            $connection->commit();
+              Cache::forget($this->cacheKey('list-api-configs'));
               $this->resolver->forget($validated['endpoint'], $validated['method']);
              return response()->json(["status" => 200, 'message' => 'Data api builder created', 'data'=>$dataApiBuilder], 201);
         } catch (\Exception $e) {
 
-            \DB::rollback();
+            $connection->rollBack();
 
             \Log::error("STORE API BUILDER=> " . $e->getMessage());
             \Log::error("STORE API BUILDER => " . (tenant()->id??'tenant not found'));
@@ -1133,7 +1132,7 @@ class DataAPIBuilderController extends Controller
     $originalMethod = $dataApiBuilder->method;
 
     $validated = $request->validate([
-      'route_name' => ['required', 'string', Rule::unique('api_configs', 'route_name')->ignore($dataApiBuilder->id)],
+      'route_name' => ['required', 'string', Rule::unique(DatabaseConnection::validationTable('api_configs'), 'route_name')->ignore($dataApiBuilder->id)],
       'endpoint' => [
           'required',
           'string',
@@ -1142,7 +1141,7 @@ class DataAPIBuilderController extends Controller
                   $fail('The endpoint conflicts with a reserved package route.');
               }
           },
-          Rule::unique('api_configs', 'endpoint')
+          Rule::unique(DatabaseConnection::validationTable('api_configs'), 'endpoint')
               ->where(fn ($query) => $query->where('method', strtoupper((string) $request->input('method'))))
               ->ignore($dataApiBuilder->id),
       ],
@@ -1165,7 +1164,8 @@ class DataAPIBuilderController extends Controller
 
         try {
 
-            \DB::beginTransaction();
+            $connection = DatabaseConnection::connection();
+            $connection->beginTransaction();
             $dataApiBuilder->update([
               'route_name' => $validated['route_name'],
               'endpoint' => $validated['endpoint'],
@@ -1213,14 +1213,14 @@ class DataAPIBuilderController extends Controller
              } 
 
 
-            \DB::commit();
-            Cache::forget('list-api-configs');
+            $connection->commit();
+            Cache::forget($this->cacheKey('list-api-configs'));
             $this->resolver->forget($originalEndpoint, $originalMethod);
             $this->resolver->forget($validated['endpoint'], $validated['method']);
             return response()->json(["status" => 200, 'message' => 'Data api builder updated', 'data'=>$dataApiBuilder], 200);
         } catch (\Exception $e) {
 
-            \DB::rollback();
+            $connection->rollBack();
 
             \Log::error("UPDATE API BUILDER=> " . $e->getMessage());
             \Log::error("UPDATE API BUILDER => " . (tenant()->id??'tenant not found'));
@@ -1252,8 +1252,13 @@ class DataAPIBuilderController extends Controller
         $this->resolver->forget($dataApiBuilder->endpoint, $dataApiBuilder->method);
         $dataApiBuilder->delete();
 
-        Cache::forget('list-api-configs');
+        Cache::forget($this->cacheKey('list-api-configs'));
         return response()->json(['message' => 'Data api builder deleted']);
+      }
+
+      protected function cacheKey(string $key): string
+      {
+            return DatabaseConnection::cachePrefix($key);
       }
 
       protected function buildRouteName(?string $endpoint, ?string $method): string

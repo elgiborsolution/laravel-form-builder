@@ -1,6 +1,8 @@
 <?php
 
 return [
+    'database_connection' => env('LARAVEL_FORM_BUILDER_DB_CONNECTION', env('DB_CONNECTION', 'mysql')),
+
     'cache' => [
         'dynamic_api_ttl' => 60,
     ],

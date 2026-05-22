@@ -2,13 +2,10 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataPicker;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Pagination\LengthAwarePaginator;
 
 class DataPickerController extends Controller
 {
@@ -36,8 +33,8 @@ class DataPickerController extends Controller
     if(!empty($headers)){
         tenancy()->initialize($headers);
         //if the tenant has table
-        if(Schema::hasTable('data_pickers')){
-          $dataPickerInTenant = DB::table('data_pickers')->get();
+        if(DatabaseConnection::schema()->hasTable('data_pickers')){
+          $dataPickerInTenant = DatabaseConnection::table('data_pickers')->get();
           $dataPickerInTenantMap = [];
           foreach ($dataPickerInTenant as $key => $value) { 
             $dataArray = json_decode(json_encode($value, true), true);
@@ -81,7 +78,7 @@ class DataPickerController extends Controller
         'type' => ["required" , "string", "in:text,number,date,checkbox,dropdown,radio"],
         'label' => 'required|string',
         'name' => 'required|string',
-        'operator' => ["required" , "string", "in:=,>,<,<=,>=,like,LIKE"],
+        'operator' => ["required" , "string", "in:=,!=,>,<,>=,<=,like,LIKE,not like,NOT LIKE"],
         'value' => 'nullable',
         'options' => 'nullable|array'
       ];
@@ -136,7 +133,7 @@ class DataPickerController extends Controller
   public function store(Request $request)
   {
     $validated = $request->validate([
-      'code' => 'required|string|unique:data_pickers,code',
+      'code' => 'required|string|unique:' . DatabaseConnection::validationTable('data_pickers') . ',code',
       'name' => 'required|string',
       'filters' => 'required|array',
       'columns' => 'required|array',
@@ -181,7 +178,7 @@ class DataPickerController extends Controller
 
     if(!empty($headers)){
         tenancy()->initialize($headers);
-        $dataPickerInTenant = DB::table('data_pickers')->where('code', $id)->first();
+        $dataPickerInTenant = DatabaseConnection::table('data_pickers')->where('code', $id)->first();
         if(!empty($dataPickerInTenant)) $dataPicker = $dataPickerInTenant;
     }
 
@@ -208,7 +205,7 @@ class DataPickerController extends Controller
     }
 
     $validated = $request->validate([
-      'code' => 'required|string|unique:data_pickers,code,'.$dataPicker->id,
+      'code' => 'required|string|unique:' . DatabaseConnection::validationTable('data_pickers') . ',code,'.$dataPicker->id,
       'name' => 'required|string',
       'filters' => 'required|array',
       'columns' => 'required|array',
@@ -226,7 +223,7 @@ class DataPickerController extends Controller
     $headers = $request->header('x-tenant');
     if(!empty($headers)){
         tenancy()->initialize($headers);
-        $dataPicker = DB::table('data_pickers')->updateOrInsert(
+        $dataPicker = DatabaseConnection::table('data_pickers')->updateOrInsert(
                                  [ 'code' => $validated['code'] ],
                                  [
                                    'name' => $validated['name'],
@@ -271,10 +268,10 @@ class DataPickerController extends Controller
     $headers = $request->header('x-tenant');
     if(!empty($headers)){
         tenancy()->initialize($headers);
-        $dataPickerInTenant = DB::table('data_pickers')->where('code', $id)->first();
+        $dataPickerInTenant = DatabaseConnection::table('data_pickers')->where('code', $id)->first();
         if(empty($dataPickerInTenant)) return response()->json(['error' => 'You not allowed to delete data central'], 400);
 
-        DB::table('data_pickers')->where('code', $id)->delete();
+        DatabaseConnection::table('data_pickers')->where('code', $id)->delete();
     
     }else{
 

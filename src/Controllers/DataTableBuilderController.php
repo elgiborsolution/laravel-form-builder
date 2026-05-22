@@ -2,13 +2,10 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataTableBuilder;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
-use Illuminate\Pagination\LengthAwarePaginator;
-use Illuminate\Support\Facades\Schema;
 
 class DataTableBuilderController extends Controller
 {
@@ -37,9 +34,9 @@ class DataTableBuilderController extends Controller
     if(!empty($headers)){
         tenancy()->initialize($headers);
         //if the tenant has table
-        if(Schema::hasTable('data_table_builders')){
+        if(DatabaseConnection::schema()->hasTable('data_table_builders')){
 
-            $dataTableBuilderInTenant = DB::table('data_table_builders')->get();
+            $dataTableBuilderInTenant = DatabaseConnection::table('data_table_builders')->get();
             $dataTableBuilderInTenantMap = [];
             foreach ($dataTableBuilderInTenant as $key => $value) { 
               $dataArray = json_decode(json_encode($value, true), true);
@@ -83,7 +80,7 @@ class DataTableBuilderController extends Controller
         'type' => ["required" , "string", "in:text,number,date,checkbox,dropdown,radio"],
         'label' => 'required|string',
         'name' => 'required|string',
-        'operator' => ["required" , "string", "in:=,>,<,<=,>=,like,LIKE"],
+        'operator' => ["required" , "string", "in:=,!=,>,<,>=,<=,like,LIKE,not like,NOT LIKE"],
         'value' => 'nullable',
         'options' => 'nullable|array'
       ];
@@ -156,7 +153,7 @@ class DataTableBuilderController extends Controller
   public function store(Request $request)
   {
     $validated = $request->validate([
-      'code' => 'required|string|unique:data_table_builders,code',
+      'code' => 'required|string|unique:' . DatabaseConnection::validationTable('data_table_builders') . ',code',
       'name' => 'required|string',
       'filters' => 'nullable|array',
       'columns' => 'required|array',
@@ -205,8 +202,8 @@ class DataTableBuilderController extends Controller
     if(!empty($headers)){
         tenancy()->initialize($headers);
         //if the tenant has table
-        if(Schema::hasTable('data_table_builders')){
-          $dataTableBuilderInTenant = DB::table('data_table_builders')->where('code', $id)->first();
+        if(DatabaseConnection::schema()->hasTable('data_table_builders')){
+          $dataTableBuilderInTenant = DatabaseConnection::table('data_table_builders')->where('code', $id)->first();
           if(!empty($dataTableBuilderInTenant)) $dataTableBuilder = $dataTableBuilderInTenant;
         }
     }
@@ -235,7 +232,7 @@ class DataTableBuilderController extends Controller
     }
 
     $validated = $request->validate([
-      'code' => 'required|string|unique:data_table_builders,code,'.$dataTableBuilder->id,
+      'code' => 'required|string|unique:' . DatabaseConnection::validationTable('data_table_builders') . ',code,'.$dataTableBuilder->id,
       'name' => 'required|string',
       'filters' => 'nullable|array',
       'columns' => 'required|array',
@@ -254,8 +251,8 @@ class DataTableBuilderController extends Controller
     if(!empty($headers)){
         tenancy()->initialize($headers);
         //if the tenant has table
-        if(Schema::hasTable('data_table_builders')){
-          $dataTableBuilder = DB::table('data_table_builders')->updateOrInsert(
+        if(DatabaseConnection::schema()->hasTable('data_table_builders')){
+          $dataTableBuilder = DatabaseConnection::table('data_table_builders')->updateOrInsert(
                                    [ 'code' => $validated['code'] ],
                                    [
                                      'name' => $validated['name'],
@@ -308,11 +305,11 @@ class DataTableBuilderController extends Controller
     if(!empty($headers)){
         tenancy()->initialize($headers);
         //if the tenant has table
-        if(Schema::hasTable('data_table_builders')){
-          $dataTableBuilderInTenant = DB::table('data_table_builders')->where('code', $id)->first();
+        if(DatabaseConnection::schema()->hasTable('data_table_builders')){
+          $dataTableBuilderInTenant = DatabaseConnection::table('data_table_builders')->where('code', $id)->first();
           if(empty($dataTableBuilderInTenant)) return response()->json(['error' => 'You not allowed to delete data central'], 400);
 
-          DB::table('data_table_builders')->where('code', $id)->delete();
+          DatabaseConnection::table('data_table_builders')->where('code', $id)->delete();
         }else{
 
           tenancy()->end();

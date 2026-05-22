@@ -3,6 +3,7 @@
 namespace ESolution\DataSources\Support;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Support\Facades\Cache;
 
 class DynamicApiConfigResolver
@@ -61,7 +62,7 @@ class DynamicApiConfigResolver
 
     public static function cacheKey(string $endpoint, string $method): string
     {
-        return 'datasources.dynamic_api.' . strtoupper($method) . '.' . md5(trim($endpoint, '/'));
+        return DatabaseConnection::cachePrefix('datasources.dynamic_api.' . strtoupper($method) . '.' . md5(trim($endpoint, '/')));
     }
 
     public function normalizeEndpoint(?string $endpoint): string
