@@ -3,10 +3,12 @@ namespace ESolution\DataSources\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use ESolution\DataSources\Support\Concerns\UsesPackageDatabaseConnection;
 
 class ApiPermission extends Model
 {
     use HasFactory;
+    use UsesPackageDatabaseConnection;
 
     /**
      * The attributes that are mass assignable.

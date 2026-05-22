@@ -4,10 +4,10 @@ namespace ESolution\DataSources\Controllers;
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pipeline\Pipeline;
-use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 
@@ -31,6 +31,11 @@ class ApiController extends Controller
   public function handleRequest(Request $request, string $dynamicPath): JsonResponse
   {
         $headers = $request->header('x-tenant');
+
+        if (!empty($headers)) {
+            tenancy()->initialize($headers);
+        }
+
         $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
         /** @var ApiConfig|null $apiConfigs */
         $apiConfigs = $resolvedRoute['config'];
@@ -38,11 +43,6 @@ class ApiController extends Controller
 
         if (empty($apiConfigs)) {
               return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
-        }
-
-        // if it has tenant
-        if(!empty($headers)){
-            tenancy()->initialize($headers);
         }
 
         return $this->runDynamicMiddlewarePipeline(
@@ -179,14 +179,15 @@ class ApiController extends Controller
           ], 400);
       }
 
-      $prefix = DB::getTablePrefix();
+      $connection = DatabaseConnection::connection();
+      $prefix = $connection->getTablePrefix();
       $childTables = $apiConfigs->childTables->toArray();
 
       // Flatten parameters for easier access
       $masterParam1Level = $this->flattenArray($apiConfigs->params);
 
       try {
-          \DB::beginTransaction();
+          $connection->beginTransaction();
           $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
           // Prepare parent table data for insertion
@@ -196,7 +197,7 @@ class ApiController extends Controller
           }
 
           // Insert data into the parent table and get the generated ID
-          $id = DB::table($cleanParentTable)->insertGetId($parentData);
+          $id = $connection->table($cleanParentTable)->insertGetId($parentData);
 
           $insertDataChild = [];
 
@@ -241,10 +242,10 @@ class ApiController extends Controller
 
           // Insert all child table data into the database
           foreach ($insertDataChild as $key => $value) {
-              DB::table($value['table'])->insert($value['table_values']);
+              $connection->table($value['table'])->insert($value['table_values']);
           }
 
-          \DB::commit();
+          $connection->commit();
           return response()->json([
               "status" => 200,
               'message' => 'Data has been successfully created',
@@ -252,7 +253,7 @@ class ApiController extends Controller
           ], 201);
 
       } catch (\Exception $e) {
-          \DB::rollback();
+          $connection->rollBack();
           \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
           return response()->json([
               "status" => 422,
@@ -306,13 +307,14 @@ class ApiController extends Controller
             return response()->json(['status' => 400, 'error' => 'Invalid Api Builder', 'message' => 'The input data for the parent table cannot be plural (cannot use an array parameter).'], 400);
         }
 
-        $prefix = DB::getTablePrefix();
+        $connection = DatabaseConnection::connection();
+        $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
         $masterParam1Level = $this->flattenArray($apiConfigs->params);
 
         try {
-            \DB::beginTransaction();
+            $connection->beginTransaction();
             $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
             // insert parent table
@@ -321,7 +323,7 @@ class ApiController extends Controller
                 $parentData[$column] = $this->getValueFromPath($request->all(), $paramPath);
             }
 
-            DB::table($cleanParentTable)
+            $connection->table($cleanParentTable)
                 ->where($primarykey, $id)
                 ->update($parentData);
 
@@ -364,15 +366,15 @@ class ApiController extends Controller
             }
 
             foreach ($insertDataChild as $key => $value) {
-              DB::table($value['table'])->where($value['foreign_key'], $id)->delete();
-              DB::table($value['table'])->insert($value['table_values']);
+              $connection->table($value['table'])->where($value['foreign_key'], $id)->delete();
+              $connection->table($value['table'])->insert($value['table_values']);
             }
 
 
-            \DB::commit();
+            $connection->commit();
             return response()->json(["status" => 200, 'message' => 'Data has been successfully updated', 'data' => []], 201);
         } catch (\Exception $e) {
-            \DB::rollback();
+            $connection->rollBack();
             \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
             return response()->json(["status" => 422, "data" => [], "error" => $e->getMessage()], 422);
         }
@@ -416,29 +418,30 @@ class ApiController extends Controller
         $parentTable = $apiConfigs->parentTable->table_name;
         $primarykey = $apiConfigs->parentTable->primary_key;
 
-        $prefix = DB::getTablePrefix();
+        $connection = DatabaseConnection::connection();
+        $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
         $masterParam1Level = $this->flattenArray($apiConfigs->params);
 
         try {
-            \DB::beginTransaction();
+            $connection->beginTransaction();
             $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
-            DB::table($cleanParentTable)
+            $connection->table($cleanParentTable)
                 ->where($primarykey, $id)
                 ->delete();
 
             foreach ($childTables as $key => $table) {
                 $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
-                DB::table($tableChild)->where($table['foreign_key'], $id)->delete();
+                $connection->table($tableChild)->where($table['foreign_key'], $id)->delete();
 
             }
 
-            \DB::commit();
+            $connection->commit();
             return response()->json(["status" => 200, 'message' => 'Data has been successfully deleted', 'data' => []], 201);
         } catch (\Exception $e) {
-            \DB::rollback();
+            $connection->rollBack();
             \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
             return response()->json(["status" => 422, "data" => [], "error" => $e->getMessage()], 422);
         }
@@ -536,7 +539,7 @@ class ApiController extends Controller
  */
 public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
 {
-    $prefix = DB::getTablePrefix(); // Get the database table prefix
+    $prefix = DatabaseConnection::connection()->getTablePrefix(); // Get the database table prefix
     $value = $rowParam;
 
     // Determine if the parameter is required or nullable

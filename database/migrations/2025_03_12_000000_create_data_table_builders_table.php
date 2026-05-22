@@ -3,11 +3,14 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use ESolution\DataSources\Support\DatabaseConnection;
 
 return new class extends Migration {
     public function up()
     {
-        Schema::create('data_table_builders', function (Blueprint $table) {
+        $schema = Schema::connection(DatabaseConnection::name());
+
+        $schema->create('data_table_builders', function (Blueprint $table) {
             $table->id();
             $table->string('code');
             $table->string('name');
@@ -21,6 +24,6 @@ return new class extends Migration {
 
     public function down()
     {
-        Schema::dropIfExists('data_table_builders');
+        Schema::connection(DatabaseConnection::name())->dropIfExists('data_table_builders');
     }
 };

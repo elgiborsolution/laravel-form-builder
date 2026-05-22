@@ -3,11 +3,14 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use ESolution\DataSources\Support\DatabaseConnection;
 
 return new class extends Migration {
     public function up()
     {
-        Schema::create('data_sources', function (Blueprint $table) {
+        $schema = Schema::connection(DatabaseConnection::name());
+
+        $schema->create('data_sources', function (Blueprint $table) {
             $table->id();
             $table->string('name');
             $table->string('table_name');
@@ -20,6 +23,6 @@ return new class extends Migration {
 
     public function down()
     {
-        Schema::dropIfExists('data_sources');
+        Schema::connection(DatabaseConnection::name())->dropIfExists('data_sources');
     }
 };

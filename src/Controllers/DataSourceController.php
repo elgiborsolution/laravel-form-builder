@@ -4,10 +4,9 @@ namespace ESolution\DataSources\Controllers;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
@@ -150,7 +149,8 @@ class DataSourceController extends Controller
         ], 422);
       }
 
-      DB::beginTransaction();
+      $connection = DatabaseConnection::connection();
+      $connection->beginTransaction();
 
       foreach ($rows as $index => $row) {
         $rowNumber = $index + 1;
@@ -239,9 +239,9 @@ class DataSourceController extends Controller
         }
       }
 
-      DB::commit();
+      $connection->commit();
     } catch (\Throwable $exception) {
-      DB::rollBack();
+      $connection->rollBack();
 
       Log::error('IMPORT FAILED', [
         'message' => $exception->getMessage(),
@@ -290,7 +290,7 @@ class DataSourceController extends Controller
 
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
-      'name' => 'required|string|unique:data_sources,name',
+      'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name',
       'table_name' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -324,6 +324,7 @@ class DataSourceController extends Controller
       'param_name' => 'required|string',
       'param_default_value' => 'nullable|string',
       'param_type' => ["required" , "string", "in:string,integer,boolean,date,float"],
+      'operator' => 'nullable|string|in:=,!=,>,<,>=,<=,LIKE,NOT LIKE,like,not like',
       'is_required' => 'nullable|integer',
     ];
     $dataParam = [];
@@ -351,6 +352,7 @@ class DataSourceController extends Controller
           $dataParam[] = [
                             'param_name' => $value,
                             'param_type' => 'string',
+                            'operator' => '=',
                             'is_required' => 0
                         ];
           $validated['columns'][] = $value;
@@ -407,7 +409,7 @@ class DataSourceController extends Controller
     ]);
 
     $validated = $request->validate([
-      'name' => 'required|string|unique:data_sources,name,'. $dataSource->id ,
+      'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
       'table_name' => [
         'nullable',
@@ -442,6 +444,7 @@ class DataSourceController extends Controller
       'param_name' => 'required|string',
       'param_default_value' => 'nullable|string',
       'param_type' => ["required" , "string", "in:string,integer,boolean,date,float"],
+      'operator' => 'nullable|string|in:=,!=,>,<,>=,<=,LIKE,NOT LIKE,like,not like',
       'is_required' => 'nullable|integer',
     ];
     $dataParam = [];
@@ -469,6 +472,7 @@ class DataSourceController extends Controller
           $dataParam[] = [
                             'param_name' => $value,
                             'param_type' => 'string',
+                            'operator' => '=',
                             'is_required' => 0
                         ];
           $validated['columns'][] = $value;
@@ -551,7 +555,7 @@ class DataSourceController extends Controller
    */
   protected function exportableColumns(): array
   {
-    $columns = Schema::getColumnListing((new DataSource())->getTable());
+    $columns = DatabaseConnection::schema()->getColumnListing((new DataSource())->getTable());
 
     return array_values(array_filter(
       $columns,
@@ -566,7 +570,7 @@ class DataSourceController extends Controller
    */
   protected function duplicateColumns(): array
   {
-    $columns = Schema::getColumnListing((new DataSource())->getTable());
+    $columns = DatabaseConnection::schema()->getColumnListing((new DataSource())->getTable());
 
     if (in_array('slug', $columns, true)) {
       return ['slug'];
@@ -642,7 +646,7 @@ class DataSourceController extends Controller
         tenancy()->initialize($headers);
     }
 
-    $tables = DB::select("SHOW TABLES");
+    $tables = DatabaseConnection::connection()->select("SHOW TABLES");
     // $databaseName = env('DB_DATABASE');
 
     // Laravel biasanya mengembalikan array dengan key yang berbeda tergantung pada driver
@@ -670,7 +674,7 @@ class DataSourceController extends Controller
     }
 
     try {
-      $columns = DB::select("SHOW COLUMNS FROM `$table`");
+      $columns = DatabaseConnection::connection()->select("SHOW COLUMNS FROM `$table`");
 
       $columnList = [];
       foreach ($columns as $column) {
@@ -699,15 +703,16 @@ class DataSourceController extends Controller
   * @return \Illuminate\Http\JsonResponse
   */
   public function executeQuery(Request $request, $id)
-  {
+  { 
     $headers = $request->header('x-tenant');
-    $dataSource = DataSource::with('parameters')->where('name', $id)->first();;
-    if (empty($dataSource)) {
-      return response()->json(['error' => 'Data source not found'], 422);
-    }
 
     if(!empty($headers)){
         tenancy()->initialize($headers);
+    }
+
+    $dataSource = DataSource::with('parameters')->where('name', $id)->first();
+    if (empty($dataSource)) {
+      return response()->json(['error' => 'Data source not found'], 422);
     }
 
     return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
@@ -785,7 +790,7 @@ class DataSourceController extends Controller
 
                 try {
 
-                  $columns = DB::select("SHOW COLUMNS FROM `$selectTable`");
+                  $columns = DatabaseConnection::connection()->select("SHOW COLUMNS FROM `$selectTable`");
                   $columnList = [];
                   foreach ($columns as $column) {
                     $dataColumnName[] = $column->Field;

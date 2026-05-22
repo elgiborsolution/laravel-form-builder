@@ -15,6 +15,7 @@ class DataSourcesServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'datasources');
+        $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'laravel-form-builder');
     }
 
     public function boot(): void

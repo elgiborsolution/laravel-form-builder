@@ -69,6 +69,20 @@ DATASOURCES_ROUTE_PREFIX=api
 DATASOURCES_ROUTE_VERSION=
 ```
 
+### 6. Configure the package database connection
+
+Set the connection the package should use for its models, queries, and migrations:
+
+```env
+LARAVEL_FORM_BUILDER_DB_CONNECTION=tenant
+```
+
+The package will fall back to `DB_CONNECTION` and then `mysql` when this variable is not set. You can also read the resolved value from config:
+
+```php
+config('laravel-form-builder.database_connection')
+```
+
 ## Quick Start
 
 1. Create a data source for your table or custom SQL.
@@ -135,4 +149,3 @@ If you are documenting the package for your team, start with:
 1. [Getting Started](docs/getting-started.md)
 2. [Data API Builder](docs/data-api-builder.md)
 3. [Form Builder](docs/form-builder.md)
-

@@ -3,12 +3,15 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use ESolution\DataSources\Support\DatabaseConnection;
 
 return new class extends Migration {
     public function up()
     {
+        $schema = Schema::connection(DatabaseConnection::name());
+
         // Table for API configurations
-        Schema::create('api_configs', function (Blueprint $table) {
+        $schema->create('api_configs', function (Blueprint $table) {
             $table->id();
             $table->string('route_name', 250); // Route prefix
             $table->string('endpoint', 250);
@@ -20,7 +23,7 @@ return new class extends Migration {
         });
 
         // Table for affected table api configurations
-        Schema::create('api_tables', function (Blueprint $table) {
+        $schema->create('api_tables', function (Blueprint $table) {
             $table->id();
             $table->foreignId('api_config_id')->references('id')->on('api_configs')->onDelete('cascade');
             $table->integer('parent_id')->default(0);
@@ -32,14 +35,14 @@ return new class extends Migration {
         });
         
         // Table for permissions
-        Schema::create('api_permissions', function (Blueprint $table) {
+        $schema->create('api_permissions', function (Blueprint $table) {
             $table->id();
             $table->foreignId('api_config_id')->references('id')->on('api_configs')->onDelete('cascade');
             $table->string('permission_string'); // e.g., "post.create", "user.delete"
             $table->timestamps();
         });
         // Table for hooks (before/after create, update, delete)
-        Schema::create('api_hooks', function (Blueprint $table) {
+        $schema->create('api_hooks', function (Blueprint $table) {
             $table->id();
             $table->foreignId('api_config_id')->references('id')->on('api_configs')->onDelete('cascade');
             $table->string('action_type'); // before_create, after_create, etc.
@@ -50,9 +53,11 @@ return new class extends Migration {
 
     public function down()
     {
-        Schema::dropIfExists('api_configs');
-        Schema::dropIfExists('api_tables');
-        Schema::dropIfExists('api_permissions');
-        Schema::dropIfExists('api_hooks');
+        $schema = Schema::connection(DatabaseConnection::name());
+
+        $schema->dropIfExists('api_configs');
+        $schema->dropIfExists('api_tables');
+        $schema->dropIfExists('api_permissions');
+        $schema->dropIfExists('api_hooks');
     }
 };
