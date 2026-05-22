@@ -98,14 +98,6 @@ Response example:
 }
 ```
 
-## Screenshots
-
-> Screenshot placeholder: Data Source Builder
->
-> Screenshot placeholder: Data API Builder
->
-> Screenshot placeholder: Form Builder
-
 ## Documentation
 
 - [Installation](docs/installation.md)
