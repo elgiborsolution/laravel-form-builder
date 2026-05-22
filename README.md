@@ -1,89 +1,146 @@
-# 🚀 Laravel Form Builder Package
+# Laravel Form Builder
 
-**Laravel Form Builder** is a package that allows developers to create dynamic APIs without writing manual queries in the backend. With this package, the frontend can retrieve data from the database without requiring a new API for each request.
+Laravel Form Builder is a backend package for building dynamic data sources, reusable API configurations, and form-driven CRUD flows without writing a new controller for every use case. It is designed for teams that want a configurable, JSON-friendly builder layer on top of Laravel.
 
----
+## Live Demo
 
-## 📦 Features
-✅ **CRUD operations** for Data Sources  
-✅ **Dynamic queries** based on tables, columns, and parameters  
-✅ Supports **custom queries** (only `SELECT` queries allowed)  
-✅ **Caching** for improved query performance  
-✅ API to get **list of tables** and **list of columns** from the database  
-✅ Easy installation as a **Laravel Package**  
+https://esbuilder.web.app
 
----
+## GitHub Repository
 
-## 🛠 Installation
+https://github.com/elgiborsolution/laravel-form-builder.git
 
-### **1️⃣ Add the Package to Laravel**
+## Table of Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Screenshots](#screenshots)
+- [Documentation](#documentation)
+- [Architecture](#architecture)
+- [Support](#support)
+
+## Features
+
+- Dynamic form builder
+- Data source builder
+- API builder
+- Import/export configuration
+- Middleware support
+- Dynamic validation
+- Custom query support
+- Reusable API configuration
+- JSON-based configuration
+- Dynamic select datasource
+- Form API integration
+
+## Installation
+
+### 1. Require the package
 
 ```bash
 composer require elgibor-solution/laravel-form-builder
 ```
 
----
+### 2. Publish configuration
 
-### **2️⃣ Publish and Run Migrations**
+```bash
+php artisan vendor:publish --provider="ESolution\DataSources\Providers\DataSourcesServiceProvider" --tag=datasources-config
+```
+
+### 3. Publish migrations
+
+```bash
+php artisan vendor:publish --provider="ESolution\DataSources\Providers\DataSourcesServiceProvider" --tag=datasources-migrations
+```
+
+### 4. Run migrations
+
 ```bash
 php artisan migrate
 ```
 
-To publish migration files to your Laravel project:
-```bash
-php artisan vendor:publish --provider="ESolution\DataSources\Providers\DataSourcesServiceProvider" --tag=migrations
+### 5. Verify route prefix
+
+By default, package routes are registered under the `api` prefix. You can adjust this in `config/datasources.php` or with environment variables such as:
+
+```env
+DATASOURCES_ROUTE_PREFIX=api
+DATASOURCES_ROUTE_VERSION=
 ```
 
----
+## Quick Start
 
-## 📌 API Endpoints
+1. Create a data source for your table or custom SQL.
+2. Create an API config if you need a public dynamic endpoint.
+3. Use the form builder to define fields and bind select options.
+4. Call the generated endpoint from your frontend or server-to-server integration.
 
-### **1️⃣ Get All Data Sources**
+Example:
+
 ```http
-GET /api/data-sources
+GET /api/data-source/users-list/query?page=1&per_page=10
 ```
 
-### **2️⃣ Create a New Data Source**
-```http
-POST /api/data-sources
-Content-Type: application/json
-```
-**Body:**
+Response example:
+
 ```json
 {
-    "name": "Users List",
-    "table_name": "users",
-    "use_custom_query": false,
-    "columns": ["id", "name", "email"]
+  "current_page": 1,
+  "data": [
+    {
+      "id": 1,
+      "name": "Alice",
+      "email": "alice@example.com"
+    }
+  ],
+  "total": 1
 }
 ```
 
-### **3️⃣ Execute Query from a Data Source**
-```http
-GET /api/data-sources/{id}/query
-```
+## Screenshots
 
-### **4️⃣ Get All Tables in the Database**
-```http
-GET /api/data-sources/tables
-```
+> Screenshot placeholder: Data Source Builder
+>
+> Screenshot placeholder: Data API Builder
+>
+> Screenshot placeholder: Form Builder
 
-### **5️⃣ Get All Columns from a Table**
-```http
-GET /api/data-sources/tables/{table}/columns
-```
+## Documentation
 
----
+- [Installation](docs/installation.md)
+- [Getting Started](docs/getting-started.md)
+- [Data Source](docs/data-source.md)
+- [Data API Builder](docs/data-api-builder.md)
+- [Form Builder](docs/form-builder.md)
+- [Import / Export](docs/import-export.md)
+- [Authentication](docs/authentication.md)
+- [Examples](docs/examples.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [FAQ](docs/faq.md)
 
-## ⚡ Technologies Used
-- **Laravel 8+**
-- **MySQL / PostgreSQL**
-- **Redis Cache**
+## Architecture
 
----
+The package is organized around a small set of backend layers:
 
-## 🤝 Contributing
-If you’d like to contribute to this project, feel free to fork the repository and submit a pull request! 🚀
+- `Controllers` accept management requests for builders and runtime API requests.
+- `Models` store the configuration records such as data sources, API configs, listeners, permissions, and mappings.
+- `Services` turn configuration into executable queries.
+- `Support` classes resolve dynamic routes and normalize endpoint lookups.
+- `Providers` register routes, migrations, and configuration.
 
----
-✌ **Happy Coding!**
+High-level flow:
+
+1. A developer creates a builder configuration.
+2. The configuration is persisted in Laravel models and database tables.
+3. The runtime route resolver finds the matching API config.
+4. The query service validates input, builds SQL, and returns the response.
+
+## Support
+
+If you are documenting the package for your team, start with:
+
+1. [Getting Started](docs/getting-started.md)
+2. [Data API Builder](docs/data-api-builder.md)
+3. [Form Builder](docs/form-builder.md)
+
