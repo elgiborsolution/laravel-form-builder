@@ -655,7 +655,7 @@ class DataSourceController extends Controller
       $tableList[] = array_values((array) $table)[0];
     }
 
-    return response()->json($tableList);
+    return response()->json(['data' => $tableList]);
   }
 
   /**
@@ -687,7 +687,7 @@ class DataSourceController extends Controller
         ];
       }
 
-      return response()->json($columnList);
+      return response()->json(['data' => $columnList]);
     } catch (\Exception $e) {
       return response()->json(['error' => 'Table not found'], 404);
     }
