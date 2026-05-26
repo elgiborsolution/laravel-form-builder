@@ -9,10 +9,18 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pipeline\Pipeline;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\DatabasePresenceVerifier;
 
 class ApiController extends Controller
 {
+    /**
+     * Track whether the request is already running inside the datasource
+     * validation connection scope.
+     */
+    protected bool $datasourceValidationConnectionActive = false;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DataQueryService $dataQueryService,
@@ -36,20 +44,22 @@ class ApiController extends Controller
             tenancy()->initialize($headers);
         }
 
-        $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
-        /** @var ApiConfig|null $apiConfigs */
-        $apiConfigs = $resolvedRoute['config'];
-        $id = $resolvedRoute['id'];
+        return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
+            $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
+            /** @var ApiConfig|null $apiConfigs */
+            $apiConfigs = $resolvedRoute['config'];
+            $id = $resolvedRoute['id'];
 
-        if (empty($apiConfigs)) {
-              return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
-        }
+            if (empty($apiConfigs)) {
+                return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
+            }
 
-        return $this->runDynamicMiddlewarePipeline(
-            $request,
-            $apiConfigs,
-            fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
-        );
+            return $this->runDynamicMiddlewarePipeline(
+                $request,
+                $apiConfigs,
+                fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
+            );
+        });
   }
 
   protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
@@ -141,12 +151,13 @@ class ApiController extends Controller
   */
   public function store(Request $request, $apiConfigs)
   {
+      $connection = DatabaseConnection::connection();
       // Validate input data based on API configurations
       $checkValidateRule = $this->validateRule($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
 
       // Validate parent-level parameters
       if (count($checkValidateRule['parentValidate']) > 0) {
-          $validated = $request->validate($checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
       }
 
       // Validate child-level parameters
@@ -154,7 +165,7 @@ class ApiController extends Controller
           foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
               foreach ($request[$key] ?? [] as $keyParam => $valueParam) {
                   // Perform validation on each child record
-                  $validator = Validator::make($valueParam, $valueValidateRule);
+                  $validator = $this->makeDatasourceValidator($valueParam, $valueValidateRule);
                   if ($validator->fails()) {
                       return response()->json([
                           'error' => $validator->errors(),
@@ -179,7 +190,6 @@ class ApiController extends Controller
           ], 400);
       }
 
-      $connection = DatabaseConnection::connection();
       $prefix = $connection->getTablePrefix();
       $childTables = $apiConfigs->childTables->toArray();
 
@@ -281,7 +291,7 @@ class ApiController extends Controller
 
         if(count($checkValidateRule['parentValidate']) > 0){
           
-          $validated = $request->validate($checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
         }
 
         if(count($checkValidateRule['childValidate']) > 0){
@@ -289,7 +299,7 @@ class ApiController extends Controller
             foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
 
                 foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = Validator::make($valueParam,  $valueValidateRule);
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule);
                     if ($validator->fails()) {
                         return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
                     }
@@ -397,7 +407,7 @@ class ApiController extends Controller
 
         if(count($checkValidateRule['parentValidate']) > 0){
           
-          $validated = $request->validate($checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
         }
 
         if(count($checkValidateRule['childValidate']) > 0){
@@ -405,7 +415,7 @@ class ApiController extends Controller
             foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
 
                 foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = Validator::make($valueParam,  $valueValidateRule);
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule);
                     if ($validator->fails()) {
                         return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
                     }
@@ -558,6 +568,83 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
     }
 
     return $dataValidate; // Return the validation rule string
+}
+
+/**
+ * Validate payload using the package datasource connection.
+ *
+ * @param array $data
+ * @param array $rules
+ * @return array<string, mixed>
+ */
+protected function validateWithDatasourceConnection(array $data, array $rules): array
+{
+    return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
+        return Validator::make($data, $rules)->validate();
+    });
+}
+
+/**
+ * Build a validator instance bound to the package datasource connection.
+ *
+ * @param array $data
+ * @param array $rules
+ * @return \Illuminate\Contracts\Validation\Validator
+ */
+protected function makeDatasourceValidator(array $data, array $rules)
+{
+    return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
+        return Validator::make($data, $rules);
+    });
+}
+
+/**
+ * Temporarily switch the default database connection and presence verifier
+ * so database validation rules run against the active datasource connection.
+ *
+ * @template TReturn
+ * @param \Closure():TReturn $callback
+ * @return mixed
+ */
+protected function withDatasourceValidationConnection(\Closure $callback)
+{
+    if ($this->datasourceValidationConnectionActive) {
+        return $callback();
+    }
+
+    $connectionName = DatabaseConnection::name();
+    $databaseManager = app('db');
+    $validatorFactory = app('validator');
+    $previousDefaultConnection = DB::getDefaultConnection();
+    $previousPresenceVerifier = method_exists($validatorFactory, 'getPresenceVerifier')
+        ? $validatorFactory->getPresenceVerifier()
+        : null;
+
+    $this->datasourceValidationConnectionActive = true;
+    try {
+        config(['database.default' => $connectionName]);
+        $databaseManager->setDefaultConnection($connectionName);
+        DB::setDefaultConnection($connectionName);
+
+        // Refresh the connection so any runtime tenancy changes are picked up
+        // before validation touches the database.
+        $databaseManager->purge($connectionName);
+
+        $presenceVerifier = new DatabasePresenceVerifier($databaseManager);
+        $presenceVerifier->setConnection($connectionName);
+        $validatorFactory->setPresenceVerifier($presenceVerifier);
+
+        return $callback();
+    } finally {
+        if ($previousPresenceVerifier !== null) {
+            $validatorFactory->setPresenceVerifier($previousPresenceVerifier);
+        }
+
+        config(['database.default' => $previousDefaultConnection]);
+        $databaseManager->setDefaultConnection($previousDefaultConnection);
+        DB::setDefaultConnection($previousDefaultConnection);
+        $this->datasourceValidationConnectionActive = false;
+    }
 }
 
 /**

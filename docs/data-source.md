@@ -7,6 +7,7 @@
 - [Endpoints](#endpoints)
 - [Filtering and Pagination](#filtering-and-pagination)
 - [Custom Query Mode](#custom-query-mode)
+- [Contoh Response](#contoh-response)
 - [Examples](#examples)
 - [Screenshot Placeholder](#screenshot-placeholder)
 
@@ -106,6 +107,101 @@ Example:
 }
 ```
 
+## Contoh Response
+
+Gunakan struktur berikut sebagai contoh response yang konsisten dengan output backend terbaru.
+
+### Non paginate
+
+Jika `columns` bernilai:
+
+```json
+["id", "name"]
+```
+
+Maka response non paginate:
+
+```json
+{
+  "data": [
+    {
+      "id": 6,
+      "name": "BARU"
+    },
+    {
+      "id": 7,
+      "name": "BEKAS"
+    },
+    {
+      "id": 8,
+      "name": "AKAN DIREKONDISI"
+    },
+    {
+      "id": 9,
+      "name": "TELAH DIREKONDISI"
+    }
+  ]
+}
+```
+
+### Paginate
+
+Jika paginate aktif, response akan mengikuti format paginator Laravel:
+
+```json
+{
+  "current_page": 1,
+  "data": [
+    {
+      "id": 6,
+      "name": "BARU"
+    },
+    {
+      "id": 7,
+      "name": "BEKAS"
+    },
+    {
+      "id": 8,
+      "name": "AKAN DIREKONDISI"
+    },
+    {
+      "id": 9,
+      "name": "TELAH DIREKONDISI"
+    }
+  ],
+  "first_page_url": "/?page=1",
+  "from": 1,
+  "last_page": 1,
+  "last_page_url": "/?page=1",
+  "links": [
+    {
+      "url": null,
+      "label": "« Sebelumnya",
+      "page": null,
+      "active": false
+    },
+    {
+      "url": "/?page=1",
+      "label": "1",
+      "page": 1,
+      "active": true
+    },
+    {
+      "url": null,
+      "label": "Berikutnya »",
+      "page": null,
+      "active": false
+    }
+  ],
+  "next_page_url": null,
+  "path": "/",
+  "per_page": 10,
+  "prev_page_url": null,
+  "to": 4,
+  "total": 4
+}
+```
+
 ## Examples
 
 ### Table-based data source
@@ -148,4 +244,3 @@ Example:
 ## Screenshot Placeholder
 
 > Screenshot placeholder: create and test a data source
-

@@ -15,28 +15,36 @@ use Illuminate\Support\Facades\Validator;
 class DataQueryService
 {
     protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'];
+    protected bool $cacheEnabled = true;
+    protected bool $forceDisableCacheForDataSource = true;
 
     public function executeForDataSource(Request $request, DataSource $dataSource, string $cacheKeyPrefix): JsonResponse
     {
-        $definition = [
-            'identifier' => $cacheKeyPrefix,
-            'parameters' => $dataSource->parameters->map(function ($param): array {
-                return [
-                    'name' => $param->param_name,
-                    'type' => $param->param_type,
-                    'required' => (bool) $param->is_required,
-                    'default' => $param->param_default_value,
-                    'operator' => $param->operator ?? '=',
-                ];
-            })->all(),
-            'use_custom_query' => (bool) $dataSource->use_custom_query,
-            'custom_query' => $dataSource->custom_query,
-            'table_name' => $dataSource->table_name,
-            'columns' => $this->normalizeColumns($dataSource->columns),
-            'debug_index_table' => $dataSource->table_name,
-        ];
+        try {
+            $this->cacheEnabled = ! $this->forceDisableCacheForDataSource;
 
-        return $this->execute($request, $definition);
+            $definition = [
+                'identifier' => $cacheKeyPrefix,
+                'parameters' => $dataSource->parameters->map(function ($param): array {
+                    return [
+                        'name' => $param->param_name,
+                        'type' => $param->param_type,
+                        'required' => (bool) $param->is_required,
+                        'default' => $param->param_default_value,
+                        'operator' => $param->operator ?? '=',
+                    ];
+                })->all(),
+                'use_custom_query' => (bool) $dataSource->use_custom_query,
+                'custom_query' => $dataSource->custom_query,
+                'table_name' => $dataSource->table_name,
+                'columns' => $this->normalizeColumns($dataSource->columns),
+                'debug_index_table' => $dataSource->table_name,
+            ];
+
+            return $this->execute($request, $definition);
+        } finally {
+            $this->cacheEnabled = true;
+        }
     }
 
     public function executeForApiConfig(Request $request, ApiConfig $apiConfig, string $cacheKeyPrefix): JsonResponse
@@ -146,10 +154,12 @@ class DataQueryService
         ));
 
         if (!empty($request->isDebug) && $request->isDebug) {
-            $result = $this->makeQuery($queryCount, $query, $request, $definition);
+            $result = $this->runQueryDirectly($queryCount, $query, $request, $definition);
+        } elseif (! $this->cacheEnabled) {
+            $result = $this->runQueryDirectly($queryCount, $query, $request, $definition);
         } else {
             $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request, $definition) {
-                return $this->makeQuery($queryCount, $query, $request, $definition);
+                return $this->runQueryDirectly($queryCount, $query, $request, $definition);
             });
         }
 
@@ -179,7 +189,7 @@ class DataQueryService
         ];
     }
 
-    protected function makeQuery(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
+    protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
     {
         try {
             $query = $this->ensureStringQuery($query);
@@ -227,6 +237,14 @@ class DataQueryService
         } catch (\Exception $e) {
             return ['error' => $e->getMessage()];
         }
+    }
+
+    /**
+     * Backward-compatible query executor used by the cache bypass path.
+     */
+    protected function makeQuery(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
+    {
+        return $this->runQueryDirectly($queryCount, $query, $request, $definition);
     }
 
     protected function paginate($items, int $total, int $perPage = 5, int $page = 1, array $options = []): LengthAwarePaginator
