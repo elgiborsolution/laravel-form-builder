@@ -880,7 +880,7 @@ class DataAPIBuilderController extends Controller
      * @param Request $request
      * @return \Illuminate\Http\JsonResponse|null
      */
-    public function validateDetail($request)
+    public function validateDetail($request, bool $forceDataMappings = false)
     {
 
           $validateParam = [
@@ -927,7 +927,10 @@ class DataAPIBuilderController extends Controller
           ];
           
 
-          if(!in_array($request->method, ['DELETE', 'GET'], true)){
+          if ($forceDataMappings) {
+            $validateParentTable['data_params'] = 'required|array';
+            $validateChildTable['data_params'] = 'required|array';
+          } elseif(!in_array($request->method, ['DELETE', 'GET'], true)){
             $validateParentTable['data_params'] = 'required|array';
             $validateChildTable['data_params'] = 'required|array';
           }else{
@@ -1231,6 +1234,115 @@ class DataAPIBuilderController extends Controller
   
   }
 
+  /**
+   * Generate POST, PUT, and DELETE API configs from a single request payload.
+   *
+   * @param Request $request
+   * @return \Illuminate\Http\JsonResponse
+   */
+  public function bundleCrud(Request $request)
+  {
+     $request->merge([
+        'method' => strtoupper((string) $request->input('method')),
+        'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
+        'route_name' => $request->filled('route_name')
+            ? $request->input('route_name')
+            : '',
+     ]);
+
+     $eventClass = "App\\Events\\AfterRunnerApiBuiderEvent";
+
+     if (!class_exists($eventClass)) {
+         Artisan::call('make:event AfterRunnerApiBuiderEvent');
+     }
+
+    $validated = $request->validate([
+      'route_name' => ['nullable', 'string'],
+      'endpoint' => [
+          'required',
+          'string',
+          function (string $attribute, mixed $value, \Closure $fail): void {
+              if ($this->resolver->isReservedEndpoint((string) $value)) {
+                  $fail('The endpoint conflicts with a reserved package route.');
+              }
+          },
+      ],
+      'method' => ['nullable', 'string', 'in:POST,PUT,DELETE'],
+      'params' => ['required', 'array'],
+      'parent_table' => 'required|array',
+      'child_tables' => 'nullable|array',
+      'enabled' => 'nullable|boolean',
+      'description' => 'nullable|string',
+      'middlewares' => 'nullable|array',
+      'middlewares.*' => 'nullable|string',
+    ]);
+
+    $invalid = $this->validateDetail($request, true);
+
+    if (!empty($invalid)) {
+       return $invalid;
+    }
+
+        $connection = DatabaseConnection::connection();
+        $createdConfigs = [];
+
+        try {
+            $connection->beginTransaction();
+
+            foreach (['POST', 'PUT', 'DELETE'] as $method) {
+                $bundlePayload = $validated;
+                $bundlePayload['method'] = $method;
+                $bundlePayload['route_name'] = $this->buildCrudBundleRouteName(
+                    $validated['route_name'] ?? null,
+                    $bundlePayload['endpoint'],
+                    $method
+                );
+                $bundlePayload['enabled'] = array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true;
+                $bundlePayload['description'] = $validated['description'] ?? null;
+                $bundlePayload['middlewares'] = $this->normalizeMiddlewares($validated['middlewares'] ?? null);
+
+                $dataApiBuilder = ApiConfig::create([
+                    'route_name' => $bundlePayload['route_name'],
+                    'endpoint' => $bundlePayload['endpoint'],
+                    'method' => $bundlePayload['method'],
+                    'params' => ($bundlePayload['params'] ?? []),
+                    'enabled' => (bool) $bundlePayload['enabled'],
+                    'description' => $bundlePayload['description'] ?? null,
+                    'middlewares' => $bundlePayload['middlewares'],
+                ]);
+
+                $this->syncApiConfigRelations($dataApiBuilder, $bundlePayload);
+
+                $listenerName = $this->getListenerName($bundlePayload['route_name']);
+                $listenerClass = "App\\Listeners\\{$listenerName}";
+
+                if (!class_exists($listenerClass)) {
+                    Artisan::call('make:listener ' . $listenerName . ' --event=AfterRunnerApiBuiderEvent');
+                }
+
+                $createdConfigs[] = $dataApiBuilder->load(['parentTable', 'childTables', 'permission', 'hook']);
+                $this->resolver->forget($bundlePayload['endpoint'], $method);
+            }
+
+            $connection->commit();
+            Cache::forget($this->cacheKey('list-api-configs'));
+
+            return response()->json([
+                "status" => 200,
+                'message' => 'CRUD API bundle created',
+                'data' => $createdConfigs,
+            ], 201);
+        } catch (\Exception $e) {
+            $connection->rollBack();
+
+            \Log::error("BUNDLE CRUD API BUILDER=> " . $e->getMessage());
+            \Log::error("BUNDLE CRUD API BUILDER => " . (tenant()->id??'tenant not found'));
+            \Log::error("BUNDLE CRUD API BUILDER => " . $e->getTraceAsString());
+
+            return response()->json(["status" => 422, "data" => [], "error" => $e->getMessage()], 422);
+        }
+  }
+
     /**
      * Delete an API Builder configuration.
      *
@@ -1265,12 +1377,26 @@ class DataAPIBuilderController extends Controller
       {
             $endpoint = $this->resolver->normalizeEndpoint($endpoint);
 
-            return 'generated.' . strtolower((string) $method) . '.' . Str::of($endpoint)
-                ->replace('/', '.')
-                ->replace('-', '.')
+            return 'generated-' . strtolower((string) $method) . '-' . Str::of($endpoint)
+                ->replace('/', '-')
+                ->replace('-', '-')
                 ->snake()
-                ->trim('.')
+                ->trim('-')
                 ->value();
+      }
+
+      protected function buildCrudBundleRouteName(?string $routeName, ?string $endpoint, string $method): string
+      {
+            $normalizedRouteName = trim((string) $routeName);
+            $methodSuffix = strtolower($method);
+
+            if ($normalizedRouteName !== '') {
+                $normalizedRouteName = preg_replace('/\.(post|put|delete)$/i', '', $normalizedRouteName) ?? $normalizedRouteName;
+
+                return $normalizedRouteName . '.' . $methodSuffix;
+            }
+
+            return $this->buildRouteName($endpoint, $method);
       }
 
       protected function normalizeMiddlewares(?array $middlewares): ?array

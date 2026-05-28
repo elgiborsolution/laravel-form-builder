@@ -64,6 +64,8 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-api-builder.export');
                 Route::post('data-api-builder/import', [DataAPIBuilderController::class, 'import'])
                     ->name('management.data-api-builder.import');
+                Route::post('data-api-builder/bundle-crud', [DataAPIBuilderController::class, 'bundleCrud'])
+                    ->name('management.data-api-builder.bundle-crud');
 
                 Route::apiResource('data-source', DataSourceController::class)
                     ->names($this->resourceRouteNames('management.data-source'));
