@@ -42,10 +42,19 @@ https://github.com/elgiborsolution/laravel-form-builder.git
 composer require elgibor-solution/laravel-form-builder
 ```
 
-### 2. Publish configuration
+### 2. Install the runtime registry scaffold
 
 ```bash
-php artisan vendor:publish --provider="ESolution\DataSources\Providers\DataSourcesServiceProvider" --tag=datasources-config
+php artisan datasources:install
+```
+
+This command creates `app/Runtime/AppRuntimeVariableRegistry.php` only when it does not already exist.
+No `AppServiceProvider` changes or manual registry binding are needed.
+
+If you also want the package config published during install, use:
+
+```bash
+php artisan datasources:install --publish-config
 ```
 
 ### 3. Publish migrations

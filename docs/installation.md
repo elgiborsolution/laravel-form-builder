@@ -4,6 +4,7 @@
 
 - [Requirements](#requirements)
 - [Install Package](#install-package)
+- [Install Runtime Registry](#install-runtime-registry)
 - [Publish Assets](#publish-assets)
 - [Run Migrations](#run-migrations)
 - [Configure Routes](#configure-routes)
@@ -22,6 +23,23 @@ composer require elgibor-solution/laravel-form-builder
 ```
 
 The package is Laravel auto-discoverable. In most projects you do not need to register the service provider manually.
+
+## Install Runtime Registry
+
+Generate the default application registry stub:
+
+```bash
+php artisan datasources:install
+```
+
+This creates `app/Runtime/AppRuntimeVariableRegistry.php` only if the file does not already exist.
+No `AppServiceProvider` changes or manual registry binding are needed.
+
+If you want the config file published during the same step, add:
+
+```bash
+php artisan datasources:install --publish-config
+```
 
 ## Publish Assets
 

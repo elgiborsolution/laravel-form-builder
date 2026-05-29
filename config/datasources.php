@@ -7,6 +7,8 @@ return [
         'dynamic_api_ttl' => 60,
     ],
 
+    'runtime_variable_registry' => null,
+
     'routes' => [
         'prefix' => env('DATASOURCES_ROUTE_PREFIX', 'api'),
         'version' => env('DATASOURCES_ROUTE_VERSION'),

@@ -1,11 +1,15 @@
 <?php
 namespace ESolution\DataSources\Providers;
 
+use ESolution\DataSources\Console\InstallDatasourcesCommand;
 use ESolution\DataSources\Controllers\ApiController;
 use ESolution\DataSources\Controllers\DataAPIBuilderController;
 use ESolution\DataSources\Controllers\DataPickerController;
 use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Controllers\DataTableBuilderController;
+use ESolution\DataSources\Controllers\RuntimeVariableController;
+use ESolution\DataSources\Contracts\RuntimeVariableRegistryInterface;
+use ESolution\DataSources\Runtime\RuntimeVariableRegistryResolver;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Stancl\Tenancy\Middleware\InitializeTenancyByRequestData;
@@ -16,6 +20,12 @@ class DataSourcesServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'datasources');
         $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'laravel-form-builder');
+        $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'data-sources');
+
+        $this->app->singleton(RuntimeVariableRegistryResolver::class, RuntimeVariableRegistryResolver::class);
+        $this->app->bind(RuntimeVariableRegistryInterface::class, function ($app) {
+            return $app->make(RuntimeVariableRegistryResolver::class)->resolveInstance();
+        });
     }
 
     public function boot(): void
@@ -24,6 +34,12 @@ class DataSourcesServiceProvider extends ServiceProvider
 
         if (! $this->app->routesAreCached()) {
             $this->registerRoutes();
+        }
+
+        if ($this->app->runningInConsole()) {
+            $this->commands([
+                InstallDatasourcesCommand::class,
+            ]);
         }
 
         $this->publishes([
@@ -66,6 +82,8 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-api-builder.import');
                 Route::post('data-api-builder/bundle-crud', [DataAPIBuilderController::class, 'bundleCrud'])
                     ->name('management.data-api-builder.bundle-crud');
+                Route::get('runtime-variables', [RuntimeVariableController::class, 'index'])
+                    ->name('management.runtime-variables.index');
 
                 Route::apiResource('data-source', DataSourceController::class)
                     ->names($this->resourceRouteNames('management.data-source'));

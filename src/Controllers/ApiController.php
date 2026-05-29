@@ -2,7 +2,9 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\JsonResponse;
@@ -24,7 +26,8 @@ class ApiController extends Controller
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DataQueryService $dataQueryService,
-        protected Pipeline $pipeline
+        protected Pipeline $pipeline,
+        protected DynamicVariableParser $runtimeVariableParser
     ) {
     }
 
@@ -60,6 +63,26 @@ class ApiController extends Controller
                 fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
             );
         });
+  }
+
+  protected function applyRuntimeVariables(Request $request): void
+  {
+      $request->merge($this->resolveRuntimePayload($request->all()));
+  }
+
+  protected function resolveRuntimePayload(mixed $payload): mixed
+  {
+      if (is_array($payload)) {
+          $resolved = [];
+
+          foreach ($payload as $key => $value) {
+              $resolved[$key] = $this->resolveRuntimePayload($value);
+          }
+
+          return $resolved;
+      }
+
+      return $this->runtimeVariableParser->parse($payload);
   }
 
   protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
@@ -151,6 +174,16 @@ class ApiController extends Controller
   */
   public function store(Request $request, $apiConfigs)
   {
+      try {
+          $this->applyRuntimeVariables($request);
+      } catch (InvalidRuntimeVariableException $e) {
+          return response()->json([
+              'status' => 422,
+              'error' => $e->getMessage(),
+              'message' => $e->getMessage(),
+          ], 422);
+      }
+
       $connection = DatabaseConnection::connection();
       // Validate input data based on API configurations
       $checkValidateRule = $this->validateRule($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
@@ -287,6 +320,16 @@ class ApiController extends Controller
   */
   public function update(Request $request, $apiConfigs, $id)
   {
+        try {
+            $this->applyRuntimeVariables($request);
+        } catch (InvalidRuntimeVariableException $e) {
+            return response()->json([
+                'status' => 422,
+                'error' => $e->getMessage(),
+                'message' => $e->getMessage(),
+            ], 422);
+        }
+
         $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
 
         if(count($checkValidateRule['parentValidate']) > 0){
