@@ -24,6 +24,16 @@ class DynamicVariableParser
             return $resolved;
         }
 
+        if (is_object($value)) {
+            $resolved = clone $value;
+
+            foreach (get_object_vars($value) as $key => $item) {
+                $resolved->{$key} = $this->parse($item, $default);
+            }
+
+            return $resolved;
+        }
+
         if (! is_string($value)) {
             return $value;
         }

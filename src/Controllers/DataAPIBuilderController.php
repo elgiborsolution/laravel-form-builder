@@ -2,8 +2,10 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use App\Http\Controllers\Controller;
@@ -16,7 +18,8 @@ use Illuminate\Support\Str;
 class DataAPIBuilderController extends Controller
 {
     public function __construct(
-        protected DynamicApiConfigResolver $resolver
+        protected DynamicApiConfigResolver $resolver,
+        protected DynamicVariableParser $runtimeVariableParser
     ) {
     }
 
@@ -698,6 +701,23 @@ class DataAPIBuilderController extends Controller
             ];
         }
 
+        if ($runtimeValidation = $this->validateRuntimeVariables($payload)) {
+            $batchSummary['failed']++;
+            $batchSummary['errors'][] = [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => $runtimeValidation->getData(true)['message'] ?? 'Invalid runtime variable expression.',
+            ];
+
+            return [
+                'error' => [
+                    'file_name' => $fileName,
+                    'row' => $rowNumber,
+                    'message' => $runtimeValidation->getData(true)['message'] ?? 'Invalid runtime variable expression.',
+                ],
+            ];
+        }
+
         $routeName = trim((string) $payload['route_name']);
         $endpoint = $this->resolver->normalizeEndpoint((string) $payload['endpoint']);
         $method = strtoupper((string) $payload['method']);
@@ -883,11 +903,12 @@ class DataAPIBuilderController extends Controller
     public function validateDetail($request, bool $forceDataMappings = false)
     {
 
-          $validateParam = [
+        $validateParam = [
             'name' => 'required|string',
             'type' => ["required" , "string", "in:string,object,array,integer,date,boolean,numeric,url"],
             'required' => 'nullable|boolean',
             'unique' => 'nullable|boolean',
+            'default' => ['nullable'],
             'params' =>  ['nullable', 'required_if:type,object,array', "array"]
           ];
 
@@ -961,6 +982,50 @@ class DataAPIBuilderController extends Controller
       }
 
     /**
+     * Validate runtime variable expressions used anywhere in the API Builder payload.
+     *
+     * @param mixed $payload
+     * @param string $path
+     * @return \Illuminate\Http\JsonResponse|null
+     */
+    protected function validateRuntimeVariables(mixed $payload, string $path = ''): ?\Illuminate\Http\JsonResponse
+    {
+        if (is_array($payload)) {
+            foreach ($payload as $key => $value) {
+                $childPath = $path === '' ? (string) $key : $path . '.' . $key;
+                $validationError = $this->validateRuntimeVariables($value, $childPath);
+
+                if ($validationError !== null) {
+                    return $validationError;
+                }
+            }
+
+            return null;
+        }
+
+        if (is_object($payload)) {
+            return $this->validateRuntimeVariables(get_object_vars($payload), $path);
+        }
+
+        if (! is_string($payload) || ! str_contains($payload, '{{')) {
+            return null;
+        }
+
+        try {
+            $this->runtimeVariableParser->parse($payload);
+        } catch (InvalidRuntimeVariableException $e) {
+            return response()->json([
+                'status' => 422,
+                'error' => $e->getMessage(),
+                'message' => $e->getMessage(),
+                'field' => $path !== '' ? $path : null,
+            ], 422);
+        }
+
+        return null;
+    }
+
+    /**
      * Store a new API Builder configuration.
      *
      * @param Request $request
@@ -1012,6 +1077,10 @@ class DataAPIBuilderController extends Controller
 
     if (!empty($invalid)) {
        return $invalid;
+    }
+
+    if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
+       return $runtimeValidation;
     }
 
 
@@ -1164,6 +1233,10 @@ class DataAPIBuilderController extends Controller
        return $invalid;
     }
 
+    if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
+       return $runtimeValidation;
+    }
+
 
         try {
 
@@ -1281,6 +1354,10 @@ class DataAPIBuilderController extends Controller
 
     if (!empty($invalid)) {
        return $invalid;
+    }
+
+    if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
+       return $runtimeValidation;
     }
 
         $connection = DatabaseConnection::connection();
@@ -1422,4 +1499,3 @@ class DataAPIBuilderController extends Controller
             return $cleanString;
       }
 }
-
