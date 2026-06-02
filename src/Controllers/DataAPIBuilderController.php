@@ -2,8 +2,10 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use App\Http\Controllers\Controller;
@@ -16,7 +18,8 @@ use Illuminate\Support\Str;
 class DataAPIBuilderController extends Controller
 {
     public function __construct(
-        protected DynamicApiConfigResolver $resolver
+        protected DynamicApiConfigResolver $resolver,
+        protected DynamicVariableParser $runtimeVariableParser
     ) {
     }
 
@@ -698,6 +701,23 @@ class DataAPIBuilderController extends Controller
             ];
         }
 
+        if ($runtimeValidation = $this->validateRuntimeVariables($payload)) {
+            $batchSummary['failed']++;
+            $batchSummary['errors'][] = [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => $runtimeValidation->getData(true)['message'] ?? 'Invalid runtime variable expression.',
+            ];
+
+            return [
+                'error' => [
+                    'file_name' => $fileName,
+                    'row' => $rowNumber,
+                    'message' => $runtimeValidation->getData(true)['message'] ?? 'Invalid runtime variable expression.',
+                ],
+            ];
+        }
+
         $routeName = trim((string) $payload['route_name']);
         $endpoint = $this->resolver->normalizeEndpoint((string) $payload['endpoint']);
         $method = strtoupper((string) $payload['method']);
@@ -880,14 +900,15 @@ class DataAPIBuilderController extends Controller
      * @param Request $request
      * @return \Illuminate\Http\JsonResponse|null
      */
-    public function validateDetail($request)
+    public function validateDetail($request, bool $forceDataMappings = false)
     {
 
-          $validateParam = [
+        $validateParam = [
             'name' => 'required|string',
             'type' => ["required" , "string", "in:string,object,array,integer,date,boolean,numeric,url"],
             'required' => 'nullable|boolean',
             'unique' => 'nullable|boolean',
+            'default' => ['nullable'],
             'params' =>  ['nullable', 'required_if:type,object,array', "array"]
           ];
 
@@ -927,7 +948,10 @@ class DataAPIBuilderController extends Controller
           ];
           
 
-          if(!in_array($request->method, ['DELETE', 'GET'], true)){
+          if ($forceDataMappings) {
+            $validateParentTable['data_params'] = 'required|array';
+            $validateChildTable['data_params'] = 'required|array';
+          } elseif(!in_array($request->method, ['DELETE', 'GET'], true)){
             $validateParentTable['data_params'] = 'required|array';
             $validateChildTable['data_params'] = 'required|array';
           }else{
@@ -956,6 +980,50 @@ class DataAPIBuilderController extends Controller
 
           return null;
       }
+
+    /**
+     * Validate runtime variable expressions used anywhere in the API Builder payload.
+     *
+     * @param mixed $payload
+     * @param string $path
+     * @return \Illuminate\Http\JsonResponse|null
+     */
+    protected function validateRuntimeVariables(mixed $payload, string $path = ''): ?\Illuminate\Http\JsonResponse
+    {
+        if (is_array($payload)) {
+            foreach ($payload as $key => $value) {
+                $childPath = $path === '' ? (string) $key : $path . '.' . $key;
+                $validationError = $this->validateRuntimeVariables($value, $childPath);
+
+                if ($validationError !== null) {
+                    return $validationError;
+                }
+            }
+
+            return null;
+        }
+
+        if (is_object($payload)) {
+            return $this->validateRuntimeVariables(get_object_vars($payload), $path);
+        }
+
+        if (! is_string($payload) || ! str_contains($payload, '{{')) {
+            return null;
+        }
+
+        try {
+            $this->runtimeVariableParser->parse($payload);
+        } catch (InvalidRuntimeVariableException $e) {
+            return response()->json([
+                'status' => 422,
+                'error' => $e->getMessage(),
+                'message' => $e->getMessage(),
+                'field' => $path !== '' ? $path : null,
+            ], 422);
+        }
+
+        return null;
+    }
 
     /**
      * Store a new API Builder configuration.
@@ -1009,6 +1077,10 @@ class DataAPIBuilderController extends Controller
 
     if (!empty($invalid)) {
        return $invalid;
+    }
+
+    if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
+       return $runtimeValidation;
     }
 
 
@@ -1161,6 +1233,10 @@ class DataAPIBuilderController extends Controller
        return $invalid;
     }
 
+    if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
+       return $runtimeValidation;
+    }
+
 
         try {
 
@@ -1231,6 +1307,119 @@ class DataAPIBuilderController extends Controller
   
   }
 
+  /**
+   * Generate POST, PUT, and DELETE API configs from a single request payload.
+   *
+   * @param Request $request
+   * @return \Illuminate\Http\JsonResponse
+   */
+  public function bundleCrud(Request $request)
+  {
+     $request->merge([
+        'method' => strtoupper((string) $request->input('method')),
+        'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
+        'route_name' => $request->filled('route_name')
+            ? $request->input('route_name')
+            : '',
+     ]);
+
+     $eventClass = "App\\Events\\AfterRunnerApiBuiderEvent";
+
+     if (!class_exists($eventClass)) {
+         Artisan::call('make:event AfterRunnerApiBuiderEvent');
+     }
+
+    $validated = $request->validate([
+      'route_name' => ['nullable', 'string'],
+      'endpoint' => [
+          'required',
+          'string',
+          function (string $attribute, mixed $value, \Closure $fail): void {
+              if ($this->resolver->isReservedEndpoint((string) $value)) {
+                  $fail('The endpoint conflicts with a reserved package route.');
+              }
+          },
+      ],
+      'method' => ['nullable', 'string', 'in:POST,PUT,DELETE'],
+      'params' => ['required', 'array'],
+      'parent_table' => 'required|array',
+      'child_tables' => 'nullable|array',
+      'enabled' => 'nullable|boolean',
+      'description' => 'nullable|string',
+      'middlewares' => 'nullable|array',
+      'middlewares.*' => 'nullable|string',
+    ]);
+
+    $invalid = $this->validateDetail($request, true);
+
+    if (!empty($invalid)) {
+       return $invalid;
+    }
+
+    if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
+       return $runtimeValidation;
+    }
+
+        $connection = DatabaseConnection::connection();
+        $createdConfigs = [];
+
+        try {
+            $connection->beginTransaction();
+
+            foreach (['POST', 'PUT', 'DELETE'] as $method) {
+                $bundlePayload = $validated;
+                $bundlePayload['method'] = $method;
+                $bundlePayload['route_name'] = $this->buildCrudBundleRouteName(
+                    $validated['route_name'] ?? null,
+                    $bundlePayload['endpoint'],
+                    $method
+                );
+                $bundlePayload['enabled'] = array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true;
+                $bundlePayload['description'] = $validated['description'] ?? null;
+                $bundlePayload['middlewares'] = $this->normalizeMiddlewares($validated['middlewares'] ?? null);
+
+                $dataApiBuilder = ApiConfig::create([
+                    'route_name' => $bundlePayload['route_name'],
+                    'endpoint' => $bundlePayload['endpoint'],
+                    'method' => $bundlePayload['method'],
+                    'params' => ($bundlePayload['params'] ?? []),
+                    'enabled' => (bool) $bundlePayload['enabled'],
+                    'description' => $bundlePayload['description'] ?? null,
+                    'middlewares' => $bundlePayload['middlewares'],
+                ]);
+
+                $this->syncApiConfigRelations($dataApiBuilder, $bundlePayload);
+
+                $listenerName = $this->getListenerName($bundlePayload['route_name']);
+                $listenerClass = "App\\Listeners\\{$listenerName}";
+
+                if (!class_exists($listenerClass)) {
+                    Artisan::call('make:listener ' . $listenerName . ' --event=AfterRunnerApiBuiderEvent');
+                }
+
+                $createdConfigs[] = $dataApiBuilder->load(['parentTable', 'childTables', 'permission', 'hook']);
+                $this->resolver->forget($bundlePayload['endpoint'], $method);
+            }
+
+            $connection->commit();
+            Cache::forget($this->cacheKey('list-api-configs'));
+
+            return response()->json([
+                "status" => 200,
+                'message' => 'CRUD API bundle created',
+                'data' => $createdConfigs,
+            ], 201);
+        } catch (\Exception $e) {
+            $connection->rollBack();
+
+            \Log::error("BUNDLE CRUD API BUILDER=> " . $e->getMessage());
+            \Log::error("BUNDLE CRUD API BUILDER => " . (tenant()->id??'tenant not found'));
+            \Log::error("BUNDLE CRUD API BUILDER => " . $e->getTraceAsString());
+
+            return response()->json(["status" => 422, "data" => [], "error" => $e->getMessage()], 422);
+        }
+  }
+
     /**
      * Delete an API Builder configuration.
      *
@@ -1265,12 +1454,26 @@ class DataAPIBuilderController extends Controller
       {
             $endpoint = $this->resolver->normalizeEndpoint($endpoint);
 
-            return 'generated.' . strtolower((string) $method) . '.' . Str::of($endpoint)
-                ->replace('/', '.')
-                ->replace('-', '.')
+            return 'generated-' . strtolower((string) $method) . '-' . Str::of($endpoint)
+                ->replace('/', '-')
+                ->replace('-', '-')
                 ->snake()
-                ->trim('.')
+                ->trim('-')
                 ->value();
+      }
+
+      protected function buildCrudBundleRouteName(?string $routeName, ?string $endpoint, string $method): string
+      {
+            $normalizedRouteName = trim((string) $routeName);
+            $methodSuffix = strtolower($method);
+
+            if ($normalizedRouteName !== '') {
+                $normalizedRouteName = preg_replace('/\.(post|put|delete)$/i', '', $normalizedRouteName) ?? $normalizedRouteName;
+
+                return $normalizedRouteName . '.' . $methodSuffix;
+            }
+
+            return $this->buildRouteName($endpoint, $method);
       }
 
       protected function normalizeMiddlewares(?array $middlewares): ?array
@@ -1296,4 +1499,3 @@ class DataAPIBuilderController extends Controller
             return $cleanString;
       }
 }
-

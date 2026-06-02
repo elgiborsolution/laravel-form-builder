@@ -2,21 +2,34 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\MiddlewareConnectionResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pipeline\Pipeline;
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\DatabasePresenceVerifier;
 
 class ApiController extends Controller
 {
+    /**
+     * Track whether the request is already running inside the datasource
+     * validation connection scope.
+     */
+    protected bool $datasourceValidationConnectionActive = false;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DataQueryService $dataQueryService,
-        protected Pipeline $pipeline
+        protected Pipeline $pipeline,
+        protected DynamicVariableParser $runtimeVariableParser,
+        protected MiddlewareConnectionResolver $middlewareConnectionResolver
     ) {
     }
 
@@ -28,7 +41,7 @@ class ApiController extends Controller
   *
   * @return \Illuminate\Http\JsonResponse
   */
-  public function handleRequest(Request $request, string $dynamicPath): JsonResponse
+    public function handleRequest(Request $request, string $dynamicPath): JsonResponse
   {
         $headers = $request->header('x-tenant');
 
@@ -36,20 +49,106 @@ class ApiController extends Controller
             tenancy()->initialize($headers);
         }
 
-        $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
-        /** @var ApiConfig|null $apiConfigs */
-        $apiConfigs = $resolvedRoute['config'];
-        $id = $resolvedRoute['id'];
+        return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
+            $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
+            /** @var ApiConfig|null $apiConfigs */
+            $apiConfigs = $resolvedRoute['config'];
+            $id = $resolvedRoute['id'];
 
-        if (empty($apiConfigs)) {
-              return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
-        }
+            if (empty($apiConfigs)) {
+                return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
+            }
 
-        return $this->runDynamicMiddlewarePipeline(
-            $request,
-            $apiConfigs,
-            fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
-        );
+            return $this->runDynamicMiddlewarePipeline(
+                $request,
+                $apiConfigs,
+                fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
+            );
+        });
+  }
+
+  protected function applyRuntimeVariables(Request $request): void
+  {
+      $request->merge($this->resolveRuntimePayload($request->all()));
+  }
+
+  protected function resolveRuntimePayload(mixed $payload): mixed
+  {
+      if (is_array($payload)) {
+          $resolved = [];
+
+          foreach ($payload as $key => $value) {
+              $resolved[$key] = $this->resolveRuntimePayload($value);
+          }
+
+          return $resolved;
+      }
+
+      return $this->runtimeVariableParser->parse($payload);
+  }
+
+  protected function applyRuntimeDefaults(Request $request, array $params): void
+  {
+      $payload = $request->all();
+
+      foreach ($this->collectRuntimeDefaults($params) as $path => $default) {
+          $currentValue = data_get($payload, $path);
+
+          if ($currentValue !== null && $currentValue !== '') {
+              continue;
+          }
+
+          data_set($payload, $path, $this->runtimeVariableParser->parse($default));
+      }
+
+      $request->merge($payload);
+  }
+
+  /**
+   * @return array<string, mixed>
+   */
+  protected function collectRuntimeDefaults(array $params, string $prefix = ''): array
+  {
+      $defaults = [];
+
+      foreach ($params as $param) {
+          if (! is_array($param) || empty($param['name'])) {
+              continue;
+          }
+
+          $name = (string) $param['name'];
+          $path = $prefix === '' ? $name : $prefix . '.' . $name;
+
+          if (array_key_exists('default', $param)) {
+              $defaults[$path] = $param['default'];
+          }
+
+          if (
+              in_array((string) ($param['type'] ?? ''), ['array', 'object'], true)
+              && ! empty($param['params'])
+              && is_array($param['params'])
+          ) {
+              $defaults += $this->collectRuntimeDefaults($param['params'], $path);
+          }
+      }
+
+      return $defaults;
+  }
+
+  protected function prepareRuntimeRequest(Request $request, array $params): ?JsonResponse
+  {
+      try {
+          $this->applyRuntimeVariables($request);
+          $this->applyRuntimeDefaults($request, $params);
+      } catch (InvalidRuntimeVariableException $e) {
+          return response()->json([
+              'status' => 422,
+              'error' => $e->getMessage(),
+              'message' => $e->getMessage(),
+          ], 422);
+      }
+
+      return null;
   }
 
   protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
@@ -99,12 +198,92 @@ class ApiController extends Controller
             return $destination($request);
         }
 
-        $middlewares = $this->resolveMiddlewareDefinitions($middlewares);
+        $middlewares = $this->buildDynamicMiddlewarePipes($middlewares);
 
         return $this->pipeline
             ->send($request)
             ->through($middlewares)
             ->then(fn (Request $request) => $destination($request));
+  }
+
+  /**
+   * Build a middleware pipe list where sensitive middleware is wrapped in a
+   * connection-scoped closure and regular middleware stays untouched.
+   *
+   * @param array<int, mixed> $middlewares
+   * @return array<int, mixed>
+   */
+  protected function buildDynamicMiddlewarePipes(array $middlewares): array
+  {
+        $pipes = [];
+
+        foreach ($middlewares as $middleware) {
+            if (! is_string($middleware) || trim($middleware) === '') {
+                continue;
+            }
+
+            $connection = $this->middlewareConnectionResolver->resolveConnection($middleware);
+
+            if ($connection !== null) {
+                $pipes[] = $this->wrapMiddlewareWithConnection($middleware, $connection);
+                continue;
+            }
+
+            foreach ($this->resolveMiddlewareDefinitions([$middleware]) as $resolvedMiddleware) {
+                $pipes[] = $resolvedMiddleware;
+            }
+        }
+
+        return $pipes;
+  }
+
+  /**
+   * Wrap a middleware so it runs under a specific database connection and the
+   * original connection is always restored before the outer pipeline continues.
+   *
+   * @param string $middleware
+   * @param string $connection
+   * @return \Closure
+   */
+  protected function wrapMiddlewareWithConnection(string $middleware, string $connection): \Closure
+  {
+        return function (Request $request, \Closure $next) use ($middleware, $connection) {
+            $databaseManager = app('db');
+            $validatorFactory = app('validator');
+            $previousDefaultConnection = DB::getDefaultConnection();
+            $previousPresenceVerifier = method_exists($validatorFactory, 'getPresenceVerifier')
+                ? $validatorFactory->getPresenceVerifier()
+                : null;
+
+            try {
+                config(['database.default' => $connection]);
+                $databaseManager->setDefaultConnection($connection);
+                DB::setDefaultConnection($connection);
+
+                $presenceVerifier = new DatabasePresenceVerifier($databaseManager);
+                $presenceVerifier->setConnection($connection);
+                $validatorFactory->setPresenceVerifier($presenceVerifier);
+
+                $middlewarePipe = $this->resolveMiddlewareDefinitions([$middleware]);
+
+                if ($middlewarePipe === []) {
+                    $middlewarePipe = [$middleware];
+                }
+
+                return $this->pipeline
+                    ->send($request)
+                    ->through($middlewarePipe)
+                    ->then(fn (Request $request) => $next($request));
+            } finally {
+                if ($previousPresenceVerifier !== null) {
+                    $validatorFactory->setPresenceVerifier($previousPresenceVerifier);
+                }
+
+                config(['database.default' => $previousDefaultConnection]);
+                $databaseManager->setDefaultConnection($previousDefaultConnection);
+                DB::setDefaultConnection($previousDefaultConnection);
+            }
+        };
   }
 
   /**
@@ -141,12 +320,17 @@ class ApiController extends Controller
   */
   public function store(Request $request, $apiConfigs)
   {
+      if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
+          return $runtimeError;
+      }
+
+      $connection = DatabaseConnection::connection();
       // Validate input data based on API configurations
       $checkValidateRule = $this->validateRule($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
 
       // Validate parent-level parameters
       if (count($checkValidateRule['parentValidate']) > 0) {
-          $validated = $request->validate($checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
       }
 
       // Validate child-level parameters
@@ -154,7 +338,7 @@ class ApiController extends Controller
           foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
               foreach ($request[$key] ?? [] as $keyParam => $valueParam) {
                   // Perform validation on each child record
-                  $validator = Validator::make($valueParam, $valueValidateRule);
+                  $validator = $this->makeDatasourceValidator($valueParam, $valueValidateRule);
                   if ($validator->fails()) {
                       return response()->json([
                           'error' => $validator->errors(),
@@ -179,7 +363,6 @@ class ApiController extends Controller
           ], 400);
       }
 
-      $connection = DatabaseConnection::connection();
       $prefix = $connection->getTablePrefix();
       $childTables = $apiConfigs->childTables->toArray();
 
@@ -216,7 +399,7 @@ class ApiController extends Controller
                       $dataFilled[$key][$table['foreign_key']] = $id;
                       foreach ($table['data_params'] as $keyMap => $valueMap) {
                           if (!in_array((explode('.', $valueMap)[0]), $tableMutipleValue[$table['table_name']])) {
-                              $dataFilled[$key][$keyMap] = $this->getValueFromPath($request->all(), $valueMap);
+                              $dataFilled[$key][$keyMap] = $this->resolveDataParamValue($valueMap, $request);
                           }
                       }
                   }
@@ -226,7 +409,7 @@ class ApiController extends Controller
                   // Handle singular insertions (single child record)
                   $childData[$table['foreign_key']] = $id;
                   foreach ($table['data_params'] as $key => $value) {
-                      $childData[$key] = $request->input($value);
+                      $childData[$key] = $this->resolveDataParamValue($value, $request);
                   }
               }
 
@@ -277,11 +460,15 @@ class ApiController extends Controller
   */
   public function update(Request $request, $apiConfigs, $id)
   {
+        if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
+            return $runtimeError;
+        }
+
         $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
 
         if(count($checkValidateRule['parentValidate']) > 0){
           
-          $validated = $request->validate($checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
         }
 
         if(count($checkValidateRule['childValidate']) > 0){
@@ -289,7 +476,7 @@ class ApiController extends Controller
             foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
 
                 foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = Validator::make($valueParam,  $valueValidateRule);
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule);
                     if ($validator->fails()) {
                         return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
                     }
@@ -339,7 +526,7 @@ class ApiController extends Controller
                       $dataFilled[$key][$table['foreign_key']] = $id;
                       foreach ($table['data_params'] as $keyMap => $valueMap) {
                         if(!in_array((explode('.', $valueMap)[0]), $tableMutipleValue[$table['table_name']])){
-                          $dataFilled[$key][$keyMap] = $this->getValueFromPath($request->all(), $valueMap);
+                          $dataFilled[$key][$keyMap] = $this->resolveDataParamValue($valueMap, $request);
                         } 
                       }
                   }
@@ -348,7 +535,7 @@ class ApiController extends Controller
                 }else{
                   $childData[$table['foreign_key']] = $id;
                   foreach ($table['data_params'] as $key => $value) {
-                    $childData[$key] = $request->input($value);
+                    $childData[$key] = $this->resolveDataParamValue($value, $request);
                   }
 
                 }
@@ -393,11 +580,15 @@ class ApiController extends Controller
   */
   public function destroy(Request $request, $apiConfigs, $id)
   {
+        if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
+            return $runtimeError;
+        }
+
         $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
 
         if(count($checkValidateRule['parentValidate']) > 0){
           
-          $validated = $request->validate($checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
         }
 
         if(count($checkValidateRule['childValidate']) > 0){
@@ -405,7 +596,7 @@ class ApiController extends Controller
             foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
 
                 foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = Validator::make($valueParam,  $valueValidateRule);
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule);
                     if ($validator->fails()) {
                         return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
                     }
@@ -553,11 +744,108 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
         // Remove the table prefix from the table name
         $table = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $tableParent);
         // Add uniqueness validation rule
-        $unique = '|unique:' . $table . ',' . $value['name'];
+        $unique = '|unique:' . DatabaseConnection::validationTable($table) . ',' . $value['name'];
         $dataValidate .= $unique;
     }
 
     return $dataValidate; // Return the validation rule string
+}
+
+/**
+ * Validate payload using the package datasource connection.
+ *
+ * @param array $data
+ * @param array $rules
+ * @return array<string, mixed>
+ */
+protected function validateWithDatasourceConnection(array $data, array $rules): array
+{
+    return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
+        return Validator::make($data, $rules)->validate();
+    });
+}
+
+/**
+ * Build a validator instance bound to the package datasource connection.
+ *
+ * @param array $data
+ * @param array $rules
+ * @return \Illuminate\Contracts\Validation\Validator
+ */
+protected function makeDatasourceValidator(array $data, array $rules)
+{
+    return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
+        return Validator::make($data, $rules);
+    });
+}
+
+/**
+ * Temporarily switch the default database connection and presence verifier
+ * so database validation rules run against the active datasource connection.
+ *
+ * @template TReturn
+ * @param \Closure():TReturn $callback
+ * @return mixed
+ */
+protected function withDatasourceValidationConnection(\Closure $callback)
+{
+    if ($this->datasourceValidationConnectionActive) {
+        return $callback();
+    }
+
+    $connectionName = $this->getDatasourceConnectionName();
+    $databaseManager = app('db');
+    $validatorFactory = app('validator');
+
+    $this->datasourceValidationConnectionActive = true;
+
+    try {
+        config(['database.default' => $connectionName]);
+        $databaseManager->setDefaultConnection($connectionName);
+        DB::setDefaultConnection($connectionName);
+        $databaseManager->purge($connectionName);
+
+        $presenceVerifier = new DatabasePresenceVerifier($databaseManager);
+        $presenceVerifier->setConnection($connectionName);
+        $validatorFactory->setPresenceVerifier($presenceVerifier);
+
+        return $callback();
+    } finally {
+        config(['database.default' => $connectionName]);
+        $databaseManager->setDefaultConnection($connectionName);
+        DB::setDefaultConnection($connectionName);
+        $databaseManager->purge($connectionName);
+
+        $restoredPresenceVerifier = new DatabasePresenceVerifier($databaseManager);
+        $restoredPresenceVerifier->setConnection($connectionName);
+        $validatorFactory->setPresenceVerifier($restoredPresenceVerifier);
+
+        $this->datasourceValidationConnectionActive = false;
+    }
+}
+
+/**
+ * Resolve the package datasource connection name in a single place.
+ *
+ * @return string
+ */
+protected function getDatasourceConnectionName(): string
+{
+    try {
+        $connection = DatabaseConnection::connection();
+
+        if (method_exists($connection, 'getName')) {
+            $name = $connection->getName();
+
+            if (is_string($name) && trim($name) !== '') {
+                return trim($name);
+            }
+        }
+    } catch (\Throwable $e) {
+        // Fall back to the configured datasource connection name below.
+    }
+
+    return DatabaseConnection::name();
 }
 
 /**
@@ -642,6 +930,41 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
 
       // Return the found value
       return $data;
+  }
+
+  /**
+   * Resolve a data_params value into the final payload value.
+   *
+   * Resolution order:
+   * 1. Runtime variable syntax such as `{{ auth.id }}`
+   * 2. Request input reference when the request contains the key
+   * 3. Static value fallback
+   *
+   * @param mixed $value
+   * @param Request $request
+   * @return mixed
+   */
+  protected function resolveDataParamValue(mixed $value, Request $request): mixed
+  {
+      if (! is_string($value)) {
+          return $value;
+      }
+
+      $normalized = trim($value);
+
+      if ($normalized === '') {
+          return $value;
+      }
+
+      if (str_contains($normalized, '{{')) {
+          return $this->runtimeVariableParser->parse($value);
+      }
+
+      if ($request->has($normalized)) {
+          return $request->input($normalized);
+      }
+
+      return $value;
   }
 
     /**

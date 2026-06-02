@@ -421,7 +421,7 @@ class DataSourceController extends Controller
       'columns' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
-          return $request->boolean('use_custom_query');
+          return ! $request->boolean('use_custom_query');
         }),
         'array',
       ],
@@ -812,7 +812,9 @@ class DataSourceController extends Controller
 
       }// if match
 
-      tenancy()->end();
+      if(! empty($headers)){
+        tenancy()->end();
+      }
       return $return;
 
   }

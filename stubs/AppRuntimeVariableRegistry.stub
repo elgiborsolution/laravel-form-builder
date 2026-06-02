@@ -1,0 +1,28 @@
+<?php
+
+namespace App\Runtime;
+
+use ESolution\DataSources\Runtime\DefaultRuntimeVariableRegistry;
+
+class AppRuntimeVariableRegistry extends DefaultRuntimeVariableRegistry
+{
+    protected function variables(): array
+    {
+        return array_merge(
+            parent::variables(),
+            [
+                // User customization area: add project-specific runtime variables here.
+                'auth.role_id' => [
+                    'type' => 'number',
+                    'description' => 'Current authenticated user role ID',
+                    'resolver' => static fn () => auth()->user()?->role_id,
+                ],
+                'auth.branch_id' => [
+                    'type' => 'number',
+                    'description' => 'Current authenticated user branch ID',
+                    'resolver' => static fn () => auth()->user()?->branch_id,
+                ],
+            ]
+        );
+    }
+}

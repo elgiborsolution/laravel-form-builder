@@ -4,7 +4,9 @@ namespace ESolution\DataSources\Services;
 
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
+use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
@@ -15,105 +17,132 @@ use Illuminate\Support\Facades\Validator;
 class DataQueryService
 {
     protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'];
+    protected bool $cacheEnabled = true;
+    protected bool $forceDisableCacheForDataSource = true;
+
+    public function __construct(
+        protected DynamicVariableParser $runtimeVariableParser
+    ) {
+    }
 
     public function executeForDataSource(Request $request, DataSource $dataSource, string $cacheKeyPrefix): JsonResponse
     {
-        $definition = [
-            'identifier' => $cacheKeyPrefix,
-            'parameters' => $dataSource->parameters->map(function ($param): array {
-                return [
-                    'name' => $param->param_name,
-                    'type' => $param->param_type,
-                    'required' => (bool) $param->is_required,
-                    'default' => $param->param_default_value,
-                    'operator' => $param->operator ?? '=',
-                ];
-            })->all(),
-            'use_custom_query' => (bool) $dataSource->use_custom_query,
-            'custom_query' => $dataSource->custom_query,
-            'table_name' => $dataSource->table_name,
-            'columns' => $this->normalizeColumns($dataSource->columns),
-            'debug_index_table' => $dataSource->table_name,
-        ];
+        try {
+            $this->cacheEnabled = ! $this->forceDisableCacheForDataSource;
 
-        return $this->execute($request, $definition);
+            $definition = [
+                'identifier' => $cacheKeyPrefix,
+                'parameters' => $dataSource->parameters->map(function ($param): array {
+                    return [
+                        'name' => $param->param_name,
+                        'type' => $param->param_type,
+                        'required' => (bool) $param->is_required,
+                        'default' => $this->parseRuntimeValue($param->param_default_value),
+                        'operator' => $param->operator ?? '=',
+                    ];
+                })->all(),
+                'use_custom_query' => (bool) $dataSource->use_custom_query,
+                'custom_query' => $this->parseRuntimeValue($dataSource->custom_query),
+                'table_name' => $this->parseRuntimeValue($dataSource->table_name),
+                'columns' => $this->normalizeColumns($dataSource->columns),
+                'debug_index_table' => $this->parseRuntimeValue($dataSource->table_name),
+            ];
+
+            return $this->execute($request, $definition);
+        } catch (InvalidRuntimeVariableException $e) {
+            return response()->json([
+                'error' => $e->getMessage(),
+                'message' => $e->getMessage(),
+            ], 422);
+        } finally {
+            $this->cacheEnabled = true;
+        }
     }
 
     public function executeForApiConfig(Request $request, ApiConfig $apiConfig, string $cacheKeyPrefix): JsonResponse
     {
-        $parentTable = $apiConfig->parentTable;
+        try {
+            $parentTable = $apiConfig->parentTable;
 
-        $definition = [
-            'identifier' => $cacheKeyPrefix,
-            'parameters' => $this->normalizeApiConfigParameters($apiConfig->params ?? []),
-            'use_custom_query' => false,
-            'custom_query' => null,
-            'table_name' => $parentTable?->table_name ?? '',
-            'columns' => $this->columnsFromApiConfig($apiConfig),
-            'debug_index_table' => $parentTable?->table_name ?? '',
-        ];
+            $definition = [
+                'identifier' => $cacheKeyPrefix,
+                'parameters' => $this->normalizeApiConfigParameters($apiConfig->params ?? []),
+                'use_custom_query' => false,
+                'custom_query' => null,
+                'table_name' => $parentTable?->table_name ?? '',
+                'columns' => $this->columnsFromApiConfig($apiConfig),
+                'debug_index_table' => $parentTable?->table_name ?? '',
+            ];
 
-        return $this->execute($request, $definition);
+            return $this->execute($request, $definition);
+        } catch (InvalidRuntimeVariableException $e) {
+            return response()->json([
+                'error' => $e->getMessage(),
+                'message' => $e->getMessage(),
+            ], 422);
+        }
     }
 
     public function execute(Request $request, array $definition): JsonResponse
     {
-        if (!empty($request->params) && is_string($request->params)) {
+        try {
+            if (!empty($request->params) && is_string($request->params)) {
             $params = json_decode($request->params, true);
             $request->merge(['params' => $params]);
-        }
-
-        $validator = Validator::make($request->all(), ['params' => 'nullable|array']);
-        if ($validator->fails()) {
-            return response()->json(['error' => $validator->errors(), 'message' => $validator->errors()->first()], 422);
-        }
-
-        $invalid = $this->validateDetail($request);
-        if ($invalid !== null) {
-            return $invalid;
-        }
-
-        if (!empty($definition['custom_query'])) {
-            try {
-                $definition['custom_query'] = $this->ensureStringQuery($definition['custom_query']);
-            } catch (\InvalidArgumentException $e) {
-                return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
             }
-        }
 
-        if (!empty($definition['table_name'])) {
-            try {
-                $definition['table_name'] = $this->ensureStringQuery($definition['table_name']);
-            } catch (\InvalidArgumentException $e) {
-                return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+            $validator = Validator::make($request->all(), ['params' => 'nullable|array']);
+            if ($validator->fails()) {
+                return response()->json(['error' => $validator->errors(), 'message' => $validator->errors()->first()], 422);
             }
-        }
 
-        if (!empty($definition['columns']) && is_array($definition['columns'])) {
-            try {
-                foreach ($definition['columns'] as $key => $column) {
-                    $definition['columns'][$key] = $this->ensureStringQuery($column);
+            $invalid = $this->validateDetail($request);
+            if ($invalid !== null) {
+                return $invalid;
+            }
+
+            if (!empty($definition['custom_query'])) {
+                try {
+                    $definition['custom_query'] = $this->ensureStringQuery($this->parseRuntimeValue($definition['custom_query']));
+                } catch (\InvalidArgumentException $e) {
+                    return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
                 }
-            } catch (\InvalidArgumentException $e) {
-                return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
             }
-        }
 
-        if (empty($definition['table_name']) && empty($definition['custom_query'])) {
-            return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
-        }
+            if (!empty($definition['table_name'])) {
+                try {
+                    $definition['table_name'] = $this->ensureStringQuery($this->parseRuntimeValue($definition['table_name']));
+                } catch (\InvalidArgumentException $e) {
+                    return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+                }
+            }
 
-        [$queryCount, $query] = $this->buildBaseQueries($definition);
-        $appliedFilters = [];
+            if (!empty($definition['columns']) && is_array($definition['columns'])) {
+                try {
+                    foreach ($definition['columns'] as $key => $column) {
+                        $definition['columns'][$key] = $this->ensureStringQuery($this->parseRuntimeValue($column));
+                    }
+                } catch (\InvalidArgumentException $e) {
+                    return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+                }
+            }
 
-        foreach ($definition['parameters'] as $parameter) {
+            if (empty($definition['table_name']) && empty($definition['custom_query'])) {
+                return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
+            }
+
+            [$queryCount, $query] = $this->buildBaseQueries($definition);
+            $appliedFilters = [];
+
+            foreach ($definition['parameters'] as $parameter) {
             $field = (string) ($parameter['name'] ?? '');
             if ($field === '') {
                 continue;
             }
 
-            $operator = $this->normalizeFilterOperator((string) ($parameter['operator'] ?? '='));
-            $rawValue = $this->resolveFilterValue($request, $field, $parameter['default']);
+                $operator = $this->normalizeFilterOperator((string) ($parameter['operator'] ?? '='));
+                $rawValue = $this->resolveFilterValue($request, $field, $parameter['default']);
+                $rawValue = $this->parseRuntimeValue($rawValue);
             if ($rawValue === null || $rawValue === '') {
                 if (($parameter['required'] ?? false) === true) {
                     return response()->json([
@@ -125,39 +154,44 @@ class DataQueryService
                 continue;
             }
 
-            $formattedValue = $this->findFormatValue(
-                $parameter['type'],
-                $rawValue,
-                false
-            );
+                $formattedValue = $this->findFormatValue(
+                    $parameter['type'],
+                    $rawValue,
+                    false
+                );
 
-            $filterClause = $this->buildFilterClause($field, $operator, $formattedValue);
-            $query .= $filterClause;
-            $queryCount .= $filterClause;
-            $appliedFilters[] = [
-                'field' => $field,
-                'operator' => $operator,
-                'value' => $formattedValue,
-            ];
-        }
+                $filterClause = $this->buildFilterClause($field, $operator, $formattedValue);
+                $query .= $filterClause;
+                $queryCount .= $filterClause;
+                $appliedFilters[] = [
+                    'field' => $field,
+                    'operator' => $operator,
+                    'value' => $formattedValue,
+                ];
+            }
 
-        $cacheKey = DatabaseConnection::cachePrefix($definition['identifier'] . '_query_' . md5(
+            $cacheKey = DatabaseConnection::cachePrefix($definition['identifier'] . '_query_' . md5(
             $query . '|' . $queryCount . '|' . json_encode($appliedFilters) . '|' . ($request->page ?? '0') . '|' . ($request->per_page ?? '0')
-        ));
+            ));
 
-        if (!empty($request->isDebug) && $request->isDebug) {
-            $result = $this->makeQuery($queryCount, $query, $request, $definition);
-        } else {
-            $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request, $definition) {
-                return $this->makeQuery($queryCount, $query, $request, $definition);
-            });
+            if (!empty($request->isDebug) && $request->isDebug) {
+                $result = $this->runQueryDirectly($queryCount, $query, $request, $definition);
+            } elseif (! $this->cacheEnabled) {
+                $result = $this->runQueryDirectly($queryCount, $query, $request, $definition);
+            } else {
+                $result = Cache::remember($cacheKey, now()->addMinutes(10), function () use ($queryCount, $query, $request, $definition) {
+                    return $this->runQueryDirectly($queryCount, $query, $request, $definition);
+                });
+            }
+
+            if (!empty($result['error'])) {
+                return response()->json(['error' => $result['error'], 'message' => $result['error']], 400);
+            }
+
+            return response()->json($result);
+        } catch (InvalidRuntimeVariableException $e) {
+            return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
         }
-
-        if (!empty($result['error'])) {
-            return response()->json(['error' => $result['error'], 'message' => $result['error']], 400);
-        }
-
-        return response()->json($result);
     }
 
     protected function buildBaseQueries(array $definition): array
@@ -179,7 +213,7 @@ class DataQueryService
         ];
     }
 
-    protected function makeQuery(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
+    protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
     {
         try {
             $query = $this->ensureStringQuery($query);
@@ -227,6 +261,14 @@ class DataQueryService
         } catch (\Exception $e) {
             return ['error' => $e->getMessage()];
         }
+    }
+
+    /**
+     * Backward-compatible query executor used by the cache bypass path.
+     */
+    protected function makeQuery(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
+    {
+        return $this->runQueryDirectly($queryCount, $query, $request, $definition);
     }
 
     protected function paginate($items, int $total, int $perPage = 5, int $page = 1, array $options = []): LengthAwarePaginator
@@ -512,11 +554,16 @@ class DataQueryService
                 'name' => $param['name'],
                 'type' => $param['type'],
                 'required' => (bool) ($param['required'] ?? false),
-                'default' => $param['default'] ?? null,
+                'default' => $this->parseRuntimeValue($param['default'] ?? null),
             ];
         }
 
         return $normalized;
+    }
+
+    protected function parseRuntimeValue(mixed $value): mixed
+    {
+        return $this->runtimeVariableParser->parse($value);
     }
 
     protected function ensureStringQuery(mixed $query): string

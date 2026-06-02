@@ -10,9 +10,11 @@ class DatabaseConnection
 {
     public static function name(): string
     {
-        $connection = config('datasources.database_connection', env('LARAVEL_FORM_BUILDER_DB_CONNECTION', env('DB_CONNECTION', 'mysql')));
-
-        return is_string($connection) && trim($connection) !== '' ? trim($connection) : 'mysql';
+        $connection = config('datasources.database_connection', env('LARAVEL_FORM_BUILDER_DB_CONNECTION', env('DB_CONNECTION')));
+        
+        return is_string($connection) && trim($connection) !== ''
+            ? trim($connection)
+            : (string) config('database.default', '');
     }
 
     public static function connection(): ConnectionInterface
