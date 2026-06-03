@@ -63,6 +63,36 @@ class DataQueryServiceRuntimeTest extends TestCase
         $this->assertSame('invoices', $definition['table_name']);
         $this->assertSame(['id', 'name'], $definition['columns']);
     }
+
+    public function test_it_formats_select_columns_with_backticks_and_preserves_raw_expressions(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry())
+        );
+
+        [$countQuery, $selectQuery] = $service->exposeBuildBaseQueries([
+            'table_name' => 'tc_truck_type_positions',
+            'columns' => [
+                'id',
+                'truck_type_id',
+                '  position_code  ',
+                '`position_name`',
+                'COUNT(*) as aggregate',
+                'CONCAT(first_name, " ", last_name)',
+                'table_alias.column_name as alias_name',
+                'table_alias.*',
+            ],
+        ]);
+
+        $this->assertSame(
+            'SELECT count(*) as aggregate FROM tc_truck_type_positions WHERE 1=1',
+            $countQuery
+        );
+        $this->assertSame(
+            'SELECT `id` , `truck_type_id` , `position_code` , `position_name` , COUNT(*) as aggregate , CONCAT(first_name, " ", last_name) , table_alias.column_name as alias_name , `table_alias`.* FROM tc_truck_type_positions WHERE 1=1',
+            $selectQuery
+        );
+    }
 }
 
 class CapturingDataQueryService extends DataQueryService
@@ -74,5 +104,10 @@ class CapturingDataQueryService extends DataQueryService
         $this->capturedDefinition = $definition;
 
         return new JsonResponse(['ok' => true], 200);
+    }
+
+    public function exposeBuildBaseQueries(array $definition): array
+    {
+        return $this->buildBaseQueries($definition);
     }
 }

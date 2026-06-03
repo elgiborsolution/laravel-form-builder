@@ -205,12 +205,82 @@ class DataQueryService
             ];
         }
 
-        $columns = implode(',', $definition['columns']);
+        $columns = $this->formatSelectColumns($definition['columns'] ?? []);
 
         return [
             "SELECT count(*) as aggregate FROM {$definition['table_name']} WHERE 1=1",
             "SELECT {$columns} FROM {$definition['table_name']} WHERE 1=1",
         ];
+    }
+
+    /**
+     * Format a SELECT column list while keeping raw SQL expressions intact.
+     *
+     * @param array<int, mixed> $columns
+     * @return string
+     */
+    protected function formatSelectColumns(array $columns): string
+    {
+        $normalized = [];
+
+        foreach ($columns as $column) {
+            $formatted = $this->normalizeSelectColumn($column);
+
+            if ($formatted === '') {
+                continue;
+            }
+
+            $normalized[] = $formatted;
+        }
+
+        return $normalized === [] ? '*' : implode(' , ', $normalized);
+    }
+
+    /**
+     * Normalize a single SELECT column or raw expression.
+     *
+     * @param mixed $column
+     * @return string
+     */
+    protected function normalizeSelectColumn(mixed $column): string
+    {
+        if (! is_string($column) && ! is_numeric($column)) {
+            return '';
+        }
+
+        $column = trim((string) $column);
+
+        if ($column === '') {
+            return '';
+        }
+
+        if (
+            $column === '*'
+            || str_contains($column, '(')
+            || str_contains($column, ')')
+            || preg_match('/\s+as\s+/i', $column) === 1
+        ) {
+            return $column;
+        }
+
+        $segments = explode('.', $column);
+
+        foreach ($segments as $index => $segment) {
+            $segment = trim($segment, " \t\n\r\0\x0B`");
+
+            if ($segment === '') {
+                continue;
+            }
+
+            if ($segment === '*') {
+                $segments[$index] = '*';
+                continue;
+            }
+
+            $segments[$index] = '`' . $segment . '`';
+        }
+
+        return implode('.', $segments);
     }
 
     protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection

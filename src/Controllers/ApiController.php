@@ -89,50 +89,65 @@ class ApiController extends Controller
 
   protected function applyRuntimeDefaults(Request $request, array $params): void
   {
-      $payload = $request->all();
-
-      foreach ($this->collectRuntimeDefaults($params) as $path => $default) {
-          $currentValue = data_get($payload, $path);
-
-          if ($currentValue !== null && $currentValue !== '') {
-              continue;
-          }
-
-          data_set($payload, $path, $this->runtimeVariableParser->parse($default));
-      }
-
-      $request->merge($payload);
+      $request->merge($this->applyRuntimeDefaultsToPayload($request->all(), $params));
   }
 
   /**
+   * Apply runtime defaults recursively without flattening nested collection
+   * payloads into dot-notation paths.
+   *
+   * @param array<string, mixed> $payload
+   * @param array<int, mixed> $params
    * @return array<string, mixed>
    */
-  protected function collectRuntimeDefaults(array $params, string $prefix = ''): array
+  protected function applyRuntimeDefaultsToPayload(array $payload, array $params): array
   {
-      $defaults = [];
-
       foreach ($params as $param) {
           if (! is_array($param) || empty($param['name'])) {
               continue;
           }
 
           $name = (string) $param['name'];
-          $path = $prefix === '' ? $name : $prefix . '.' . $name;
+          $type = (string) ($param['type'] ?? '');
 
-          if (array_key_exists('default', $param)) {
-              $defaults[$path] = $param['default'];
+          if (in_array($type, ['array', 'object'], true)) {
+              if (! array_key_exists($name, $payload) || ! is_array($payload[$name])) {
+                  continue;
+              }
+
+              $childParams = is_array($param['params'] ?? null) ? $param['params'] : [];
+
+              if ($childParams === []) {
+                  continue;
+              }
+
+              if (array_is_list($payload[$name])) {
+                  foreach ($payload[$name] as $index => $item) {
+                      if (! is_array($item)) {
+                          continue;
+                      }
+
+                      $payload[$name][$index] = $this->applyRuntimeDefaultsToPayload($item, $childParams);
+                  }
+              } else {
+                  $payload[$name] = $this->applyRuntimeDefaultsToPayload($payload[$name], $childParams);
+              }
+
+              continue;
           }
 
           if (
-              in_array((string) ($param['type'] ?? ''), ['array', 'object'], true)
-              && ! empty($param['params'])
-              && is_array($param['params'])
+              (! array_key_exists($name, $payload))
+              || $payload[$name] === null
+              || $payload[$name] === ''
           ) {
-              $defaults += $this->collectRuntimeDefaults($param['params'], $path);
+              if (array_key_exists('default', $param)) {
+                  $payload[$name] = $this->runtimeVariableParser->parse($param['default']);
+              }
           }
       }
 
-      return $defaults;
+      return $payload;
   }
 
   protected function prepareRuntimeRequest(Request $request, array $params): ?JsonResponse
