@@ -19,6 +19,7 @@ class DataQueryService
     protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'];
     protected bool $cacheEnabled = true;
     protected bool $forceDisableCacheForDataSource = true;
+    protected ?string $executionConnectionName = null;
 
     public function __construct(
         protected DynamicVariableParser $runtimeVariableParser
@@ -32,6 +33,7 @@ class DataQueryService
 
             $definition = [
                 'identifier' => $cacheKeyPrefix,
+                'connection_name' => $this->resolveExecutionConnectionName($request),
                 'parameters' => $dataSource->parameters->map(function ($param): array {
                     return [
                         'name' => $param->param_name,
@@ -66,6 +68,7 @@ class DataQueryService
 
             $definition = [
                 'identifier' => $cacheKeyPrefix,
+                'connection_name' => $this->resolveExecutionConnectionName($request),
                 'parameters' => $this->normalizeApiConfigParameters($apiConfig->params ?? []),
                 'use_custom_query' => false,
                 'custom_query' => null,
@@ -85,6 +88,9 @@ class DataQueryService
 
     public function execute(Request $request, array $definition): JsonResponse
     {
+        $previousExecutionConnectionName = $this->executionConnectionName;
+        $this->executionConnectionName = $this->normalizeConnectionName($definition['connection_name'] ?? $this->resolveExecutionConnectionName($request));
+
         try {
             if (!empty($request->params) && is_string($request->params)) {
             $params = json_decode($request->params, true);
@@ -170,7 +176,7 @@ class DataQueryService
                 ];
             }
 
-            $cacheKey = DatabaseConnection::cachePrefix($definition['identifier'] . '_query_' . md5(
+            $cacheKey = $this->cachePrefixForExecution($definition['identifier'] . '_query_' . md5(
             $query . '|' . $queryCount . '|' . json_encode($appliedFilters) . '|' . ($request->page ?? '0') . '|' . ($request->per_page ?? '0')
             ));
 
@@ -191,6 +197,8 @@ class DataQueryService
             return response()->json($result);
         } catch (InvalidRuntimeVariableException $e) {
             return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+        } finally {
+            $this->executionConnectionName = $previousExecutionConnectionName;
         }
     }
 
@@ -286,15 +294,16 @@ class DataQueryService
     protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|LengthAwarePaginator|Collection
     {
         try {
+            $connection = DatabaseConnection::connection($this->executionConnectionName);
             $query = $this->ensureStringQuery($query);
             if ($queryCount !== null) {
                 $queryCount = $this->ensureStringQuery($queryCount);
             }
             if (!empty($request->page)) {
                 if (empty($queryCount)) {
-                    $count = count(DatabaseConnection::connection()->select($query));
+                    $count = count($connection->select($query));
                 } else {
-                    $dataCount = DatabaseConnection::connection()->select($queryCount);
+                    $dataCount = $connection->select($queryCount);
                     $count = $dataCount[0]->aggregate;
                 }
 
@@ -303,23 +312,23 @@ class DataQueryService
                 $start = ($page - 1) * $perPage;
                 $query .= ' LIMIT ' . $start . ', ' . $perPage;
 
-                $data = DatabaseConnection::connection()->select($query);
+                $data = $connection->select($query);
                 $dataResult = $this->paginate($data, $count, $perPage, $request->page);
             } else {
-                $data = DatabaseConnection::connection()->select($query);
+                $data = $connection->select($query);
                 $dataResult = ['data' => $data];
             }
 
             if (!empty($request->isDebug) && $request->isDebug) {
                 $explainQuery = $this->ensureStringQuery('explain ' . $query);
-                $dataExplain = DatabaseConnection::connection()->select($explainQuery);
+                $dataExplain = $connection->select($explainQuery);
 
                 if (!empty($definition['use_custom_query'])) {
                     $custom = collect(['data_index' => [], 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 } else {
                     $indexQuery = $this->ensureStringQuery('show index from ' . $definition['debug_index_table']);
-                    $dataIndex = DatabaseConnection::connection()->select($indexQuery);
+                    $dataIndex = $connection->select($indexQuery);
                     $custom = collect(['data_index' => $dataIndex, 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 }
@@ -518,7 +527,7 @@ class DataQueryService
             return (string) $value;
         }
 
-        $quoted = DatabaseConnection::connection()->getPdo()->quote((string) $value);
+        $quoted = DatabaseConnection::connection($this->executionConnectionName)->getPdo()->quote((string) $value);
 
         return $quoted !== false ? $quoted : "'" . str_replace("'", "''", (string) $value) . "'";
     }
@@ -641,7 +650,7 @@ class DataQueryService
         if ($query instanceof \Illuminate\Database\Query\Expression) {
             if (method_exists($query, 'getValue')) {
                 try {
-                    $query = $query->getValue(DatabaseConnection::connection()->getQueryGrammar());
+                    $query = $query->getValue(DatabaseConnection::connection($this->executionConnectionName)->getQueryGrammar());
                 } catch (\Throwable $e) {
                     try {
                         $query = $query->getValue();
@@ -659,5 +668,38 @@ class DataQueryService
         }
 
         return $query;
+    }
+
+    protected function resolveExecutionConnectionName(Request $request): string
+    {
+        return DatabaseConnection::resolveExecutionConnectionName($request);
+    }
+
+    protected function normalizeConnectionName(mixed $connectionName): string
+    {
+        if (! is_string($connectionName)) {
+            return DatabaseConnection::configuredName();
+        }
+
+        $connectionName = trim($connectionName);
+
+        return $connectionName !== '' ? $connectionName : DatabaseConnection::configuredName();
+    }
+
+    protected function cachePrefixForExecution(string $key): string
+    {
+        $connection = $this->executionConnectionName ?? DatabaseConnection::configuredName();
+
+        try {
+            $databaseName = DatabaseConnection::connection($connection)->getDatabaseName();
+
+            if (is_string($databaseName) && trim($databaseName) !== '') {
+                return $connection . '@' . trim($databaseName) . ':' . $key;
+            }
+        } catch (\Throwable $e) {
+            // Fall through to connection-scoped key.
+        }
+
+        return $connection . ':' . $key;
     }
 }

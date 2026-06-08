@@ -6,7 +6,9 @@ use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Collection;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
@@ -28,11 +30,17 @@ class DataSourceController extends Controller
 
   public function index(Request $request)
   {
-    $data = DataSource::with('parameters');
+    $connection = DatabaseConnection::configuredName();
+    $data = DataSource::on($connection)->orderBy('id');
+
     if(!empty($request->page)){
-      return $data->paginate(10);
+      $paginator = $data->paginate(10);
+      $this->attachDataSourceParameters($paginator->getCollection(), $connection);
+
+      return $paginator;
     }else{
       $data = $data->get();
+      $this->attachDataSourceParameters($data, $connection);
     }
     return response()->json(['data' => $data], 200);
   }
@@ -630,6 +638,110 @@ class DataSourceController extends Controller
   }
 
   /**
+   * Attach parameter records using the explicit datasource connection.
+   *
+   * @param Collection<int, DataSource> $dataSources
+   * @param string $connection
+   * @return void
+   */
+  protected function attachDataSourceParameters(Collection $dataSources, string $connection): void
+  {
+    if ($dataSources->isEmpty()) {
+      return;
+    }
+
+    $ids = $dataSources->pluck('id')->filter()->values()->all();
+
+    if ($ids === []) {
+      return;
+    }
+
+    $parametersBySource = DataSourceParameter::on($connection)
+      ->whereIn('data_source_id', $ids)
+      ->get()
+      ->groupBy('data_source_id');
+
+    $dataSources->each(function (DataSource $dataSource) use ($parametersBySource): void {
+      $dataSource->setRelation(
+        'parameters',
+        $parametersBySource->get($dataSource->id, collect())->values()
+      );
+    });
+  }
+
+  /**
+   * Execute a callback inside the tenant database context when the request
+   * provides an `x-tenant` header.
+   *
+   * This keeps the existing non-tenant behavior intact while ensuring the
+   * Data Source lookup and execution flow run on the active tenant database.
+   *
+   * @template TReturn
+   * @param Request $request
+   * @param \Closure():TReturn $callback
+   * @return mixed
+   */
+  protected function runWithDatasourceTenantContext(Request $request, \Closure $callback)
+  {
+    if ($request->attributes->get('datasources.connection_resolved') === true) {
+      return $callback();
+    }
+
+    $tenantId = trim((string) $request->header('x-tenant'));
+
+    if ($tenantId === '') {
+      return $callback();
+    }
+
+    $tenantInitialized = false;
+
+    try {
+      if (function_exists('tenancy')) {
+        try {
+          tenancy()->initialize($tenantId);
+          $tenantInitialized = true;
+          $connection = DB::getDefaultConnection();
+
+          if (! is_string($connection) || trim($connection) === '') {
+            $connection = DatabaseConnection::configuredName();
+          }
+
+          $request->attributes->set('datasources.connection_name', trim($connection));
+        } catch (\Throwable $e) {
+          // If tenancy cannot be initialized, keep the package connection flow.
+        }
+      }
+
+      return $callback();
+    } finally {
+      if ($tenantInitialized && function_exists('tenancy')) {
+        try {
+          tenancy()->end();
+        } catch (\Throwable $e) {
+          // Ignore teardown failures so the request can still complete.
+        }
+      }
+    }
+  }
+
+  /**
+   * Resolve the datasource execution connection for the current request.
+   *
+   * @param Request $request
+   * @return string
+   */
+  protected function resolveExecutionConnectionNameFromRequest(Request $request): string
+  {
+    $connectionName = $request->attributes->get('datasources.connection_name');
+
+    if (is_string($connectionName) && trim($connectionName) !== '') {
+      return trim($connectionName);
+    }
+
+    return DatabaseConnection::configuredName();
+  }
+
+  /**
   * Display a list of tables in the database
   *
   * @param Request $request, DataSource $id
@@ -638,24 +750,18 @@ class DataSourceController extends Controller
   */
   public function listTables(Request $request)
   {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request) {
+      $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+      $tables = DatabaseConnection::connection($connectionName)->select("SHOW TABLES");
 
+      // Laravel biasanya mengembalikan array dengan key yang berbeda tergantung pada driver
+      $tableList = [];
+      foreach ($tables as $table) {
+        $tableList[] = array_values((array) $table)[0];
+      }
 
-    $headers = $request->header('x-tenant');
-
-    if(!empty($headers)){
-        tenancy()->initialize($headers);
-    }
-
-    $tables = DatabaseConnection::connection()->select("SHOW TABLES");
-    // $databaseName = env('DB_DATABASE');
-
-    // Laravel biasanya mengembalikan array dengan key yang berbeda tergantung pada driver
-    $tableList = [];
-    foreach ($tables as $table) {
-      $tableList[] = array_values((array) $table)[0];
-    }
-
-    return response()->json(['data' => $tableList]);
+      return response()->json(['data' => $tableList]);
+    });
   }
 
   /**
@@ -667,30 +773,27 @@ class DataSourceController extends Controller
   */
   public function listColumns(Request $request, $table)
   {
-    $headers = $request->header('x-tenant');
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $table) {
+      try {
+        $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+        $columns = DatabaseConnection::connection($connectionName)->select("SHOW COLUMNS FROM `$table`");
 
-    if(!empty($headers)){
-        tenancy()->initialize($headers);
-    }
+        $columnList = [];
+        foreach ($columns as $column) {
+          $columnList[] = [
+            'name' => $column->Field,
+            'type' => $column->Type,
+            'nullable' => $column->Null === 'YES',
+            'default' => $column->Default,
+            'key' => $column->Key,
+          ];
+        }
 
-    try {
-      $columns = DatabaseConnection::connection()->select("SHOW COLUMNS FROM `$table`");
-
-      $columnList = [];
-      foreach ($columns as $column) {
-        $columnList[] = [
-          'name' => $column->Field,
-          'type' => $column->Type,
-          'nullable' => $column->Null === 'YES',
-          'default' => $column->Default,
-          'key' => $column->Key,
-        ];
+        return response()->json(['data' => $columnList]);
+      } catch (\Exception $e) {
+        return response()->json(['error' => 'Table not found'], 404);
       }
-
-      return response()->json(['data' => $columnList]);
-    } catch (\Exception $e) {
-      return response()->json(['error' => 'Table not found'], 404);
-    }
+    });
   }
 
 
@@ -704,18 +807,14 @@ class DataSourceController extends Controller
   */
   public function executeQuery(Request $request, $id)
   { 
-    $headers = $request->header('x-tenant');
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id) {
+      $dataSource = DataSource::on(DatabaseConnection::configuredName())->with('parameters')->where('name', $id)->first();
+      if (empty($dataSource)) {
+        return response()->json(['error' => 'Data source not found'], 422);
+      }
 
-    if(!empty($headers)){
-        tenancy()->initialize($headers);
-    }
-
-    $dataSource = DataSource::with('parameters')->where('name', $id)->first();
-    if (empty($dataSource)) {
-      return response()->json(['error' => 'Data source not found'], 422);
-    }
-
-    return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
+      return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
+    });
   }
 
 
@@ -728,49 +827,48 @@ class DataSourceController extends Controller
   */
   public function findAttributeSQlBuilder($request, $query)
   {
+      return $this->runWithDatasourceTenantContext($request, function () use ($request, $query) {
+        $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+        $re = '/select (.*?)from/';
+        $str = str_replace("\n", "", strtolower($query));
+        $return = [];
 
-      $headers = $request->header('x-tenant');
+        preg_match($re, $str, $matches);
+        if (count($matches) > 1) {
+          // $lineColum = str_replace("as ","as#",$matches[1]);
+          $lineColum = preg_replace('/\s+/', ' ', $matches[1]);
+          $dataColumnName = explode(',', $lineColum);
+          foreach ($dataColumnName as $key => $value) {
+            if (substr($value, 0, 1) == ' ') {
+              $value = substr($value, 1);
+            }
 
-      if(!empty($headers)){
-          tenancy()->initialize($headers);
-      }
-
-      $re = '/select (.*?)from/';
-      $str = str_replace("\n", "", strtolower($query));
-      $return = [];
-
-      preg_match($re, $str, $matches);
-      if(count($matches) > 1){
-        // $lineColum = str_replace("as ","as#",$matches[1]);
-        $lineColum = preg_replace('/\s+/', ' ', $matches[1]);
-        $dataColumnName =  explode(',', $lineColum);
-        foreach ($dataColumnName as $key => $value) {
-
-            if(substr($value, 0, 1) == ' ')$value = substr($value, 1);
-            if(substr($value, -1) == ' ')$value = substr($value, 0, -1);
+            if (substr($value, -1) == ' ') {
+              $value = substr($value, 0, -1);
+            }
 
             $arraySValue = explode(' ', $value);
-            $value = $arraySValue[count($arraySValue)-1];
+            $value = $arraySValue[count($arraySValue) - 1];
 
             $coulmnAlias = $value;
             if (str_contains($value, ')')) {
               $columnFn = explode(')', $value);
               //its mean this column dosent have alias column
-              if(count($columnFn)==1) continue;
+              if (count($columnFn) == 1) {
+                continue;
+              }
 
-              $coulmnAlias = $columnFn[count($columnFn)-1];
-
-            }else if (str_contains($value, '.')) {
+              $coulmnAlias = $columnFn[count($columnFn) - 1];
+            } elseif (str_contains($value, '.')) {
               $columnFn = explode('.', $value);
 
-              $coulmnAlias = $columnFn[count($columnFn)-1];
-
+              $coulmnAlias = $columnFn[count($columnFn) - 1];
             }
 
             $dataColumnName[$key] = $coulmnAlias;
-        }
+          }
 
-        if(in_array('*', $dataColumnName)){
+          if (in_array('*', $dataColumnName)) {
             // find first table
             // dd($dataColumnName);
             $re = '/from (.*)/';
@@ -778,45 +876,42 @@ class DataSourceController extends Controller
             preg_match($re, $str, $matches);
             $array = array_diff($dataColumnName, ["*"]);
             $dataColumnName = array_values($array);
-            if(count($matches) > 1){
-                $tquery = str_replace("`", "", strtolower($matches[1]));
-                $tquery = preg_replace('/\s+/', ' ', $tquery);
-                if(substr($tquery, 0, 1) == ' ')$tquery = substr($tquery, 1);
-                if(substr($tquery, -1) == ' ')$tquery = substr($tquery, 0, -1);
+            if (count($matches) > 1) {
+              $tquery = str_replace("`", "", strtolower($matches[1]));
+              $tquery = preg_replace('/\s+/', ' ', $tquery);
+              if (substr($tquery, 0, 1) == ' ') {
+                $tquery = substr($tquery, 1);
+              }
 
-                $tableName = explode(' ', $tquery); 
+              if (substr($tquery, -1) == ' ') {
+                $tquery = substr($tquery, 0, -1);
+              }
 
-                $selectTable = $tableName[0];
+              $tableName = explode(' ', $tquery);
 
-                try {
+              $selectTable = $tableName[0];
 
-                  $columns = DatabaseConnection::connection()->select("SHOW COLUMNS FROM `$selectTable`");
-                  $columnList = [];
-                  foreach ($columns as $column) {
-                    $dataColumnName[] = $column->Field;
-                  } 
-                } catch (\Exception $e) {
-                    $return['error'] = 'Table '.$selectTable.' not found';
+              try {
+                $columns = DatabaseConnection::connection($connectionName)->select("SHOW COLUMNS FROM `$selectTable`");
+                foreach ($columns as $column) {
+                  $dataColumnName[] = $column->Field;
                 }
+              } catch (\Exception $e) {
+                $return['error'] = 'Table ' . $selectTable . ' not found';
+              }
 
-                $arr = array_diff_assoc($dataColumnName, array_unique($dataColumnName));
-                if(count($arr) > 0){
-                    $return['error'] = 'Duplicate column '.implode(', ', $arr);
-                
-                }
-                
+              $arr = array_diff_assoc($dataColumnName, array_unique($dataColumnName));
+              if (count($arr) > 0) {
+                $return['error'] = 'Duplicate column ' . implode(', ', $arr);
+              }
             }
+          }
 
+          $return['columns'] = $dataColumnName;
         }
-        $return['columns'] = $dataColumnName;
 
-      }// if match
-
-      if(! empty($headers)){
-        tenancy()->end();
-      }
-      return $return;
-
+        return $return;
+      });
   }
 
 }
