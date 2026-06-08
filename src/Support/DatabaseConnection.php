@@ -3,7 +3,6 @@
 namespace ESolution\DataSources\Support;
 
 use Illuminate\Database\ConnectionInterface;
-use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 
@@ -68,31 +67,4 @@ class DatabaseConnection
         return $scope . ':' . $key;
     }
 
-    public static function resolveExecutionConnectionName(?Request $request = null): string
-    {
-        if ($request instanceof Request) {
-            $connection = $request->attributes->get('datasources.connection_name');
-
-            if (is_string($connection) && trim($connection) !== '') {
-                return trim($connection);
-            }
-
-            $tenantId = trim((string) $request->header('x-tenant'));
-
-            if ($tenantId !== '' && function_exists('tenancy')) {
-                try {
-                    tenancy()->initialize($tenantId);
-                    $resolved = DB::getDefaultConnection();
-
-                    if (is_string($resolved) && trim($resolved) !== '') {
-                        return trim($resolved);
-                    }
-                } catch (\Throwable $e) {
-                    // Fall back to the package connection below.
-                }
-            }
-        }
-
-        return self::configuredName();
-    }
 }

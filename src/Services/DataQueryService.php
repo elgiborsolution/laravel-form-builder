@@ -6,6 +6,7 @@ use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -22,7 +23,8 @@ class DataQueryService
     protected ?string $executionConnectionName = null;
 
     public function __construct(
-        protected DynamicVariableParser $runtimeVariableParser
+        protected DynamicVariableParser $runtimeVariableParser,
+        protected ExecutionConnectionResolver $executionConnectionResolver
     ) {
     }
 
@@ -672,7 +674,7 @@ class DataQueryService
 
     protected function resolveExecutionConnectionName(Request $request): string
     {
-        return DatabaseConnection::resolveExecutionConnectionName($request);
+        return $this->executionConnectionResolver->resolve($request);
     }
 
     protected function normalizeConnectionName(mixed $connectionName): string
