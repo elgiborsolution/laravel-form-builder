@@ -5,6 +5,7 @@ use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -16,8 +17,10 @@ use Illuminate\Validation\Rule;
 class DataSourceController extends Controller
 {
   public function __construct(
-    protected DataQueryService $dataQueryService
+    protected DataQueryService $dataQueryService,
+    protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
   ) {
+    $this->databaseMetadataProvider ??= new DatabaseMetadataProvider();
   }
 
   /**
@@ -752,13 +755,7 @@ class DataSourceController extends Controller
   {
     return $this->runWithDatasourceTenantContext($request, function () use ($request) {
       $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-      $tables = DatabaseConnection::connection($connectionName)->select("SHOW TABLES");
-
-      // Laravel biasanya mengembalikan array dengan key yang berbeda tergantung pada driver
-      $tableList = [];
-      foreach ($tables as $table) {
-        $tableList[] = array_values((array) $table)[0];
-      }
+      $tableList = $this->databaseMetadataProvider->listTables($connectionName);
 
       return response()->json(['data' => $tableList]);
     });
@@ -776,18 +773,7 @@ class DataSourceController extends Controller
     return $this->runWithDatasourceTenantContext($request, function () use ($request, $table) {
       try {
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-        $columns = DatabaseConnection::connection($connectionName)->select("SHOW COLUMNS FROM `$table`");
-
-        $columnList = [];
-        foreach ($columns as $column) {
-          $columnList[] = [
-            'name' => $column->Field,
-            'type' => $column->Type,
-            'nullable' => $column->Null === 'YES',
-            'default' => $column->Default,
-            'key' => $column->Key,
-          ];
-        }
+        $columnList = $this->databaseMetadataProvider->listColumns((string) $table, $connectionName);
 
         return response()->json(['data' => $columnList]);
       } catch (\Exception $e) {
@@ -877,7 +863,7 @@ class DataSourceController extends Controller
             $array = array_diff($dataColumnName, ["*"]);
             $dataColumnName = array_values($array);
             if (count($matches) > 1) {
-              $tquery = str_replace("`", "", strtolower($matches[1]));
+              $tquery = str_replace(['`', '"'], "", strtolower($matches[1]));
               $tquery = preg_replace('/\s+/', ' ', $tquery);
               if (substr($tquery, 0, 1) == ' ') {
                 $tquery = substr($tquery, 1);
@@ -892,13 +878,15 @@ class DataSourceController extends Controller
               $selectTable = $tableName[0];
 
               try {
-                $columns = DatabaseConnection::connection($connectionName)->select("SHOW COLUMNS FROM `$selectTable`");
+                $columns = $this->databaseMetadataProvider->listColumns($selectTable, $connectionName);
                 foreach ($columns as $column) {
-                  $dataColumnName[] = $column->Field;
+                  $dataColumnName[] = $column['name'] ?? null;
                 }
               } catch (\Exception $e) {
                 $return['error'] = 'Table ' . $selectTable . ' not found';
               }
+
+              $dataColumnName = array_values(array_filter($dataColumnName, static fn ($column) => is_string($column) && $column !== ''));
 
               $arr = array_diff_assoc($dataColumnName, array_unique($dataColumnName));
               if (count($arr) > 0) {

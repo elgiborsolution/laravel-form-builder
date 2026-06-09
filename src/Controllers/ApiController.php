@@ -395,7 +395,7 @@ class ApiController extends Controller
           // Prepare parent table data for insertion
           $parentData = [];
           foreach ($apiConfigs->parentTable->data_params as $column => $paramPath) {
-              $parentData[$column] = $this->getValueFromPath($request->all(), $paramPath);
+              $parentData[$column] = $this->resolveDataParamValue($paramPath, $request);
           }
 
           // Insert data into the parent table and get the generated ID
@@ -526,7 +526,7 @@ class ApiController extends Controller
             // insert parent table
             $parentData  = [];
             foreach ($apiConfigs->parentTable->data_params as $column => $paramPath) {
-                $parentData[$column] = $this->getValueFromPath($request->all(), $paramPath);
+                $parentData[$column] = $this->resolveDataParamValue($paramPath, $request);
             }
 
             $connection->table($cleanParentTable)

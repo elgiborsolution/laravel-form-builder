@@ -47,7 +47,9 @@ class DatabaseConnection
 
     public static function validationTable(string $table): string
     {
-        return self::configuredName() . '.' . $table;
+        $connection = trim(self::configuredName());
+
+        return $connection !== '' ? $connection . '.' . $table : $table;
     }
 
     public static function cachePrefix(string $key): string
