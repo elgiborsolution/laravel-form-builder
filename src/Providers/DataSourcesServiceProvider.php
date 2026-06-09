@@ -11,6 +11,8 @@ use ESolution\DataSources\Controllers\RuntimeVariableController;
 use ESolution\DataSources\Contracts\RuntimeVariableRegistryInterface;
 use ESolution\DataSources\Http\Middleware\ForceDatabaseConnection;
 use ESolution\DataSources\Runtime\RuntimeVariableRegistryResolver;
+use ESolution\DataSources\Support\DatabaseDriverResolver;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
 use Stancl\Tenancy\Middleware\InitializeTenancyByRequestData;
@@ -24,6 +26,10 @@ class DataSourcesServiceProvider extends ServiceProvider
         $this->mergeConfigFrom(__DIR__ . '/../../config/datasources.php', 'data-sources');
 
         $this->app->singleton(RuntimeVariableRegistryResolver::class, RuntimeVariableRegistryResolver::class);
+        $this->app->singleton(DatabaseDriverResolver::class, DatabaseDriverResolver::class);
+        $this->app->singleton(DatabaseMetadataProvider::class, function ($app) {
+            return new DatabaseMetadataProvider($app->make(DatabaseDriverResolver::class));
+        });
         $this->app->bind(RuntimeVariableRegistryInterface::class, function ($app) {
             return $app->make(RuntimeVariableRegistryResolver::class)->resolveInstance();
         });

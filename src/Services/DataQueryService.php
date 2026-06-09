@@ -4,6 +4,8 @@ namespace ESolution\DataSources\Services;
 
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
+use ESolution\DataSources\Support\DatabaseDriverResolver;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
@@ -17,15 +19,20 @@ use Illuminate\Support\Facades\Validator;
 
 class DataQueryService
 {
-    protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'];
+    protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE', 'ILIKE', 'NOT ILIKE'];
     protected bool $cacheEnabled = true;
     protected bool $forceDisableCacheForDataSource = true;
     protected ?string $executionConnectionName = null;
 
     public function __construct(
         protected DynamicVariableParser $runtimeVariableParser,
-        protected ExecutionConnectionResolver $executionConnectionResolver
+        protected ?ExecutionConnectionResolver $executionConnectionResolver = null,
+        protected ?DatabaseDriverResolver $databaseDriverResolver = null,
+        protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
     ) {
+        $this->executionConnectionResolver ??= new ExecutionConnectionResolver();
+        $this->databaseDriverResolver ??= new DatabaseDriverResolver();
+        $this->databaseMetadataProvider ??= new DatabaseMetadataProvider($this->databaseDriverResolver);
     }
 
     public function executeForDataSource(Request $request, DataSource $dataSource, string $cacheKeyPrefix): JsonResponse
@@ -274,9 +281,10 @@ class DataQueryService
         }
 
         $segments = explode('.', $column);
+        $driver = $this->databaseDriverResolver->resolve($this->executionConnectionName);
 
         foreach ($segments as $index => $segment) {
-            $segment = trim($segment, " \t\n\r\0\x0B`");
+            $segment = trim($segment, " \t\n\r\0\x0B`\"");
 
             if ($segment === '') {
                 continue;
@@ -287,7 +295,7 @@ class DataQueryService
                 continue;
             }
 
-            $segments[$index] = '`' . $segment . '`';
+            $segments[$index] = $driver->quoteIdentifier($segment);
         }
 
         return implode('.', $segments);
@@ -312,7 +320,9 @@ class DataQueryService
                 $perPage = $request->per_page ?? 10;
                 $page = $request->page == "" ? "1" : $request->page;
                 $start = ($page - 1) * $perPage;
-                $query .= ' LIMIT ' . $start . ', ' . $perPage;
+                $query = $this->databaseDriverResolver
+                    ->resolve($this->executionConnectionName)
+                    ->compilePaginatedQuery($query, (int) $start, (int) $perPage);
 
                 $data = $connection->select($query);
                 $dataResult = $this->paginate($data, $count, $perPage, $request->page);
@@ -322,15 +332,18 @@ class DataQueryService
             }
 
             if (!empty($request->isDebug) && $request->isDebug) {
-                $explainQuery = $this->ensureStringQuery('explain ' . $query);
+                $driver = $this->databaseDriverResolver->resolve($this->executionConnectionName);
+                $explainQuery = $this->ensureStringQuery($driver->compileExplainQuery($query));
                 $dataExplain = $connection->select($explainQuery);
 
                 if (!empty($definition['use_custom_query'])) {
                     $custom = collect(['data_index' => [], 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 } else {
-                    $indexQuery = $this->ensureStringQuery('show index from ' . $definition['debug_index_table']);
-                    $dataIndex = $connection->select($indexQuery);
+                    $dataIndex = $this->databaseMetadataProvider->listIndexes(
+                        (string) $definition['debug_index_table'],
+                        $this->executionConnectionName
+                    );
                     $custom = collect(['data_index' => $dataIndex, 'data_explain' => $dataExplain, 'query_sql' => $query]);
                     $dataResult = $custom->merge($dataResult);
                 }
@@ -482,12 +495,15 @@ class DataQueryService
     protected function buildFilterClause(string $field, string $operator, mixed $value): string
     {
         $column = $this->sanitizeIdentifier($field);
-        $operator = $this->normalizeFilterOperator($operator);
+        $driver = $this->databaseDriverResolver->resolve($this->executionConnectionName);
+        $operator = $driver->normalizeLikeOperator($this->normalizeFilterOperator($operator));
 
         return match ($operator) {
             '=', '!=', '>', '<', '>=', '<=' => ' AND ' . $column . ' ' . $operator . ' ' . $this->quoteSqlValue($value),
             'LIKE' => ' AND ' . $column . ' LIKE ' . $this->quoteSqlValue('%' . (string) $value . '%'),
             'NOT LIKE' => ' AND ' . $column . ' NOT LIKE ' . $this->quoteSqlValue('%' . (string) $value . '%'),
+            'ILIKE' => ' AND ' . $column . ' ILIKE ' . $this->quoteSqlValue('%' . (string) $value . '%'),
+            'NOT ILIKE' => ' AND ' . $column . ' NOT ILIKE ' . $this->quoteSqlValue('%' . (string) $value . '%'),
             default => ' AND ' . $column . ' = ' . $this->quoteSqlValue($value),
         };
     }
@@ -548,17 +564,18 @@ class DataQueryService
             throw new \InvalidArgumentException('Invalid filter field: empty identifier');
         }
 
+        $driver = $this->databaseDriverResolver->resolve($this->executionConnectionName);
         $segments = explode('.', $identifier);
         $quotedSegments = [];
 
         foreach ($segments as $segment) {
-            $segment = trim($segment, " \t\n\r\0\x0B`");
+            $segment = trim($segment, " \t\n\r\0\x0B`\"");
 
             if ($segment === '' || ! preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $segment)) {
                 throw new \InvalidArgumentException("Invalid filter field: {$identifier}");
             }
 
-            $quotedSegments[] = '`' . $segment . '`';
+            $quotedSegments[] = $driver->quoteIdentifier($segment);
         }
 
         return implode('.', $quotedSegments);

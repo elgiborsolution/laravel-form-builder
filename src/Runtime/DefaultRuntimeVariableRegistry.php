@@ -100,6 +100,11 @@ class DefaultRuntimeVariableRegistry implements RuntimeVariableRegistryInterface
                 'description' => 'Current application environment',
                 'resolver' => static fn () => app()->environment(),
             ],
+            'uuid.random' => [
+                'type' => 'string',
+                'description' => 'Generate a random UUID v4',
+                'resolver' => static fn () => \Illuminate\Support\Str::uuid()->toString(),
+            ],
         ];
     }
 
