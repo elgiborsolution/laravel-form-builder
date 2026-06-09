@@ -3,6 +3,7 @@
 namespace ESolution\DataSources\Http\Middleware;
 
 use Closure;
+use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 
@@ -22,24 +23,66 @@ class ForceDatabaseConnection
     public function handle(Request $request, Closure $next, ?string $connection = null)
     {
         $connection = is_string($connection) ? trim($connection) : '';
+        $initializedTenantContext = false;
+
+        if ($connection === '') {
+            $connection = $this->resolveTenantConnection($request);
+            $initializedTenantContext = $connection !== '';
+        }
 
         if ($connection === '') {
             return $next($request);
         }
 
-        $databaseManager = app('db');
-        $previousDefaultConnection = DB::getDefaultConnection();
+        $request->attributes->set('datasources.connection_resolved', true);
+        $request->attributes->set('datasources.connection_name', $connection);
 
         try {
-            config(['database.default' => $connection]);
-            $databaseManager->setDefaultConnection($connection);
-            DB::setDefaultConnection($connection);
-
             return $next($request);
         } finally {
-            config(['database.default' => $previousDefaultConnection]);
-            $databaseManager->setDefaultConnection($previousDefaultConnection);
-            DB::setDefaultConnection($previousDefaultConnection);
+            if ($initializedTenantContext) {
+                $this->endTenantContext();
+            }
+        }
+    }
+
+    protected function resolveTenantConnection(Request $request): string
+    {
+        $tenantId = trim((string) $request->header('x-tenant'));
+
+        if ($tenantId === '') {
+            return '';
+        }
+
+        if (! function_exists('tenancy')) {
+            return '';
+        }
+
+        try {
+            tenancy()->initialize($tenantId);
+        } catch (\Throwable $e) {
+            return '';
+        }
+
+        $connection = DB::getDefaultConnection();
+
+        if (! is_string($connection) || trim($connection) === '') {
+            $connection = DatabaseConnection::configuredName();
+        }
+
+        return trim($connection);
+    }
+
+    protected function endTenantContext(): void
+    {
+        if (! function_exists('tenancy')) {
+            return;
+        }
+
+        try {
+            tenancy()->end();
+        } catch (\Throwable $e) {
+            // Ignore teardown failures so the wrapped request still completes.
         }
     }
 }

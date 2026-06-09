@@ -7,6 +7,7 @@ use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Support\MiddlewareConnectionResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -29,7 +30,8 @@ class ApiController extends Controller
         protected DataQueryService $dataQueryService,
         protected Pipeline $pipeline,
         protected DynamicVariableParser $runtimeVariableParser,
-        protected MiddlewareConnectionResolver $middlewareConnectionResolver
+        protected MiddlewareConnectionResolver $middlewareConnectionResolver,
+        protected ExecutionConnectionResolver $executionConnectionResolver
     ) {
     }
 
@@ -47,6 +49,7 @@ class ApiController extends Controller
 
         if (!empty($headers)) {
             tenancy()->initialize($headers);
+            $request->attributes->set('datasources.connection_name', DB::getDefaultConnection());
         }
 
         return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
@@ -335,11 +338,12 @@ class ApiController extends Controller
   */
   public function store(Request $request, $apiConfigs)
   {
+    
       if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
           return $runtimeError;
       }
 
-      $connection = DatabaseConnection::connection();
+      $connection = $this->executionConnectionResolver->connection($request);
       // Validate input data based on API configurations
       $checkValidateRule = $this->validateRule($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
 
@@ -509,7 +513,7 @@ class ApiController extends Controller
             return response()->json(['status' => 400, 'error' => 'Invalid Api Builder', 'message' => 'The input data for the parent table cannot be plural (cannot use an array parameter).'], 400);
         }
 
-        $connection = DatabaseConnection::connection();
+        $connection = $this->executionConnectionResolver->connection($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
@@ -624,7 +628,7 @@ class ApiController extends Controller
         $parentTable = $apiConfigs->parentTable->table_name;
         $primarykey = $apiConfigs->parentTable->primary_key;
 
-        $connection = DatabaseConnection::connection();
+        $connection = $this->executionConnectionResolver->connection($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 

@@ -34,7 +34,10 @@ class DataAPIBuilderController extends Controller
       {
 
         $dataApiBuilder = Cache::remember($this->cacheKey('list-api-configs'), 60, function (){
-                return  ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->get()->toArray();
+                return  ApiConfig::on(DatabaseConnection::configuredName())
+                    ->with('parentTable', 'childTables', 'permission', 'hook')
+                    ->get()
+                    ->toArray();
         });
 
           return response()->json(['data' => $dataApiBuilder], 200);
@@ -50,7 +53,7 @@ class DataAPIBuilderController extends Controller
     {
         $ids = $this->normalizeSelectedIds($request->input('ids', []));
 
-        $query = ApiConfig::query()
+        $query = ApiConfig::on(DatabaseConnection::configuredName())
             ->with(['parentTable', 'childTables', 'permission', 'hook'])
             ->orderBy('id');
 
@@ -746,7 +749,7 @@ class DataAPIBuilderController extends Controller
             ];
         }
 
-        $config = ApiConfig::query()
+        $config = ApiConfig::on(DatabaseConnection::configuredName())
             ->with(['parentTable', 'childTables', 'permission', 'hook'])
             ->where('route_name', $routeName)
             ->where('endpoint', $endpoint)
@@ -1160,9 +1163,15 @@ class DataAPIBuilderController extends Controller
   {
 
     $headers = $request->header('x-tenant');
-    $dataApiBuilder = ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->where('id', $id)->first();
+    $dataApiBuilder = ApiConfig::on(DatabaseConnection::configuredName())
+        ->with('parentTable', 'childTables', 'permission', 'hook')
+        ->where('id', $id)
+        ->first();
     if (empty($dataApiBuilder)) {
-        $dataApiBuilder = ApiConfig::with('parentTable', 'childTables', 'permission', 'hook')->where('code', $id)->first();
+        $dataApiBuilder = ApiConfig::on(DatabaseConnection::configuredName())
+            ->with('parentTable', 'childTables', 'permission', 'hook')
+            ->where('code', $id)
+            ->first();
     }
     if (empty($dataApiBuilder)) {
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
@@ -1195,7 +1204,9 @@ class DataAPIBuilderController extends Controller
      if (!class_exists($eventClass)) {
          Artisan::call('make:event AfterRunnerApiBuiderEvent');
      } 
-    $dataApiBuilder = ApiConfig::where('id', $id)->first();
+    $dataApiBuilder = ApiConfig::on(DatabaseConnection::configuredName())
+        ->where('id', $id)
+        ->first();
     if (empty($dataApiBuilder)) {
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
     }
@@ -1430,7 +1441,9 @@ class DataAPIBuilderController extends Controller
 
       public function destroy(Request $request, $id)
       {
-        $dataApiBuilder = ApiConfig::where('id', $id)->first();
+        $dataApiBuilder = ApiConfig::on(DatabaseConnection::configuredName())
+            ->where('id', $id)
+            ->first();
         if (empty($dataApiBuilder)) {
           return response()->json(['error' => 'Data api builder not found'], 400);
         }

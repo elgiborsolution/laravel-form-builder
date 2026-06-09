@@ -9,6 +9,7 @@ use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Controllers\DataTableBuilderController;
 use ESolution\DataSources\Controllers\RuntimeVariableController;
 use ESolution\DataSources\Contracts\RuntimeVariableRegistryInterface;
+use ESolution\DataSources\Http\Middleware\ForceDatabaseConnection;
 use ESolution\DataSources\Runtime\RuntimeVariableRegistryResolver;
 use Illuminate\Support\Facades\Route;
 use Illuminate\Support\ServiceProvider;
@@ -60,7 +61,12 @@ class DataSourcesServiceProvider extends ServiceProvider
 
     protected function registerManagementRoutes(): void
     {
-        Route::middleware(config('datasources.routes.management.middleware', ['api']))
+        $middleware = array_values(array_filter(array_merge(
+            [ForceDatabaseConnection::class],
+            config('datasources.routes.management.middleware', ['api'])
+        )));
+
+        Route::middleware($middleware)
             ->prefix($this->buildPrefix())
             ->as(config('datasources.routes.name', 'datasources.'))
             ->group(function (): void {

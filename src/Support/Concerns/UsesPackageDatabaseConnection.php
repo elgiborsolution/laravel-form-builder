@@ -8,6 +8,6 @@ trait UsesPackageDatabaseConnection
 {
     public function getConnectionName(): ?string
     {
-        return DatabaseConnection::name();
+        return DatabaseConnection::configuredName();
     }
 }
