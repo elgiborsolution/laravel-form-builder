@@ -39,7 +39,7 @@ class MySqlDatabaseDriver implements DatabaseDriver
     public function listTables(ConnectionInterface $connection): array
     {
         $rows = $connection->select(
-            'SELECT table_name
+            'SELECT table_name AS table_name
             FROM information_schema.tables
             WHERE table_schema = DATABASE()
               AND table_type = ?
@@ -48,7 +48,7 @@ class MySqlDatabaseDriver implements DatabaseDriver
         );
 
         return array_values(array_map(
-            static fn (object $row): string => (string) $row->table_name,
+            fn (object $row): string => (string) $this->rowValue($row, ['table_name']),
             $rows
         ));
     }
@@ -72,18 +72,18 @@ class MySqlDatabaseDriver implements DatabaseDriver
             [$schema, $tableName]
         );
 
-        return array_values(array_map(static function (object $row): array {
-            $key = (string) ($row->column_key ?? '');
+        return array_values(array_map(function (object $row): array {
+            $key = (string) ($this->rowValue($row, ['column_key']) ?? '');
 
             return [
-                'name' => (string) $row->name,
-                'type' => (string) $row->data_type,
-                'nullable' => strtoupper((string) $row->is_nullable) === 'YES',
-                'default' => $row->column_default,
+                'name' => (string) $this->rowValue($row, ['name']),
+                'type' => (string) $this->rowValue($row, ['data_type']),
+                'nullable' => strtoupper((string) $this->rowValue($row, ['is_nullable'])) === 'YES',
+                'default' => $this->rowValue($row, ['column_default']),
                 'key' => $key,
                 'primary' => $key === 'PRI',
                 'foreign' => $key === 'MUL',
-                'extra' => (string) ($row->extra ?? ''),
+                'extra' => (string) ($this->rowValue($row, ['extra']) ?? ''),
             ];
         }, $rows));
     }
@@ -104,13 +104,13 @@ class MySqlDatabaseDriver implements DatabaseDriver
             [$schema, $tableName]
         );
 
-        return array_values(array_map(static function (object $row): array {
+        return array_values(array_map(function (object $row): array {
             return [
-                'name' => (string) $row->index_name,
-                'column' => (string) $row->column_name,
-                'unique' => (int) $row->non_unique === 0,
-                'primary' => strtoupper((string) $row->index_name) === 'PRIMARY',
-                'sequence' => (int) $row->seq_in_index,
+                'name' => (string) $this->rowValue($row, ['index_name']),
+                'column' => (string) $this->rowValue($row, ['column_name']),
+                'unique' => (int) $this->rowValue($row, ['non_unique']) === 0,
+                'primary' => strtoupper((string) $this->rowValue($row, ['index_name'])) === 'PRIMARY',
+                'sequence' => (int) $this->rowValue($row, ['seq_in_index']),
             ];
         }, $rows));
     }
@@ -132,14 +132,51 @@ class MySqlDatabaseDriver implements DatabaseDriver
             [$schema, $tableName]
         );
 
-        return array_values(array_map(static function (object $row): array {
+        return array_values(array_map(function (object $row): array {
             return [
-                'name' => (string) $row->constraint_name,
-                'column' => (string) $row->column_name,
-                'referenced_table' => (string) $row->referenced_table_name,
-                'referenced_column' => (string) $row->referenced_column_name,
+                'name' => (string) $this->rowValue($row, ['constraint_name']),
+                'column' => (string) $this->rowValue($row, ['column_name']),
+                'referenced_table' => (string) $this->rowValue($row, ['referenced_table_name']),
+                'referenced_column' => (string) $this->rowValue($row, ['referenced_column_name']),
             ];
         }, $rows));
+    }
+
+    /**
+     * Read a row value while tolerating different PDO casing behaviors.
+     *
+     * @param object|array<string, mixed> $row
+     * @param array<int, string> $keys
+     */
+    protected function rowValue(object|array $row, array $keys): mixed
+    {
+        $normalizedKeys = array_map('strtolower', $keys);
+
+        if (is_array($row)) {
+            foreach ($row as $key => $value) {
+                if (in_array(strtolower((string) $key), $normalizedKeys, true)) {
+                    return $value;
+                }
+            }
+
+            return null;
+        }
+
+        $values = get_object_vars($row);
+
+        foreach ($values as $key => $value) {
+            if (in_array(strtolower((string) $key), $normalizedKeys, true)) {
+                return $value;
+            }
+        }
+
+        foreach ($keys as $key) {
+            if (property_exists($row, $key)) {
+                return $row->{$key};
+            }
+        }
+
+        return null;
     }
 
     protected function splitTableReference(string $table): array

@@ -102,6 +102,21 @@ class DatabaseMetadataDriversTest extends TestCase
         ], $driver->listForeignKeys($connection, 'orders'));
     }
 
+    public function test_mysql_driver_accepts_uppercase_pdo_column_names_for_table_listing(): void
+    {
+        $connection = $this->createMock(ConnectionInterface::class);
+        $connection->expects($this->once())
+            ->method('select')
+            ->willReturn([
+                (object) ['TABLE_NAME' => 'users'],
+                (object) ['TABLE_NAME' => 'orders'],
+            ]);
+
+        $driver = new MySqlDatabaseDriver();
+
+        $this->assertSame(['users', 'orders'], $driver->listTables($connection));
+    }
+
     public function test_postgres_driver_normalizes_table_column_index_and_foreign_key_metadata(): void
     {
         $connection = $this->createMock(ConnectionInterface::class);

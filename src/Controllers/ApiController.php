@@ -4,6 +4,7 @@ namespace ESolution\DataSources\Controllers;
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Services\AfterHitApiDispatcher;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
@@ -25,14 +26,18 @@ class ApiController extends Controller
      */
     protected bool $datasourceValidationConnectionActive = false;
 
+    protected ?AfterHitApiDispatcher $afterHitApiDispatcher = null;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DataQueryService $dataQueryService,
         protected Pipeline $pipeline,
         protected DynamicVariableParser $runtimeVariableParser,
         protected MiddlewareConnectionResolver $middlewareConnectionResolver,
-        protected ExecutionConnectionResolver $executionConnectionResolver
+        protected ExecutionConnectionResolver $executionConnectionResolver,
+        ?AfterHitApiDispatcher $afterHitApiDispatcher = null
     ) {
+        $this->afterHitApiDispatcher = $afterHitApiDispatcher;
     }
 
   /**
@@ -65,7 +70,18 @@ class ApiController extends Controller
             return $this->runDynamicMiddlewarePipeline(
                 $request,
                 $apiConfigs,
-                fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
+                function (Request $request) use ($apiConfigs, $id) {
+                    $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id);
+                    $this->dispatchAfterHitApiEvent(
+                        $apiConfigs,
+                        $request,
+                        $response,
+                        $id,
+                        $this->resolveAfterHitPayload($request, $apiConfigs)
+                    );
+
+                    return $response;
+                }
             );
         });
   }
@@ -205,6 +221,63 @@ class ApiController extends Controller
         return response()->json(['data' => []], 200);
   }
 
+  protected function dispatchAfterHitApiEvent(
+      ApiConfig $apiConfig,
+      Request $request,
+      JsonResponse $response,
+      mixed $resolvedId = null,
+      array $payload = []
+  ): void {
+        $dispatcher = $this->afterHitApiDispatcher();
+
+        if ($dispatcher === null) {
+            return;
+        }
+
+        try {
+            $dispatcher->dispatchIfSuccessful($apiConfig, $request, $response, $resolvedId, $payload);
+        } catch (\Throwable $e) {
+            \Log::error('AFTER HIT API DISPATCH ERROR => ' . $e->getMessage(), [
+                'route_name' => $apiConfig->route_name,
+                'endpoint' => $apiConfig->endpoint,
+                'method' => $apiConfig->method,
+            ]);
+        }
+  }
+
+  protected function afterHitApiDispatcher(): ?AfterHitApiDispatcher
+  {
+        if ($this->afterHitApiDispatcher !== null) {
+            return $this->afterHitApiDispatcher;
+        }
+
+        if (! app()->bound(AfterHitApiDispatcher::class)) {
+            return null;
+        }
+
+        $this->afterHitApiDispatcher = app(AfterHitApiDispatcher::class);
+
+        return $this->afterHitApiDispatcher;
+  }
+
+  /**
+   * Resolve the data payload that should be visible to the listener.
+   *
+   * For create/update requests we forward the request data after runtime
+   * defaults have been applied. For delete we keep the payload empty so the
+   * listener can rely on resolvedId as the deleted identifier.
+   *
+   * @return array<string, mixed>
+   */
+  protected function resolveAfterHitPayload(Request $request, ApiConfig $apiConfig): array
+  {
+        if (strtoupper((string) $apiConfig->method) === 'DELETE') {
+            return [];
+        }
+
+        return $request->all();
+  }
+
   protected function runDynamicMiddlewarePipeline(Request $request, ApiConfig $apiConfig, \Closure $destination): JsonResponse
   {
         $middlewares = array_values(array_filter(array_merge(
@@ -224,7 +297,7 @@ class ApiController extends Controller
             ->then(fn (Request $request) => $destination($request));
   }
 
-  /**
+  /** 
    * Build a middleware pipe list where sensitive middleware is wrapped in a
    * connection-scoped closure and regular middleware stays untouched.
    *

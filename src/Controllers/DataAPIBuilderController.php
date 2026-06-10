@@ -861,7 +861,11 @@ class DataAPIBuilderController extends Controller
                     'action_type' => $payload['hook']['action_type'] ?? null,
                     'listener_class' => $payload['hook']['listener_class'] ?? null,
                 ]);
+            } else {
+                $this->syncAfterHitHook($config);
             }
+        } elseif (! $config->hook) {
+            $this->syncAfterHitHook($config);
         }
     }
 
@@ -1129,11 +1133,13 @@ class DataAPIBuilderController extends Controller
 
             $listenerName = $this->getListenerName($validated['route_name'], 1);
 
-             $listenerClass = "App\\Listeners\\{$listenerName}";
+            $listenerClass = "App\\Listeners\\{$listenerName}";
 
              if (!class_exists($listenerClass)) {
                  Artisan::call('make:listener '.$listenerName.' --event=AfterRunnerApiBuiderEvent');
              } 
+
+            $this->syncAfterHitHook($dataApiBuilder, $listenerClass);
 
             $connection->commit();
               Cache::forget($this->cacheKey('list-api-configs'));
@@ -1298,6 +1304,8 @@ class DataAPIBuilderController extends Controller
              if (!class_exists($listenerClass)) {
                  Artisan::call('make:listener '.$listenerName.' --event=AfterRunnerApiBuiderEvent');
              } 
+
+            $this->syncAfterHitHook($dataApiBuilder, $listenerClass);
 
 
             $connection->commit();
@@ -1501,6 +1509,17 @@ class DataAPIBuilderController extends Controller
             ));
 
             return $normalized === [] ? null : $normalized;
+      }
+
+      protected function syncAfterHitHook(ApiConfig $config, ?string $listenerClass = null): void
+      {
+            $listenerClass = $listenerClass ?? 'App\\Listeners\\' . $this->getListenerName($config->route_name);
+
+            $config->hook()->delete();
+            $config->hook()->create([
+                'action_type' => 'after_hit_api',
+                'listener_class' => $listenerClass,
+            ]);
       }
 
       public function getListenerName($routeName)
