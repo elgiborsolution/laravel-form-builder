@@ -28,6 +28,13 @@ class ApiController extends Controller
 
     protected ?AfterHitApiDispatcher $afterHitApiDispatcher = null;
 
+    /**
+     * Keep track of the connection that should be used for runtime validation
+     * so unique/exists rules follow the execution connection instead of the
+     * package metadata connection.
+     */
+    protected ?string $runtimeValidationConnectionName = null;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DataQueryService $dataQueryService,
@@ -57,7 +64,11 @@ class ApiController extends Controller
             $request->attributes->set('datasources.connection_name', DB::getDefaultConnection());
         }
 
-        return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
+        $previousValidationConnection = $this->runtimeValidationConnectionName;
+        $this->runtimeValidationConnectionName = $this->executionConnectionResolver->resolve($request);
+
+        try {
+            return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
             $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
             /** @var ApiConfig|null $apiConfigs */
             $apiConfigs = $resolvedRoute['config'];
@@ -77,7 +88,10 @@ class ApiController extends Controller
                     return $response;
                 }
             );
-        });
+            });
+        } finally {
+            $this->runtimeValidationConnectionName = $previousValidationConnection;
+        }
   }
 
   protected function applyRuntimeVariables(Request $request): void
@@ -488,11 +502,12 @@ class ApiController extends Controller
 
       $connection = $this->executionConnectionResolver->connection($request);
       // Validate input data based on API configurations
+      $validationConnectionName = $this->executionConnectionResolver->resolve($request);
       $checkValidateRule = $this->validateRule($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
 
       // Validate parent-level parameters
       if (count($checkValidateRule['parentValidate']) > 0) {
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
       }
 
       // Validate child-level parameters
@@ -500,7 +515,7 @@ class ApiController extends Controller
           foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
               foreach ($request[$key] ?? [] as $keyParam => $valueParam) {
                   // Perform validation on each child record
-                  $validator = $this->makeDatasourceValidator($valueParam, $valueValidateRule);
+                  $validator = $this->makeDatasourceValidator($valueParam, $valueValidateRule, $validationConnectionName);
                   if ($validator->fails()) {
                       return response()->json([
                           'error' => $validator->errors(),
@@ -636,11 +651,12 @@ class ApiController extends Controller
             return $runtimeError;
         }
 
+        $validationConnectionName = $this->executionConnectionResolver->resolve($request);
         $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
 
         if(count($checkValidateRule['parentValidate']) > 0){
           
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
         }
 
         if(count($checkValidateRule['childValidate']) > 0){
@@ -648,7 +664,7 @@ class ApiController extends Controller
             foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
 
                 foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule);
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule, $validationConnectionName);
                     if ($validator->fails()) {
                         return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
                     }
@@ -765,11 +781,12 @@ class ApiController extends Controller
             return $runtimeError;
         }
 
+        $validationConnectionName = $this->executionConnectionResolver->resolve($request);
         $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
 
         if(count($checkValidateRule['parentValidate']) > 0){
           
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate']);
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
         }
 
         if(count($checkValidateRule['childValidate']) > 0){
@@ -777,7 +794,7 @@ class ApiController extends Controller
             foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
 
                 foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule);
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule, $validationConnectionName);
                     if ($validator->fails()) {
                         return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
                     }
@@ -849,7 +866,7 @@ class ApiController extends Controller
  *   - 'childValidate': Validation rules for array-type parameters.
  *   - 'paramIsArray': A list of parameters identified as arrays.
  */
-  public function validateRule($params=[], $tableParent = '', $primaryKey = 0)
+public function validateRule($params=[], $tableParent = '', $primaryKey = 0)
   {
 
       $validateRule = []; // Stores validation rules for direct parameters
@@ -924,25 +941,32 @@ class ApiController extends Controller
  */
 public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
 {
-    $prefix = DatabaseConnection::connection()->getTablePrefix(); // Get the database table prefix
     $value = $rowParam;
+    $customRules = trim((string) ($value['validation_rules'] ?? ''));
+    $rules = [];
+    $typeRule = $this->mapValidationTypeRule($value['type'] ?? null);
 
-    // Determine if the parameter is required or nullable
-    $dataValidate = !empty($value['required']) && $value['required'] ? 'required' : 'nullable';
-
-    // Append the data type to the validation rule
-    $dataValidate .= '|' . $value['type'];
-
-    // Check if the field needs to be unique in the database
-    if (!empty($value['unique']) && $value['unique'] && $primaryKey == 0) {
-        // Remove the table prefix from the table name
-        $table = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $tableParent);
-        // Add uniqueness validation rule
-        $unique = '|unique:' . DatabaseConnection::validationTable($table) . ',' . $value['name'];
-        $dataValidate .= $unique;
+    if (!empty($value['required']) && $value['required']) {
+        $rules[] = 'required';
+    } else {
+        $rules[] = 'nullable';
     }
 
-    return $dataValidate; // Return the validation rule string
+    if ($typeRule !== null) {
+        $rules[] = $typeRule;
+    }
+
+    if (!empty($value['unique']) && $value['unique'] && $primaryKey == 0) {
+        $prefix = DatabaseConnection::connection()->getTablePrefix();
+        $table = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $tableParent);
+        $rules[] = 'unique:' . $this->validationTableForCurrentConnection($table) . ',' . $value['name'];
+    }
+
+    if ($customRules !== '') {
+        $rules[] = $customRules;
+    }
+
+    return implode('|', array_values(array_filter($rules, static fn ($rule) => is_string($rule) && trim($rule) !== '')));
 }
 
 /**
@@ -952,11 +976,18 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
  * @param array $rules
  * @return array<string, mixed>
  */
-protected function validateWithDatasourceConnection(array $data, array $rules): array
+protected function validateWithDatasourceConnection(array $data, array $rules, ?string $connectionName = null): array
 {
-    return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
+    $previousValidationConnection = $this->runtimeValidationConnectionName;
+    $this->runtimeValidationConnectionName = $this->resolveValidationConnectionName($connectionName);
+
+    try {
+        return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
         return Validator::make($data, $rules)->validate();
-    });
+        });
+    } finally {
+        $this->runtimeValidationConnectionName = $previousValidationConnection;
+    }
 }
 
 /**
@@ -966,11 +997,18 @@ protected function validateWithDatasourceConnection(array $data, array $rules): 
  * @param array $rules
  * @return \Illuminate\Contracts\Validation\Validator
  */
-protected function makeDatasourceValidator(array $data, array $rules)
+protected function makeDatasourceValidator(array $data, array $rules, ?string $connectionName = null)
 {
-    return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
+    $previousValidationConnection = $this->runtimeValidationConnectionName;
+    $this->runtimeValidationConnectionName = $this->resolveValidationConnectionName($connectionName);
+
+    try {
+        return $this->withDatasourceValidationConnection(function () use ($data, $rules) {
         return Validator::make($data, $rules);
-    });
+        });
+    } finally {
+        $this->runtimeValidationConnectionName = $previousValidationConnection;
+    }
 }
 
 /**
@@ -987,7 +1025,7 @@ protected function withDatasourceValidationConnection(\Closure $callback)
         return $callback();
     }
 
-    $connectionName = $this->getDatasourceConnectionName();
+    $connectionName = $this->resolveValidationConnectionName();
     $databaseManager = app('db');
     $validatorFactory = app('validator');
 
@@ -1019,27 +1057,61 @@ protected function withDatasourceValidationConnection(\Closure $callback)
 }
 
 /**
- * Resolve the package datasource connection name in a single place.
+ * Resolve the active connection that should be used for runtime validation.
  *
- * @return string
+ * This follows the execution connection when a tenant is active and falls
+ * back to the package metadata connection for non-tenant requests.
  */
-protected function getDatasourceConnectionName(): string
+protected function resolveValidationConnectionName(?string $connectionName = null): string
 {
-    try {
-        $connection = DatabaseConnection::connection();
-
-        if (method_exists($connection, 'getName')) {
-            $name = $connection->getName();
-
-            if (is_string($name) && trim($name) !== '') {
-                return trim($name);
-            }
-        }
-    } catch (\Throwable $e) {
-        // Fall back to the configured datasource connection name below.
+    if (is_string($connectionName) && trim($connectionName) !== '') {
+        return trim($connectionName);
     }
 
+    if (is_string($this->runtimeValidationConnectionName) && trim($this->runtimeValidationConnectionName) !== '') {
+        return trim($this->runtimeValidationConnectionName);
+    }
+
+    return $this->fallbackValidationConnectionName();
+}
+
+/**
+ * Build the validation table name using the active validation connection.
+ */
+protected function validationTableForCurrentConnection(string $table): string
+{
+    $connectionName = trim($this->resolveValidationConnectionName());
+
+    return $connectionName !== '' ? $connectionName . '.' . $table : $table;
+}
+
+/**
+ * Fall back to the package metadata connection when no execution connection
+ * is available.
+ */
+protected function fallbackValidationConnectionName(): string
+{
     return DatabaseConnection::name();
+}
+
+/**
+ * Map API Builder parameter types to Laravel validation rules.
+ *
+ * @param mixed $type
+ * @return string|null
+ */
+protected function mapValidationTypeRule(mixed $type): ?string
+{
+    $normalized = strtolower(trim((string) $type));
+
+    return match ($normalized) {
+        'string', 'integer', 'numeric', 'boolean', 'array', 'email', 'date',
+        'uuid', 'json', 'url', 'ip', 'ipv4', 'ipv6', 'file', 'image',
+        'alpha', 'alpha_num', 'alpha_dash' => $normalized,
+        'float', 'double' => 'numeric',
+        'object' => 'array',
+        default => $normalized !== '' ? $normalized : null,
+    };
 }
 
 /**

@@ -1090,6 +1090,7 @@ class DataAPIBuilderController extends Controller
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
       'middlewares.*' => 'nullable|string',
+      'validation_rules' => 'nullable|string',
       'generate_listener' => 'nullable|boolean',
       'listener_path' => 'nullable|string',
     ]);
