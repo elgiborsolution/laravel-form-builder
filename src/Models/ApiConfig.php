@@ -31,6 +31,7 @@ class ApiConfig extends Model
 
     protected $appends = [
         'listener_path',
+        'before_execute_hook_path',
     ];
 
     /**
@@ -52,12 +53,37 @@ class ApiConfig extends Model
      */
     public function hook()
     {
-        return $this->hasOne(ApiHook::class);
+        return $this->hasOne(ApiHook::class)->where('action_type', 'after_hit_api');
+    }
+
+    /**
+     * Define a relationship with the ApiHook model for before execute hooks.
+     *
+     * @return \Illuminate\Database\Eloquent\Relations\HasOne
+     */
+    public function beforeExecuteHook()
+    {
+        return $this->hasOne(ApiHook::class)->where('action_type', 'before_execute');
+    }
+
+    /**
+     * Define a relationship with all ApiHook rows for this API config.
+     *
+     * @return \Illuminate\Database\Eloquent\Relations\HasMany
+     */
+    public function hooks()
+    {
+        return $this->hasMany(ApiHook::class);
     }
 
     public function getListenerPathAttribute(): ?string
     {
         return $this->hook?->listener_class;
+    }
+
+    public function getBeforeExecuteHookPathAttribute(): ?string
+    {
+        return $this->beforeExecuteHook?->listener_class;
     }
 
     /**

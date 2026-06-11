@@ -10,6 +10,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Collection;
+use Illuminate\Pipeline\Pipeline;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
@@ -18,6 +19,7 @@ class DataSourceController extends Controller
 {
   public function __construct(
     protected DataQueryService $dataQueryService,
+    protected Pipeline $pipeline,
     protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
   ) {
     $this->databaseMetadataProvider ??= new DatabaseMetadataProvider();
@@ -163,7 +165,7 @@ class DataSourceController extends Controller
       $connection = DatabaseConnection::connection();
       $connection->beginTransaction();
 
-      foreach ($rows as $index => $row) {
+    foreach ($rows as $index => $row) {
         $rowNumber = $index + 1;
 
         Log::info('INSERT ROW', [
@@ -183,6 +185,7 @@ class DataSourceController extends Controller
         $useCustomQuery = filter_var($row['use_custom_query'] ?? false, FILTER_VALIDATE_BOOLEAN);
         $row['use_custom_query'] = $useCustomQuery;
         $row['columns'] = $this->normalizeColumnsInput($row['columns'] ?? []);
+        $row['middlewares'] = $this->normalizeMiddlewaresInput($row['middlewares'] ?? null);
 
         $validated = Validator::make($row, [
           'name' => ['required', 'string'],
@@ -195,6 +198,8 @@ class DataSourceController extends Controller
           'columns' => ['required', 'array'],
           'columns.*' => ['string'],
           'custom_query' => ['nullable', 'string'],
+          'middlewares' => ['nullable', 'array'],
+          'middlewares.*' => ['nullable', 'string'],
         ]);
 
         if ($validated->fails()) {
@@ -226,6 +231,7 @@ class DataSourceController extends Controller
           'use_custom_query' => $useCustomQuery,
           'columns' => $row['columns'] ?? [],
           'custom_query' => $row['custom_query'] ?? null,
+          'middlewares' => $row['middlewares'] ?? null,
         ];
 
         try {
@@ -297,6 +303,7 @@ class DataSourceController extends Controller
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
+      'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
     ]);
 
     $validated = $request->validate([
@@ -318,6 +325,8 @@ class DataSourceController extends Controller
       ],
       'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
+      'middlewares' => ['nullable', 'array'],
+      'middlewares.*' => ['nullable', 'string'],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -377,7 +386,8 @@ class DataSourceController extends Controller
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
       'columns' => $validated['columns'],
-      'custom_query' => $validated['custom_query'] ?? null
+      'custom_query' => $validated['custom_query'] ?? null,
+      'middlewares' => $validated['middlewares'] ?? null,
     ]);
 
     if(count($dataParam) > 0){
@@ -419,6 +429,7 @@ class DataSourceController extends Controller
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
+      'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
     ]);
 
     $validated = $request->validate([
@@ -440,6 +451,8 @@ class DataSourceController extends Controller
       ],
       'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
+      'middlewares' => ['nullable', 'array'],
+      'middlewares.*' => ['nullable', 'string'],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -500,7 +513,8 @@ class DataSourceController extends Controller
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
       'columns' => $validated['columns'],
-      'custom_query' => $validated['custom_query'] ?? null
+      'custom_query' => $validated['custom_query'] ?? null,
+      'middlewares' => $validated['middlewares'] ?? null,
     ]);
 
     $dataSource->parameters()->delete();
@@ -645,6 +659,31 @@ class DataSourceController extends Controller
   }
 
   /**
+   * Normalize middleware input so the rest of the controller can work with arrays only.
+   *
+   * @param mixed $middlewares
+   * @return array<int, string>|null
+   */
+  protected function normalizeMiddlewaresInput(mixed $middlewares): ?array
+  {
+    if (is_string($middlewares)) {
+      $decoded = json_decode($middlewares, true);
+      $middlewares = is_array($decoded) ? $decoded : preg_split('/[\r\n,]+/', $middlewares);
+    }
+
+    if (! is_array($middlewares)) {
+      return [];
+    }
+
+    $normalized = array_values(array_filter(
+      array_map(static fn ($middleware) => is_string($middleware) ? trim($middleware) : '', $middlewares),
+      static fn (string $middleware) => $middleware !== ''
+    ));
+
+    return $normalized;
+  }
+
+  /**
    * Attach parameter records using the explicit datasource connection.
    *
    * @param Collection<int, DataSource> $dataSources
@@ -749,6 +788,29 @@ class DataSourceController extends Controller
   }
 
   /**
+   * Resolve middleware definitions using Laravel router middleware aliases and groups.
+   *
+   * @param array<int, string> $middlewares
+   * @return array<int, mixed>
+   */
+  protected function resolveMiddlewareDefinitions(array $middlewares): array
+  {
+    if (! app()->bound('router')) {
+      return $middlewares;
+    }
+
+    $router = app('router');
+
+    if (method_exists($router, 'resolveMiddleware')) {
+      return $router->resolveMiddleware($middlewares);
+    }
+
+    return collect($middlewares)
+      ->flatMap(fn ($middleware) => (array) $router->resolveMiddleware([$middleware]))
+      ->all();
+  }
+
+  /**
   * Display a list of tables in the database
   *
   * @param Request $request, DataSource $id
@@ -803,8 +865,30 @@ class DataSourceController extends Controller
         return response()->json(['error' => 'Data source not found'], 422);
       }
 
-      return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
+      return $this->runDataSourceMiddlewarePipeline($request, $dataSource, function (Request $request) use ($dataSource, $id) {
+        return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
+      });
     });
+  }
+
+  protected function runDataSourceMiddlewarePipeline(Request $request, DataSource $dataSource, \Closure $destination): mixed
+  {
+    $middlewares = array_values(array_filter($dataSource->middlewares ?? []));
+
+    if ($middlewares === []) {
+      return $destination($request);
+    }
+
+    $middlewares = $this->resolveMiddlewareDefinitions($middlewares);
+
+    if ($middlewares === []) {
+      return $destination($request);
+    }
+
+    return $this->pipeline
+      ->send($request)
+      ->through($middlewares)
+      ->then(fn (Request $request) => $destination($request));
   }
 
 
