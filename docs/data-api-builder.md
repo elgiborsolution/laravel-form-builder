@@ -83,6 +83,7 @@ Each param can use:
 - `type`
 - `required`
 - `unique`
+- `validation_rules`
 - `params` for nested object or array fields
 
 Supported types:
@@ -95,6 +96,74 @@ Supported types:
 - `boolean`
 - `numeric`
 - `url`
+- `email`
+- `uuid`
+- `json`
+- `ip`
+- `ipv4`
+- `ipv6`
+- `file`
+- `image`
+- `alpha`
+- `alpha_num`
+- `alpha_dash`
+
+## Validation Rules
+
+API Builder runtime validation now combines three sources:
+
+1. `required` / `nullable`
+2. the parameter `type`
+3. `validation_rules`
+
+Example:
+
+```json
+{
+  "name": "name",
+  "type": "string",
+  "required": true,
+  "unique": false,
+  "validation_rules": "max:5"
+}
+```
+
+Final runtime rule:
+
+```php
+required|string|max:5
+```
+
+### Type mapping
+
+The `type` field is also translated into Laravel validation rules at runtime:
+
+- `string` -> `string`
+- `integer` -> `integer`
+- `numeric` -> `numeric`
+- `boolean` -> `boolean`
+- `array` -> `array`
+- `object` -> `array`
+- `email` -> `email`
+- `date` -> `date`
+- `uuid` -> `uuid`
+- `json` -> `json`
+- `url` -> `url`
+- `ip` -> `ip`
+- `ipv4` -> `ipv4`
+- `ipv6` -> `ipv6`
+- `file` -> `file`
+- `image` -> `image`
+- `alpha` -> `alpha`
+- `alpha_num` -> `alpha_num`
+- `alpha_dash` -> `alpha_dash`
+
+### Database-aware rules
+
+Rules such as `unique` and `exists` follow the active execution connection.
+
+- without `X-Tenant`, validation uses `config('datasources.database_connection')`
+- with `X-Tenant`, validation uses the tenant execution connection
 
 ## Headers and Middleware
 
@@ -134,6 +203,7 @@ x-tenant: tenant-id
   "type": "string",
   "required": false,
   "unique": false,
+  "validation_rules": "max:50",
   "params": []
 }
 ```
@@ -151,13 +221,15 @@ x-tenant: tenant-id
       "name": "id",
       "type": "integer",
       "required": true,
-      "unique": false
+      "unique": false,
+      "validation_rules": "min:1"
     },
     {
       "name": "name",
       "type": "string",
       "required": true,
-      "unique": false
+      "unique": false,
+      "validation_rules": "max:100"
     }
   ]
 }
@@ -176,16 +248,36 @@ x-tenant: tenant-id
       "name": "product_id",
       "type": "integer",
       "required": true,
-      "unique": false
+      "unique": false,
+      "validation_rules": "exists:products,id"
     },
     {
       "name": "qty",
       "type": "integer",
       "required": true,
-      "unique": false
+      "unique": false,
+      "validation_rules": "min:1"
     }
   ]
 }
+```
+
+### Validation example
+
+```json
+{
+  "name": "email",
+  "type": "string",
+  "required": true,
+  "unique": true,
+  "validation_rules": "email|max:255"
+}
+```
+
+Final runtime validation:
+
+```php
+required|string|unique:tenant_or_package_table,email|email|max:255
 ```
 
 ## Request and Response Examples
@@ -297,4 +389,3 @@ Example import payload:
 ## Screenshot Placeholder
 
 > Screenshot placeholder: Data API Builder usage modal
-
