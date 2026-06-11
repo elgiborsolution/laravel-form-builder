@@ -40,8 +40,6 @@ return [
         'dynamic_api_ttl' => 60,
     ],
 
-    'runtime_variable_registry' => null,
-
     'default_api_middlewares' => ['auth:api'],
 
     'routes' => [
@@ -56,15 +54,6 @@ return [
                 'data-picker',
                 'table-builder',
                 'api-config',
-            ],
-        ],
-
-        'tenant' => [
-            'enabled' => true,
-            'middleware' => ['api'],
-            'initialize_middleware' => 'Stancl\\Tenancy\\Middleware\\InitializeTenancyByRequestData',
-            'reserved_paths' => [
-                'data-source-tenant',
             ],
         ],
 
