@@ -859,9 +859,21 @@ class DataAPIBuilderController extends Controller
             if (is_array($payload['hook']) && ! empty($payload['hook'])) {
                 $config->hook()->create([
                     'action_type' => $payload['hook']['action_type'] ?? null,
-                    'listener_class' => $payload['hook']['listener_class'] ?? null,
+                    'listener_class' => $payload['hook']['listener_class'] ?? $this->resolveListenerClassFromPayload($payload, null, $config),
                 ]);
+            } else {
+                $this->syncAfterHitHook(
+                    $config,
+                    $this->resolveListenerClassFromPayload($payload, null, $config),
+                    $this->normalizeGenerateListener($payload['generate_listener'] ?? null)
+                );
             }
+        } elseif (! $config->hook) {
+            $this->syncAfterHitHook(
+                $config,
+                $this->resolveListenerClassFromPayload($payload, null, $config),
+                $this->normalizeGenerateListener($payload['generate_listener'] ?? null)
+            );
         }
     }
 
@@ -875,6 +887,10 @@ class DataAPIBuilderController extends Controller
             'middlewares' => $config->middlewares,
             'params' => $config->params,
             'enabled' => (bool) $config->enabled,
+            'generate_listener' => $config->hook
+                ? strtolower((string) $config->hook->action_type) === 'after_hit_api'
+                : true,
+            'listener_path' => $config->hook?->listener_class,
             'parent_table' => $config->parentTable ? $this->serializeApiTable($config->parentTable) : null,
             'child_tables' => $config->childTables->map(fn (ApiTable $table): array => $this->serializeApiTable($table))->values()->all(),
             'permission' => $config->permission ? [
@@ -883,6 +899,7 @@ class DataAPIBuilderController extends Controller
             'hook' => $config->hook ? [
                 'action_type' => $config->hook->action_type,
                 'listener_class' => $config->hook->listener_class,
+                'listener_path' => $config->hook->listener_class,
             ] : null,
         ];
     }
@@ -1073,6 +1090,8 @@ class DataAPIBuilderController extends Controller
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
       'middlewares.*' => 'nullable|string',
+      'generate_listener' => 'nullable|boolean',
+      'listener_path' => 'nullable|string',
     ]);
 
 
@@ -1128,12 +1147,21 @@ class DataAPIBuilderController extends Controller
             }
 
             $listenerName = $this->getListenerName($validated['route_name'], 1);
+            $generateListener = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
+            $defaultListenerClass = "App\\Listeners\\{$listenerName}";
+            $listenerClass = $this->resolveListenerClassFromPayload($validated, $defaultListenerClass);
 
-             $listenerClass = "App\\Listeners\\{$listenerName}";
+            if ($generateListener && $listenerClass === $defaultListenerClass) {
+                $this->ensureAfterHitListener($listenerName, true);
+            } elseif ($generateListener && ! class_exists($listenerClass)) {
+                return response()->json([
+                    'status' => 422,
+                    'error' => 'Listener class not found',
+                    'message' => 'Listener class not found',
+                ], 422);
+            }
 
-             if (!class_exists($listenerClass)) {
-                 Artisan::call('make:listener '.$listenerName.' --event=AfterRunnerApiBuiderEvent');
-             } 
+            $this->syncAfterHitHook($dataApiBuilder, $listenerClass, $generateListener);
 
             $connection->commit();
               Cache::forget($this->cacheKey('list-api-configs'));
@@ -1236,6 +1264,8 @@ class DataAPIBuilderController extends Controller
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
       'middlewares.*' => 'nullable|string',
+      'generate_listener' => 'nullable|boolean',
+      'listener_path' => 'nullable|string',
     ]);
 
     $invalid = $this->validateDetail($request);
@@ -1292,12 +1322,21 @@ class DataAPIBuilderController extends Controller
             }
             
             $listenerName = $this->getListenerName($validated['route_name'], 1);
+            $generateListener = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
+            $defaultListenerClass = "App\\Listeners\\{$listenerName}";
+            $listenerClass = $this->resolveListenerClassFromPayload($validated, $defaultListenerClass, $dataApiBuilder);
 
-             $listenerClass = "App\\Listeners\\{$listenerName}";
+            if ($generateListener && $listenerClass === $defaultListenerClass) {
+                $this->ensureAfterHitListener($listenerName, true);
+            } elseif ($generateListener && ! class_exists($listenerClass)) {
+                return response()->json([
+                    'status' => 422,
+                    'error' => 'Listener class not found',
+                    'message' => 'Listener class not found',
+                ], 422);
+            }
 
-             if (!class_exists($listenerClass)) {
-                 Artisan::call('make:listener '.$listenerName.' --event=AfterRunnerApiBuiderEvent');
-             } 
+            $this->syncAfterHitHook($dataApiBuilder, $listenerClass, $generateListener);
 
 
             $connection->commit();
@@ -1359,6 +1398,8 @@ class DataAPIBuilderController extends Controller
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
       'middlewares.*' => 'nullable|string',
+      'generate_listener' => 'nullable|boolean',
+      'listener_path' => 'nullable|string',
     ]);
 
     $invalid = $this->validateDetail($request, true);
@@ -1388,6 +1429,8 @@ class DataAPIBuilderController extends Controller
                 $bundlePayload['enabled'] = array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true;
                 $bundlePayload['description'] = $validated['description'] ?? null;
                 $bundlePayload['middlewares'] = $this->normalizeMiddlewares($validated['middlewares'] ?? null);
+                $bundlePayload['generate_listener'] = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
+                $bundlePayload['listener_path'] = $this->normalizeListenerPath($validated['listener_path'] ?? null);
 
                 $dataApiBuilder = ApiConfig::create([
                     'route_name' => $bundlePayload['route_name'],
@@ -1402,10 +1445,13 @@ class DataAPIBuilderController extends Controller
                 $this->syncApiConfigRelations($dataApiBuilder, $bundlePayload);
 
                 $listenerName = $this->getListenerName($bundlePayload['route_name']);
-                $listenerClass = "App\\Listeners\\{$listenerName}";
+                $defaultListenerClass = "App\\Listeners\\{$listenerName}";
+                $listenerClass = $this->resolveListenerClassFromPayload($bundlePayload, $defaultListenerClass);
 
-                if (!class_exists($listenerClass)) {
-                    Artisan::call('make:listener ' . $listenerName . ' --event=AfterRunnerApiBuiderEvent');
+                if ($bundlePayload['generate_listener'] && $listenerClass === $defaultListenerClass) {
+                    $this->ensureAfterHitListener($listenerName, true);
+                } elseif ($bundlePayload['generate_listener'] && ! class_exists($listenerClass)) {
+                    throw new \RuntimeException('Listener class not found');
                 }
 
                 $createdConfigs[] = $dataApiBuilder->load(['parentTable', 'childTables', 'permission', 'hook']);
@@ -1501,6 +1547,104 @@ class DataAPIBuilderController extends Controller
             ));
 
             return $normalized === [] ? null : $normalized;
+      }
+
+      protected function syncAfterHitHook(
+            ApiConfig $config,
+            ?string $listenerClass = null,
+            bool $generateListener = true
+      ): void
+      {
+            $listenerClass = $listenerClass ?? 'App\\Listeners\\' . $this->getListenerName($config->route_name);
+            $actionType = $generateListener ? 'after_hit_api' : 'after_hit_api_disabled';
+
+            $config->hook()->delete();
+            $config->hook()->create([
+                'action_type' => $actionType,
+                'listener_class' => $listenerClass,
+            ]);
+      }
+
+      protected function ensureAfterHitListener(string $listenerName, bool $generateListener): bool
+      {
+            if (! $generateListener) {
+                return false;
+            }
+
+            $listenerClass = "App\\Listeners\\{$listenerName}";
+
+            if (! class_exists($listenerClass)) {
+                Artisan::call('make:listener '.$listenerName.' --event=AfterRunnerApiBuiderEvent');
+            }
+
+            return true;
+      }
+
+      protected function normalizeListenerPath(mixed $value): ?string
+      {
+            if (! is_string($value)) {
+                return null;
+            }
+
+            $normalized = trim($value);
+
+            return $normalized === '' ? null : $normalized;
+      }
+
+      protected function resolveListenerClassFromPayload(array $payload, ?string $defaultListenerClass = null, ?ApiConfig $existingConfig = null): string
+      {
+            $listenerPath = $this->normalizeListenerPath($payload['listener_path'] ?? null);
+
+            if ($listenerPath !== null) {
+                return $listenerPath;
+            }
+
+            if (isset($payload['hook']) && is_array($payload['hook'])) {
+                $hookListener = $this->normalizeListenerPath($payload['hook']['listener_class'] ?? null);
+
+                if ($hookListener !== null) {
+                    return $hookListener;
+                }
+            }
+
+            $existingListener = $existingConfig?->hook?->listener_class;
+
+            if (is_string($existingListener) && trim($existingListener) !== '') {
+                return trim($existingListener);
+            }
+
+            if ($defaultListenerClass !== null && trim($defaultListenerClass) !== '') {
+                return trim($defaultListenerClass);
+            }
+
+            $routeName = trim((string) ($payload['route_name'] ?? $existingConfig?->route_name ?? ''));
+
+            return 'App\\Listeners\\' . $this->getListenerName($routeName);
+      }
+
+      protected function normalizeGenerateListener(mixed $value): bool
+      {
+            if (is_bool($value)) {
+                return $value;
+            }
+
+            if (is_int($value)) {
+                return $value === 1;
+            }
+
+            if (is_string($value)) {
+                $normalized = strtolower(trim($value));
+
+                if (in_array($normalized, ['1', 'true', 'yes', 'on'], true)) {
+                    return true;
+                }
+
+                if (in_array($normalized, ['0', 'false', 'no', 'off'], true)) {
+                    return false;
+                }
+            }
+
+            return true;
       }
 
       public function getListenerName($routeName)

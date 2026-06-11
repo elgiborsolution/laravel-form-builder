@@ -24,12 +24,14 @@ class RuntimeVariableController extends Controller
             return strcmp($left->key, $right->key);
         });
 
-        return response()->json(array_map(static function ($definition): array {
-            return [
-                'key' => $definition->key,
-                'type' => $definition->type,
-                'description' => $definition->description,
-            ];
-        }, $variables));
+        return response()->json([
+            'data' => array_map(static function ($definition): array {
+                return [
+                    'key' => $definition->key,
+                    'type' => $definition->type,
+                    'description' => $definition->description,
+                ];
+            }, $variables),
+        ]);
     }
 }

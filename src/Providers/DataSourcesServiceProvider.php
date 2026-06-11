@@ -8,9 +8,11 @@ use ESolution\DataSources\Controllers\DataPickerController;
 use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Controllers\DataTableBuilderController;
 use ESolution\DataSources\Controllers\RuntimeVariableController;
+use ESolution\DataSources\Events\AfterRunnerApiBuiderEvent;
 use ESolution\DataSources\Contracts\RuntimeVariableRegistryInterface;
 use ESolution\DataSources\Http\Middleware\ForceDatabaseConnection;
 use ESolution\DataSources\Runtime\RuntimeVariableRegistryResolver;
+use ESolution\DataSources\Services\AfterHitApiDispatcher;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Support\Facades\Route;
@@ -30,6 +32,9 @@ class DataSourcesServiceProvider extends ServiceProvider
         $this->app->singleton(DatabaseMetadataProvider::class, function ($app) {
             return new DatabaseMetadataProvider($app->make(DatabaseDriverResolver::class));
         });
+        $this->app->singleton(AfterHitApiDispatcher::class, function ($app) {
+            return new AfterHitApiDispatcher($app->make('events'));
+        });
         $this->app->bind(RuntimeVariableRegistryInterface::class, function ($app) {
             return $app->make(RuntimeVariableRegistryResolver::class)->resolveInstance();
         });
@@ -37,6 +42,10 @@ class DataSourcesServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
+        if (! class_exists(\App\Events\AfterRunnerApiBuiderEvent::class)) {
+            class_alias(AfterRunnerApiBuiderEvent::class, \App\Events\AfterRunnerApiBuiderEvent::class);
+        }
+
         $this->loadMigrationsFrom(__DIR__ . '/../../database/migrations');
 
         if (! $this->app->routesAreCached()) {

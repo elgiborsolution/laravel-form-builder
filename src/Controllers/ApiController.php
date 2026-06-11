@@ -4,6 +4,7 @@ namespace ESolution\DataSources\Controllers;
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Services\AfterHitApiDispatcher;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
@@ -25,14 +26,18 @@ class ApiController extends Controller
      */
     protected bool $datasourceValidationConnectionActive = false;
 
+    protected ?AfterHitApiDispatcher $afterHitApiDispatcher = null;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DataQueryService $dataQueryService,
         protected Pipeline $pipeline,
         protected DynamicVariableParser $runtimeVariableParser,
         protected MiddlewareConnectionResolver $middlewareConnectionResolver,
-        protected ExecutionConnectionResolver $executionConnectionResolver
+        protected ExecutionConnectionResolver $executionConnectionResolver,
+        ?AfterHitApiDispatcher $afterHitApiDispatcher = null
     ) {
+        $this->afterHitApiDispatcher = $afterHitApiDispatcher;
     }
 
   /**
@@ -65,7 +70,12 @@ class ApiController extends Controller
             return $this->runDynamicMiddlewarePipeline(
                 $request,
                 $apiConfigs,
-                fn (Request $request) => $this->dispatchResolvedRequest($request, $apiConfigs, $id)
+                function (Request $request) use ($apiConfigs, $id) {
+                    $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id);
+                    $this->dispatchAfterHitApiEvent($apiConfigs, $request, $response, $id);
+
+                    return $response;
+                }
             );
         });
   }
@@ -205,6 +215,139 @@ class ApiController extends Controller
         return response()->json(['data' => []], 200);
   }
 
+  protected function dispatchAfterHitApiEvent(
+      ApiConfig $apiConfig,
+      Request $request,
+      JsonResponse $response,
+      mixed $resolvedId = null
+  ): void {
+        $dispatcher = $this->afterHitApiDispatcher();
+
+        if ($dispatcher === null) {
+            return;
+        }
+
+        try {
+            $dispatcher->dispatchIfSuccessful(
+                $apiConfig,
+                $request,
+                $response,
+                $resolvedId,
+                $this->resolveAfterHitPayload($request, $apiConfig),
+                $this->resolveAfterHitResult($request, $apiConfig, $resolvedId),
+                $this->resolveAfterHitAction($request, $apiConfig),
+                $this->resolveAfterHitBeforeData($request, $apiConfig)
+            );
+        } catch (\Throwable $e) {
+            \Log::error('AFTER HIT API DISPATCH ERROR => ' . $e->getMessage(), [
+                'route_name' => $apiConfig->route_name,
+                'endpoint' => $apiConfig->endpoint,
+                'method' => $apiConfig->method,
+            ]);
+        }
+  }
+
+  protected function afterHitApiDispatcher(): ?AfterHitApiDispatcher
+  {
+        if ($this->afterHitApiDispatcher !== null) {
+            return $this->afterHitApiDispatcher;
+        }
+
+        if (! app()->bound(AfterHitApiDispatcher::class)) {
+            return null;
+        }
+
+        $this->afterHitApiDispatcher = app(AfterHitApiDispatcher::class);
+
+        return $this->afterHitApiDispatcher;
+  }
+
+  /**
+   * Resolve the data payload that should be visible to the listener.
+   *
+   * For create/update requests we forward the request data after runtime
+   * defaults have been applied. For delete we keep the payload empty so the
+   * listener can rely on resolvedId as the deleted identifier.
+   *
+   * @return array<string, mixed>
+   */
+  protected function resolveAfterHitPayload(Request $request, ApiConfig $apiConfig): array
+  {
+        if (strtoupper((string) $apiConfig->method) === 'DELETE') {
+            return [];
+        }
+
+        return $request->all();
+  }
+
+  /**
+   * Resolve the final API result for the after-hit listener.
+   *
+   * @return array<string, mixed>
+   */
+  protected function resolveAfterHitResult(Request $request, ApiConfig $apiConfig, mixed $resolvedId = null): array
+  {
+        $result = $request->attributes->get('datasources.after_hit.result');
+
+        if (is_array($result)) {
+            return $result;
+        }
+
+        if (is_object($result)) {
+            return json_decode(json_encode($result), true) ?: [];
+        }
+
+        if (strtoupper((string) $apiConfig->method) === 'DELETE') {
+            return $resolvedId === null ? [] : ['id' => $resolvedId];
+        }
+
+        return [];
+  }
+
+  protected function resolveAfterHitBeforeData(Request $request, ApiConfig $apiConfig): array
+  {
+        $beforeData = $request->attributes->get('datasources.after_hit.before_data');
+
+        if (is_array($beforeData)) {
+            return $beforeData;
+        }
+
+        if (is_object($beforeData)) {
+            return json_decode(json_encode($beforeData), true) ?: [];
+        }
+
+        return [];
+  }
+
+  protected function resolveAfterHitAction(Request $request, ApiConfig $apiConfig): string
+  {
+        $action = trim((string) $request->attributes->get('datasources.after_hit.action', ''));
+
+        if ($action !== '') {
+            return $action;
+        }
+
+        return strtolower((string) $apiConfig->method);
+  }
+
+  /**
+   * Normalize a database record to an associative array.
+   *
+   * @return array<string, mixed>
+   */
+  protected function normalizeAfterHitRecord(mixed $record): array
+  {
+        if (is_array($record)) {
+            return $record;
+        }
+
+        if (is_object($record)) {
+            return json_decode(json_encode($record), true) ?: [];
+        }
+
+        return [];
+  }
+
   protected function runDynamicMiddlewarePipeline(Request $request, ApiConfig $apiConfig, \Closure $destination): JsonResponse
   {
         $middlewares = array_values(array_filter(array_merge(
@@ -224,7 +367,7 @@ class ApiController extends Controller
             ->then(fn (Request $request) => $destination($request));
   }
 
-  /**
+  /** 
    * Build a middleware pipe list where sensitive middleware is wrapped in a
    * connection-scoped closure and regular middleware stays untouched.
    *
@@ -447,6 +590,16 @@ class ApiController extends Controller
               $connection->table($value['table'])->insert($value['table_values']);
           }
 
+          $finalRecord = $this->normalizeAfterHitRecord(
+              $connection->table($cleanParentTable)
+                  ->where($apiConfigs->parentTable->primary_key, $id)
+                  ->first()
+          );
+
+          $request->attributes->set('datasources.after_hit.action', 'create');
+          $request->attributes->set('datasources.after_hit.result', $finalRecord);
+          $request->attributes->set('datasources.after_hit.before_data', []);
+
           $connection->commit();
           return response()->json([
               "status" => 200,
@@ -576,6 +729,15 @@ class ApiController extends Controller
               $connection->table($value['table'])->insert($value['table_values']);
             }
 
+            $finalRecord = $this->normalizeAfterHitRecord(
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->first()
+            );
+
+            $request->attributes->set('datasources.after_hit.action', 'update');
+            $request->attributes->set('datasources.after_hit.result', $finalRecord);
+            $request->attributes->set('datasources.after_hit.before_data', []);
 
             $connection->commit();
             return response()->json(["status" => 200, 'message' => 'Data has been successfully updated', 'data' => []], 201);
@@ -637,6 +799,19 @@ class ApiController extends Controller
         try {
             $connection->beginTransaction();
             $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+
+            $beforeData = $this->normalizeAfterHitRecord(
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->first()
+            );
+
+            $request->attributes->set('datasources.after_hit.action', 'delete');
+            $request->attributes->set('datasources.after_hit.before_data', $beforeData);
+            $request->attributes->set('datasources.after_hit.result', [
+                'id' => $id,
+                'deleted' => true,
+            ]);
 
             $connection->table($cleanParentTable)
                 ->where($primarykey, $id)
