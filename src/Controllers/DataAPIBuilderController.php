@@ -3,11 +3,13 @@ namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
+use ESolution\DataSources\Models\ApiHook;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\File;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
 use ESolution\DataSources\Models\ApiTable;
@@ -35,7 +37,7 @@ class DataAPIBuilderController extends Controller
 
         $dataApiBuilder = Cache::remember($this->cacheKey('list-api-configs'), 60, function (){
                 return  ApiConfig::on(DatabaseConnection::configuredName())
-                    ->with('parentTable', 'childTables', 'permission', 'hook')
+                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
                     ->get()
                     ->toArray();
         });
@@ -54,7 +56,7 @@ class DataAPIBuilderController extends Controller
         $ids = $this->normalizeSelectedIds($request->input('ids', []));
 
         $query = ApiConfig::on(DatabaseConnection::configuredName())
-            ->with(['parentTable', 'childTables', 'permission', 'hook'])
+            ->with(['parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook'])
             ->orderBy('id');
 
         if (! empty($ids)) {
@@ -601,6 +603,16 @@ class DataAPIBuilderController extends Controller
             }
         }
 
+        if (isset($payload['before_execute_hook']) && is_string($payload['before_execute_hook']) && trim($payload['before_execute_hook']) !== '') {
+            try {
+                $payload['before_execute_hook'] = json_decode($payload['before_execute_hook'], true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $exception) {
+                \Log::warning('IMPORT API CONFIGS => invalid before_execute_hook JSON', [
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
         if (! isset($payload['middlewares']) && isset($payload['headers']) && is_array($payload['headers'])) {
             $payload['middlewares'] = $payload['headers'];
         }
@@ -699,6 +711,7 @@ class DataAPIBuilderController extends Controller
             'child_tables' => ['nullable', 'array'],
             'permission' => ['nullable'],
             'hook' => ['nullable'],
+            'before_execute_hook' => ['nullable'],
         ]);
 
         if ($validator->fails()) {
@@ -764,7 +777,7 @@ class DataAPIBuilderController extends Controller
         }
 
         $config = ApiConfig::on(DatabaseConnection::configuredName())
-            ->with(['parentTable', 'childTables', 'permission', 'hook'])
+            ->with(['parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook'])
             ->where('route_name', $routeName)
             ->where('endpoint', $endpoint)
             ->where('method', $method)
@@ -889,6 +902,32 @@ class DataAPIBuilderController extends Controller
                 $this->normalizeGenerateListener($payload['generate_listener'] ?? null)
             );
         }
+
+        if (array_key_exists('before_execute_hook', $payload)) {
+            if (is_array($payload['before_execute_hook']) && ! empty($payload['before_execute_hook'])) {
+                $config->hooks()->updateOrCreate(
+                    ['action_type' => 'before_execute'],
+                    [
+                        'listener_class' => $payload['before_execute_hook']['listener_class']
+                            ?? $this->resolveBeforeExecuteHookClassFromPayload($payload, null, $config),
+                    ]
+                );
+            } else {
+                $config->hooks()->where('action_type', 'before_execute')->delete();
+            }
+        } elseif (! $config->beforeExecuteHook) {
+            $generateBeforeExecuteHook = $this->normalizeGenerateBeforeExecuteHook(
+                $payload['generate_before_execute_hook'] ?? null
+            );
+
+            if ($generateBeforeExecuteHook) {
+                $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload($payload, null, $config);
+                $config->hooks()->updateOrCreate(
+                    ['action_type' => 'before_execute'],
+                    ['listener_class' => $beforeExecuteHookClass]
+                );
+            }
+        }
     }
 
     protected function serializeApiConfig(ApiConfig $config): array
@@ -905,6 +944,10 @@ class DataAPIBuilderController extends Controller
                 ? strtolower((string) $config->hook->action_type) === 'after_hit_api'
                 : true,
             'listener_path' => $config->hook?->listener_class,
+            'generate_before_execute_hook' => $config->beforeExecuteHook
+                ? strtolower((string) $config->beforeExecuteHook->action_type) === 'before_execute'
+                : false,
+            'before_execute_hook_path' => $config->beforeExecuteHook?->listener_class,
             'parent_table' => $config->parentTable ? $this->serializeApiTable($config->parentTable) : null,
             'child_tables' => $config->childTables->map(fn (ApiTable $table): array => $this->serializeApiTable($table))->values()->all(),
             'permission' => $config->permission ? [
@@ -914,6 +957,11 @@ class DataAPIBuilderController extends Controller
                 'action_type' => $config->hook->action_type,
                 'listener_class' => $config->hook->listener_class,
                 'listener_path' => $config->hook->listener_class,
+            ] : null,
+            'before_execute_hook' => $config->beforeExecuteHook ? [
+                'action_type' => $config->beforeExecuteHook->action_type,
+                'listener_class' => $config->beforeExecuteHook->listener_class,
+                'listener_path' => $config->beforeExecuteHook->listener_class,
             ] : null,
         ];
     }
@@ -1108,6 +1156,8 @@ class DataAPIBuilderController extends Controller
       'validation_rules' => 'nullable|string',
       'generate_listener' => 'nullable|boolean',
       'listener_path' => 'nullable|string',
+      'generate_before_execute_hook' => 'nullable|boolean',
+      'before_execute_hook_path' => 'nullable|string',
     ]);
 
 
@@ -1182,6 +1232,33 @@ class DataAPIBuilderController extends Controller
 
             $this->syncAfterHitHook($dataApiBuilder, $listenerClass, $generateListener);
 
+            $beforeExecuteHookName = $this->getBeforeExecuteHookName($validated['route_name']);
+            $generateBeforeExecuteHook = $this->normalizeGenerateBeforeExecuteHook(
+                $validated['generate_before_execute_hook'] ?? null
+            );
+            $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
+            $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload(
+                $validated,
+                $defaultBeforeExecuteHookClass,
+                $dataApiBuilder
+            );
+
+            if ($generateBeforeExecuteHook && $beforeExecuteHookClass === $defaultBeforeExecuteHookClass) {
+                $this->ensureBeforeExecuteHook($beforeExecuteHookName, true);
+            } elseif ($generateBeforeExecuteHook && ! class_exists($beforeExecuteHookClass)) {
+                return response()->json([
+                    'status' => 422,
+                    'error' => 'Before execute hook class not found',
+                    'message' => 'Before execute hook class not found',
+                ], 422);
+            }
+
+            $this->syncBeforeExecuteHook(
+                $dataApiBuilder,
+                $beforeExecuteHookClass,
+                $generateBeforeExecuteHook
+            );
+
             $connection->commit();
               Cache::forget($this->cacheKey('list-api-configs'));
               $this->resolver->forget($validated['endpoint'], $validated['method']);
@@ -1211,12 +1288,12 @@ class DataAPIBuilderController extends Controller
 
     $headers = $request->header('x-tenant');
     $dataApiBuilder = ApiConfig::on(DatabaseConnection::configuredName())
-        ->with('parentTable', 'childTables', 'permission', 'hook')
+        ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
         ->where('id', $id)
         ->first();
     if (empty($dataApiBuilder)) {
         $dataApiBuilder = ApiConfig::on(DatabaseConnection::configuredName())
-            ->with('parentTable', 'childTables', 'permission', 'hook')
+            ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
             ->where('code', $id)
             ->first();
     }
@@ -1286,6 +1363,8 @@ class DataAPIBuilderController extends Controller
       'use_default_middlewares' => 'nullable|boolean',
       'generate_listener' => 'nullable|boolean',
       'listener_path' => 'nullable|string',
+      'generate_before_execute_hook' => 'nullable|boolean',
+      'before_execute_hook_path' => 'nullable|string',
     ]);
 
     $invalid = $this->validateDetail($request);
@@ -1358,6 +1437,33 @@ class DataAPIBuilderController extends Controller
 
             $this->syncAfterHitHook($dataApiBuilder, $listenerClass, $generateListener);
 
+            $beforeExecuteHookName = $this->getBeforeExecuteHookName($validated['route_name']);
+            $generateBeforeExecuteHook = $this->normalizeGenerateBeforeExecuteHook(
+                $validated['generate_before_execute_hook'] ?? null
+            );
+            $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
+            $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload(
+                $validated,
+                $defaultBeforeExecuteHookClass,
+                $dataApiBuilder
+            );
+
+            if ($generateBeforeExecuteHook && $beforeExecuteHookClass === $defaultBeforeExecuteHookClass) {
+                $this->ensureBeforeExecuteHook($beforeExecuteHookName, true);
+            } elseif ($generateBeforeExecuteHook && ! class_exists($beforeExecuteHookClass)) {
+                return response()->json([
+                    'status' => 422,
+                    'error' => 'Before execute hook class not found',
+                    'message' => 'Before execute hook class not found',
+                ], 422);
+            }
+
+            $this->syncBeforeExecuteHook(
+                $dataApiBuilder,
+                $beforeExecuteHookClass,
+                $generateBeforeExecuteHook
+            );
+
 
             $connection->commit();
             Cache::forget($this->cacheKey('list-api-configs'));
@@ -1420,6 +1526,8 @@ class DataAPIBuilderController extends Controller
       'middlewares.*' => 'nullable|string',
       'generate_listener' => 'nullable|boolean',
       'listener_path' => 'nullable|string',
+      'generate_before_execute_hook' => 'nullable|boolean',
+      'before_execute_hook_path' => 'nullable|string',
     ]);
 
     $invalid = $this->validateDetail($request, true);
@@ -1454,6 +1562,12 @@ class DataAPIBuilderController extends Controller
                 );
                 $bundlePayload['generate_listener'] = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
                 $bundlePayload['listener_path'] = $this->normalizeListenerPath($validated['listener_path'] ?? null);
+                $bundlePayload['generate_before_execute_hook'] = $this->normalizeGenerateBeforeExecuteHook(
+                    $validated['generate_before_execute_hook'] ?? null
+                );
+                $bundlePayload['before_execute_hook_path'] = $this->normalizeBeforeExecuteHookPath(
+                    $validated['before_execute_hook_path'] ?? null
+                );
 
                 $dataApiBuilder = ApiConfig::create([
                     'route_name' => $bundlePayload['route_name'],
@@ -1477,7 +1591,27 @@ class DataAPIBuilderController extends Controller
                     throw new \RuntimeException('Listener class not found');
                 }
 
-                $createdConfigs[] = $dataApiBuilder->load(['parentTable', 'childTables', 'permission', 'hook']);
+                $beforeExecuteHookName = $this->getBeforeExecuteHookName($bundlePayload['route_name']);
+                $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
+                $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload(
+                    $bundlePayload,
+                    $defaultBeforeExecuteHookClass,
+                    $dataApiBuilder
+                );
+
+                if ($bundlePayload['generate_before_execute_hook'] && $beforeExecuteHookClass === $defaultBeforeExecuteHookClass) {
+                    $this->ensureBeforeExecuteHook($beforeExecuteHookName, true);
+                } elseif ($bundlePayload['generate_before_execute_hook'] && ! class_exists($beforeExecuteHookClass)) {
+                    throw new \RuntimeException('Before execute hook class not found');
+                }
+
+                $this->syncBeforeExecuteHook(
+                    $dataApiBuilder,
+                    $beforeExecuteHookClass,
+                    $bundlePayload['generate_before_execute_hook']
+                );
+
+                $createdConfigs[] = $dataApiBuilder->load(['parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook']);
                 $this->resolver->forget($bundlePayload['endpoint'], $method);
             }
 
@@ -1617,7 +1751,7 @@ class DataAPIBuilderController extends Controller
                 return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
             }
 
-            return true;
+            return false;
       }
 
       protected function syncAfterHitHook(
@@ -1634,6 +1768,144 @@ class DataAPIBuilderController extends Controller
                 'action_type' => $actionType,
                 'listener_class' => $listenerClass,
             ]);
+      }
+
+      protected function syncBeforeExecuteHook(
+            ApiConfig $config,
+            ?string $hookClass = null,
+            bool $generateHook = true
+      ): void
+      {
+            $existingHook = $config->beforeExecuteHook;
+
+            if (! $generateHook) {
+                if ($existingHook !== null) {
+                    $existingHook->delete();
+                }
+
+                return;
+            }
+
+            $hookClass = $hookClass ?? 'App\\Hooks\\Api\\' . $this->getBeforeExecuteHookName($config->route_name);
+            $config->hooks()->updateOrCreate(
+                ['action_type' => 'before_execute'],
+                ['listener_class' => $hookClass]
+            );
+      }
+
+      protected function ensureBeforeExecuteHook(string $hookName, bool $generateHook): bool
+      {
+            if (! $generateHook) {
+                return false;
+            }
+
+            $classPath = app_path('Hooks/Api/' . $hookName . '.php');
+
+            if (File::exists($classPath)) {
+                return true;
+            }
+
+            File::ensureDirectoryExists(dirname($classPath));
+
+            $content = <<<PHP
+<?php
+
+namespace App\Hooks\Api;
+
+use ESolution\DataSources\Contracts\BeforeExecuteHookInterface;
+use ESolution\DataSources\Models\ApiConfig;
+use Illuminate\Http\Request;
+
+class {$hookName} implements BeforeExecuteHookInterface
+{
+    public function handle(
+        array &\$payload,
+        ApiConfig \$apiConfig,
+        Request \$request
+    ): void {
+        // TODO: add before execute business rules here.
+    }
+}
+PHP;
+
+            File::put($classPath, $content);
+
+            return true;
+      }
+
+      protected function normalizeGenerateBeforeExecuteHook(mixed $value): bool
+      {
+            if (is_bool($value)) {
+                return $value;
+            }
+
+            if (is_int($value)) {
+                return $value === 1;
+            }
+
+            if (is_string($value)) {
+                $normalized = strtolower(trim($value));
+
+                if (in_array($normalized, ['1', 'true', 'yes', 'on'], true)) {
+                    return true;
+                }
+
+                if (in_array($normalized, ['0', 'false', 'no', 'off'], true)) {
+                    return false;
+                }
+            }
+
+            return true;
+      }
+
+      protected function normalizeBeforeExecuteHookPath(mixed $value): ?string
+      {
+            if (! is_string($value)) {
+                return null;
+            }
+
+            $normalized = trim($value);
+
+            return $normalized === '' ? null : $normalized;
+      }
+
+      protected function getBeforeExecuteHookName(string $routeName): string
+      {
+            $cleanString = preg_replace('/[^A-Za-z0-9]/', ' ', $routeName);
+            $cleanString = ucwords((string) $cleanString);
+
+            return 'BeforeExecute' . str_replace(' ', '', $cleanString) . 'Hook';
+      }
+
+      protected function resolveBeforeExecuteHookClassFromPayload(array $payload, ?string $defaultHookClass = null, ?ApiConfig $existingConfig = null): string
+      {
+            $hookPath = $this->normalizeBeforeExecuteHookPath($payload['before_execute_hook_path'] ?? null);
+
+            if ($hookPath !== null) {
+                return $hookPath;
+            }
+
+            if (isset($payload['before_execute_hook']) && is_array($payload['before_execute_hook'])) {
+                $hookListener = $this->normalizeBeforeExecuteHookPath($payload['before_execute_hook']['listener_class'] ?? null);
+
+                if ($hookListener !== null) {
+                    return $hookListener;
+                }
+            }
+
+            $existingListener = $existingConfig?->beforeExecuteHook?->listener_class;
+
+            if (is_string($existingListener) && trim($existingListener) !== '') {
+                return trim($existingListener);
+            }
+
+            if ($defaultHookClass !== null && trim($defaultHookClass) !== '') {
+                return trim($defaultHookClass);
+            }
+
+            $routeName = trim((string) ($payload['route_name'] ?? $existingConfig?->route_name ?? ''));
+
+            return 'App\\Hooks\\Api\\' . $this->getBeforeExecuteHookName($routeName);
       }
 
       protected function ensureAfterHitListener(string $listenerName, bool $generateListener): bool

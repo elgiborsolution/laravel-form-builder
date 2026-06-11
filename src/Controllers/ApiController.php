@@ -2,6 +2,7 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Contracts\BeforeExecuteHookInterface;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\AfterHitApiDispatcher;
@@ -200,6 +201,8 @@ class ApiController extends Controller
         }
 
         if($apiConfigs->method == 'GET'){
+            $this->runBeforeExecuteHooks($request, $apiConfigs);
+
             return $this->dataQueryService->executeForApiConfig(
                 $request,
                 $apiConfigs,
@@ -227,6 +230,48 @@ class ApiController extends Controller
         }
 
         return response()->json(['data' => []], 200);
+  }
+
+  /**
+   * Execute all before-execute hooks using the current tenant/runtime context.
+   *
+   * @param Request $request
+   * @param ApiConfig $apiConfig
+   */
+  protected function runBeforeExecuteHooks(Request $request, ApiConfig $apiConfig): void
+  {
+        $hooks = $apiConfig->hooks()
+            ->where('action_type', 'before_execute')
+            ->orderBy('id')
+            ->get();
+
+        if ($hooks->isEmpty()) {
+            return;
+        }
+
+        $payload = $request->all();
+
+        foreach ($hooks as $hook) {
+            $hookClass = trim((string) ($hook->listener_class ?? ''));
+
+            if ($hookClass === '') {
+                continue;
+            }
+
+            if (! class_exists($hookClass)) {
+                throw new \RuntimeException("Before execute hook class not found: {$hookClass}");
+            }
+
+            $instance = app($hookClass);
+
+            if (! $instance instanceof BeforeExecuteHookInterface) {
+                throw new \RuntimeException("Before execute hook must implement " . BeforeExecuteHookInterface::class);
+            }
+
+            $instance->handle($payload, $apiConfig, $request);
+        }
+
+        $request->replace($payload);
   }
 
   protected function dispatchAfterHitApiEvent(
@@ -526,6 +571,8 @@ class ApiController extends Controller
           }
       }
 
+      $this->runBeforeExecuteHooks($request, $apiConfigs);
+
       // Retrieve tables that contain array parameters
       $tableMutipleValue = $this->getTablesWithArrayParams($apiConfigs->toArray());
       $multipleInsertTable = array_keys($tableMutipleValue);
@@ -674,6 +721,8 @@ class ApiController extends Controller
 
         }
 
+        $this->runBeforeExecuteHooks($request, $apiConfigs);
+
         $tableMutipleValue = $this->getTablesWithArrayParams($apiConfigs->toArray());
         $multipleInsertTable = array_keys($tableMutipleValue);
         $parentTable = $apiConfigs->parentTable->table_name;
@@ -803,6 +852,8 @@ class ApiController extends Controller
             }
 
         }
+
+        $this->runBeforeExecuteHooks($request, $apiConfigs);
 
         $parentTable = $apiConfigs->parentTable->table_name;
         $primarykey = $apiConfigs->parentTable->primary_key;
