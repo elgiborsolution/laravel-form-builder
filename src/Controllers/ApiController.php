@@ -3,6 +3,7 @@ namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Contracts\BeforeExecuteHookInterface;
+use ESolution\DataSources\Exceptions\ApiHookException;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\AfterHitApiDispatcher;
@@ -90,6 +91,11 @@ class ApiController extends Controller
                 }
             );
             });
+        } catch (ApiHookException $exception) {
+            return response()->json(
+                $exception->toResponsePayload(),
+                $exception->getStatusCode()
+            );
         } finally {
             $this->runtimeValidationConnectionName = $previousValidationConnection;
         }
@@ -538,7 +544,7 @@ class ApiController extends Controller
   *
   * @return \Illuminate\Http\JsonResponse
   */
-  public function store(Request $request, $apiConfigs)
+    public function store(Request $request, $apiConfigs)
   {
     
       if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
@@ -669,6 +675,11 @@ class ApiController extends Controller
               'data' => []
           ], 201);
 
+      } catch (ApiHookException $e) {
+          return response()->json(
+              $e->toResponsePayload(),
+              $e->getStatusCode()
+          );
       } catch (\Exception $e) {
           $connection->rollBack();
           \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
@@ -806,6 +817,12 @@ class ApiController extends Controller
 
             $connection->commit();
             return response()->json(["status" => 200, 'message' => 'Data has been successfully updated', 'data' => []], 201);
+        } catch (ApiHookException $e) {
+            $connection->rollBack();
+            return response()->json(
+                $e->toResponsePayload(),
+                $e->getStatusCode()
+            );
         } catch (\Exception $e) {
             $connection->rollBack();
             \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
@@ -893,6 +910,12 @@ class ApiController extends Controller
 
             $connection->commit();
             return response()->json(["status" => 200, 'message' => 'Data has been successfully deleted', 'data' => []], 201);
+        } catch (ApiHookException $e) {
+            $connection->rollBack();
+            return response()->json(
+                $e->toResponsePayload(),
+                $e->getStatusCode()
+            );
         } catch (\Exception $e) {
             $connection->rollBack();
             \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());

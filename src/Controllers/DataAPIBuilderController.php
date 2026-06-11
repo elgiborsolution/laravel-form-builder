@@ -1812,6 +1812,7 @@ class DataAPIBuilderController extends Controller
 
 namespace App\Hooks\Api;
 
+use ESolution\DataSources\Exceptions\ApiHookException;
 use ESolution\DataSources\Contracts\BeforeExecuteHookInterface;
 use ESolution\DataSources\Models\ApiConfig;
 use Illuminate\Http\Request;
@@ -1823,7 +1824,42 @@ class {$hookName} implements BeforeExecuteHookInterface
         ApiConfig \$apiConfig,
         Request \$request
     ): void {
-        // TODO: add before execute business rules here.
+        /*
+        |--------------------------------------------------------------------------
+        | Example: Stop execution with custom error
+        |--------------------------------------------------------------------------
+        |
+        | throw new ApiHookException(
+        |     400,
+        |     'Branch tidak valid'
+        | );
+        |
+        */
+
+        /*
+        |--------------------------------------------------------------------------
+        | Example: Return custom status and additional data
+        |--------------------------------------------------------------------------
+        |
+        | throw new ApiHookException(
+        |     409,
+        |     'Stock tidak mencukupi',
+        |     [
+        |         'available_stock' => 10,
+        |         'requested_stock' => 20,
+        |     ]
+        | );
+        |
+        */
+
+        /*
+        |--------------------------------------------------------------------------
+        | Example: Modify payload before execution
+        |--------------------------------------------------------------------------
+        |
+        | \$payload['created_by'] = auth()->id();
+        |
+        */
     }
 }
 PHP;
