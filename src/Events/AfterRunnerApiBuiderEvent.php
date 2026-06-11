@@ -23,4 +23,23 @@ class AfterRunnerApiBuiderEvent
      * @var array<string, mixed>
      */
     public array $payload = [];
+
+    /**
+     * Final result produced by the API operation.
+     *
+     * @var array<string, mixed>
+     */
+    public array $result = [];
+
+    /**
+     * Data captured before delete, when available.
+     *
+     * @var array<string, mixed>
+     */
+    public array $beforeData = [];
+
+    /**
+     * Operation action name, for example create, update, or delete.
+     */
+    public string $action = '';
 }

@@ -72,13 +72,7 @@ class ApiController extends Controller
                 $apiConfigs,
                 function (Request $request) use ($apiConfigs, $id) {
                     $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id);
-                    $this->dispatchAfterHitApiEvent(
-                        $apiConfigs,
-                        $request,
-                        $response,
-                        $id,
-                        $this->resolveAfterHitPayload($request, $apiConfigs)
-                    );
+                    $this->dispatchAfterHitApiEvent($apiConfigs, $request, $response, $id);
 
                     return $response;
                 }
@@ -225,8 +219,7 @@ class ApiController extends Controller
       ApiConfig $apiConfig,
       Request $request,
       JsonResponse $response,
-      mixed $resolvedId = null,
-      array $payload = []
+      mixed $resolvedId = null
   ): void {
         $dispatcher = $this->afterHitApiDispatcher();
 
@@ -235,7 +228,16 @@ class ApiController extends Controller
         }
 
         try {
-            $dispatcher->dispatchIfSuccessful($apiConfig, $request, $response, $resolvedId, $payload);
+            $dispatcher->dispatchIfSuccessful(
+                $apiConfig,
+                $request,
+                $response,
+                $resolvedId,
+                $this->resolveAfterHitPayload($request, $apiConfig),
+                $this->resolveAfterHitResult($request, $apiConfig, $resolvedId),
+                $this->resolveAfterHitAction($request, $apiConfig),
+                $this->resolveAfterHitBeforeData($request, $apiConfig)
+            );
         } catch (\Throwable $e) {
             \Log::error('AFTER HIT API DISPATCH ERROR => ' . $e->getMessage(), [
                 'route_name' => $apiConfig->route_name,
@@ -276,6 +278,74 @@ class ApiController extends Controller
         }
 
         return $request->all();
+  }
+
+  /**
+   * Resolve the final API result for the after-hit listener.
+   *
+   * @return array<string, mixed>
+   */
+  protected function resolveAfterHitResult(Request $request, ApiConfig $apiConfig, mixed $resolvedId = null): array
+  {
+        $result = $request->attributes->get('datasources.after_hit.result');
+
+        if (is_array($result)) {
+            return $result;
+        }
+
+        if (is_object($result)) {
+            return json_decode(json_encode($result), true) ?: [];
+        }
+
+        if (strtoupper((string) $apiConfig->method) === 'DELETE') {
+            return $resolvedId === null ? [] : ['id' => $resolvedId];
+        }
+
+        return [];
+  }
+
+  protected function resolveAfterHitBeforeData(Request $request, ApiConfig $apiConfig): array
+  {
+        $beforeData = $request->attributes->get('datasources.after_hit.before_data');
+
+        if (is_array($beforeData)) {
+            return $beforeData;
+        }
+
+        if (is_object($beforeData)) {
+            return json_decode(json_encode($beforeData), true) ?: [];
+        }
+
+        return [];
+  }
+
+  protected function resolveAfterHitAction(Request $request, ApiConfig $apiConfig): string
+  {
+        $action = trim((string) $request->attributes->get('datasources.after_hit.action', ''));
+
+        if ($action !== '') {
+            return $action;
+        }
+
+        return strtolower((string) $apiConfig->method);
+  }
+
+  /**
+   * Normalize a database record to an associative array.
+   *
+   * @return array<string, mixed>
+   */
+  protected function normalizeAfterHitRecord(mixed $record): array
+  {
+        if (is_array($record)) {
+            return $record;
+        }
+
+        if (is_object($record)) {
+            return json_decode(json_encode($record), true) ?: [];
+        }
+
+        return [];
   }
 
   protected function runDynamicMiddlewarePipeline(Request $request, ApiConfig $apiConfig, \Closure $destination): JsonResponse
@@ -520,6 +590,16 @@ class ApiController extends Controller
               $connection->table($value['table'])->insert($value['table_values']);
           }
 
+          $finalRecord = $this->normalizeAfterHitRecord(
+              $connection->table($cleanParentTable)
+                  ->where($apiConfigs->parentTable->primary_key, $id)
+                  ->first()
+          );
+
+          $request->attributes->set('datasources.after_hit.action', 'create');
+          $request->attributes->set('datasources.after_hit.result', $finalRecord);
+          $request->attributes->set('datasources.after_hit.before_data', []);
+
           $connection->commit();
           return response()->json([
               "status" => 200,
@@ -649,6 +729,15 @@ class ApiController extends Controller
               $connection->table($value['table'])->insert($value['table_values']);
             }
 
+            $finalRecord = $this->normalizeAfterHitRecord(
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->first()
+            );
+
+            $request->attributes->set('datasources.after_hit.action', 'update');
+            $request->attributes->set('datasources.after_hit.result', $finalRecord);
+            $request->attributes->set('datasources.after_hit.before_data', []);
 
             $connection->commit();
             return response()->json(["status" => 200, 'message' => 'Data has been successfully updated', 'data' => []], 201);
@@ -710,6 +799,19 @@ class ApiController extends Controller
         try {
             $connection->beginTransaction();
             $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+
+            $beforeData = $this->normalizeAfterHitRecord(
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->first()
+            );
+
+            $request->attributes->set('datasources.after_hit.action', 'delete');
+            $request->attributes->set('datasources.after_hit.before_data', $beforeData);
+            $request->attributes->set('datasources.after_hit.result', [
+                'id' => $id,
+                'deleted' => true,
+            ]);
 
             $connection->table($cleanParentTable)
                 ->where($primarykey, $id)

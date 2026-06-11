@@ -27,7 +27,10 @@ class AfterHitApiDispatcher
         Request $request,
         JsonResponse $response,
         mixed $resolvedId = null,
-        array $payload = []
+        array $payload = [],
+        array $result = [],
+        string $action = '',
+        array $beforeData = []
     ): void {
         
         if (! $response->isSuccessful()) {
@@ -44,7 +47,7 @@ class AfterHitApiDispatcher
         $this->registerListener($eventClass, $listenerClass);
 
         $event = $this->makeEvent($eventClass, $apiConfig, $request, $response, $resolvedId);
-        $this->attachPayload($event, $payload);
+        $this->attachContext($event, $payload, $result, $action, $beforeData);
         
         $this->events->dispatch($event);
     }
@@ -60,21 +63,29 @@ class AfterHitApiDispatcher
     }
 
     /**
-     * Attach the resolved request payload to the event without requiring a
+     * Attach the runtime after-hit context to the event without requiring a
      * constructor signature change in the app event class.
      *
      * @param object $event
      * @param array<string, mixed> $payload
+     * @param array<string, mixed> $result
+     * @param array<string, mixed> $beforeData
      */
-    protected function attachPayload(object $event, array $payload): void
+    protected function attachContext(
+        object $event,
+        array $payload,
+        array $result,
+        string $action,
+        array $beforeData
+    ): void
     {
         if (property_exists($event, 'payload')) {
             $event->payload = $payload;
-
-            return;
         }
 
-        $event->payload = $payload;
+        $event->result = $result;
+        $event->action = $action;
+        $event->beforeData = $beforeData;
     }
 
     protected function registerListener(string $eventClass, string $listenerClass): void

@@ -38,13 +38,29 @@ class AfterHitApiDispatcherTest extends TestCase
             'email' => 'alice@example.test',
         ];
 
-        $dispatcher->dispatchIfSuccessful($apiConfig, $request, $response, 99, $payload);
+        $finalResult = [
+            'id' => 99,
+            'name' => 'Alice',
+            'created_at' => '2026-06-10 10:00:00',
+        ];
+
+        $dispatcher->dispatchIfSuccessful(
+            $apiConfig,
+            $request,
+            $response,
+            99,
+            $payload,
+            $finalResult,
+            'create'
+        );
 
         $this->assertSame(1, FakeAfterHitListener::$handledCount);
         $this->assertInstanceOf(AfterRunnerApiBuiderEvent::class, FakeAfterHitListener::$lastEvent);
         $this->assertSame('customers.index', FakeAfterHitListener::$lastEvent?->apiConfig->route_name);
         $this->assertSame(99, FakeAfterHitListener::$lastEvent?->resolvedId);
         $this->assertSame($payload, FakeAfterHitListener::$lastEvent?->payload);
+        $this->assertSame($finalResult, FakeAfterHitListener::$lastEvent?->result);
+        $this->assertSame('create', FakeAfterHitListener::$lastEvent?->action);
     }
 
     public function test_it_skips_failed_responses(): void
@@ -81,11 +97,28 @@ class AfterHitApiDispatcherTest extends TestCase
         $request = Request::create('/api/customers/15', 'DELETE');
         $response = new JsonResponse(['message' => 'ok'], 200);
 
-        $dispatcher->dispatchIfSuccessful($apiConfig, $request, $response, 15, []);
+        $beforeData = [
+            'id' => 15,
+            'name' => 'Old brand',
+        ];
+
+        $dispatcher->dispatchIfSuccessful(
+            $apiConfig,
+            $request,
+            $response,
+            15,
+            [],
+            ['id' => 15, 'deleted' => true],
+            'delete',
+            $beforeData
+        );
 
         $this->assertSame(1, FakeAfterHitListener::$handledCount);
         $this->assertSame(15, FakeAfterHitListener::$lastEvent?->resolvedId);
         $this->assertSame([], FakeAfterHitListener::$lastEvent?->payload);
+        $this->assertSame(['id' => 15, 'deleted' => true], FakeAfterHitListener::$lastEvent?->result);
+        $this->assertSame($beforeData, FakeAfterHitListener::$lastEvent?->beforeData);
+        $this->assertSame('delete', FakeAfterHitListener::$lastEvent?->action);
     }
 }
 

@@ -5,6 +5,7 @@ namespace ESolution\DataSources\Tests\Unit\Controllers;
 use ESolution\DataSources\Controllers\ApiController;
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Services\AfterHitApiDispatcher;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
@@ -195,6 +196,76 @@ class ApiControllerRuntimeRequestTest extends TestCase
 
         $this->assertSame(200, $response->getStatusCode());
         $this->assertSame(1, $controller->afterHitDispatchCount);
+    }
+
+    public function test_it_passes_final_result_context_to_after_hit_dispatcher(): void
+    {
+        $resolver = $this->createMock(DynamicApiConfigResolver::class);
+        $apiConfig = new ApiConfig();
+        $apiConfig->route_name = 'customers.store';
+        $apiConfig->method = 'POST';
+
+        $resolver->expects($this->once())
+            ->method('resolve')
+            ->with('customers', 'POST')
+            ->willReturn([
+                'config' => $apiConfig,
+                'id' => null,
+                'endpoint' => 'customers',
+            ]);
+
+        $afterHitDispatcher = $this->createMock(AfterHitApiDispatcher::class);
+        $afterHitDispatcher->expects($this->once())
+            ->method('dispatchIfSuccessful')
+            ->with(
+                $this->identicalTo($apiConfig),
+                $this->isInstanceOf(Request::class),
+                $this->isInstanceOf(JsonResponse::class),
+                null,
+                ['name' => 'Brand A'],
+                ['id' => 123, 'name' => 'Brand A'],
+                'create',
+                []
+            );
+
+        $controller = new class(
+            $resolver,
+            $this->createMock(DataQueryService::class),
+            $this->createMock(Pipeline::class),
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            $this->createMock(MiddlewareConnectionResolver::class),
+            $this->createMock(ExecutionConnectionResolver::class),
+            $afterHitDispatcher
+        ) extends TestableApiController {
+            protected function withDatasourceValidationConnection(\Closure $callback)
+            {
+                return $callback();
+            }
+
+            protected function runDynamicMiddlewarePipeline(Request $request, ApiConfig $apiConfig, \Closure $destination): JsonResponse
+            {
+                return $destination($request);
+            }
+
+            protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
+            {
+                $request->attributes->set('datasources.after_hit.action', 'create');
+                $request->attributes->set('datasources.after_hit.result', [
+                    'id' => 123,
+                    'name' => 'Brand A',
+                ]);
+                $request->attributes->set('datasources.after_hit.before_data', []);
+
+                return new JsonResponse(['message' => 'ok'], 200);
+            }
+        };
+
+        $response = $controller->handleRequest(
+            Request::create('/api/customers', 'POST', ['name' => 'Brand A']),
+            'customers'
+        );
+
+        $this->assertSame(200, $response->getStatusCode());
     }
 
     private function makeController(): TestableApiController
