@@ -339,7 +339,7 @@ class DataSourceController extends Controller
       'is_required' => 'nullable|integer',
     ];
     $dataParam = [];
-    foreach ($request->parameters??[] as $key => $value) {
+    foreach ($request->input('parameters', []) as $key => $value) {
 
         $validator = Validator::make($value, $validateParam);
 
@@ -355,11 +355,13 @@ class DataSourceController extends Controller
 
         $dataPrepare = $this->findAttributeSQlBuilder($request, $validated['custom_query']);
         if(!empty($dataPrepare['error'])){
-
-            return response()->json(['error' => $dataPrepare['error'], 'message' => $dataPrepare['error']], 422);
+            return response()->json([
+              'error' => $dataPrepare['error'],
+              'message' => $dataPrepare['error'],
+            ], 422);
         }
         $validated['columns'] = [];
-        foreach ((!empty($dataPrepare['columns'])?$dataPrepare['columns']:[]) as $key => $value) {
+        foreach (array_filter(($dataPrepare['columns'] ?? []), static fn ($column) => is_string($column) && $column !== '') as $key => $value) {
           $dataParam[] = [
                             'param_name' => $value,
                             'param_type' => 'string',
@@ -459,7 +461,7 @@ class DataSourceController extends Controller
       'is_required' => 'nullable|integer',
     ];
     $dataParam = [];
-    foreach ($request->parameters as $key => $value) {
+    foreach ($request->input('parameters', []) as $key => $value) {
 
         $validator = Validator::make($value, $validateParam);
 
@@ -475,11 +477,13 @@ class DataSourceController extends Controller
 
         $dataPrepare = $this->findAttributeSQlBuilder($request, $validated['custom_query']);
         if(!empty($dataPrepare['error'])){
-
-            return response()->json(['error' => $dataPrepare['error'], 'message' => $dataPrepare['error']], 422);
+            return response()->json([
+              'error' => $dataPrepare['error'],
+              'message' => $dataPrepare['error'],
+            ], 422);
         }
         $validated['columns'] = [];
-        foreach ((!empty($dataPrepare['columns'])?$dataPrepare['columns']:[]) as $key => $value) {
+        foreach (array_filter(($dataPrepare['columns'] ?? []), static fn ($column) => is_string($column) && $column !== '') as $key => $value) {
           $dataParam[] = [
                             'param_name' => $value,
                             'param_type' => 'string',

@@ -29,6 +29,10 @@ class ApiConfig extends Model
         'middlewares' => 'array',
     ];
 
+    protected $appends = [
+        'listener_path',
+    ];
+
     /**
      * Define a relationship with the ApiPermission model.
      * Each API config belongs to a specific API permission.
@@ -49,6 +53,11 @@ class ApiConfig extends Model
     public function hook()
     {
         return $this->hasOne(ApiHook::class);
+    }
+
+    public function getListenerPathAttribute(): ?string
+    {
+        return $this->hook?->listener_class;
     }
 
     /**

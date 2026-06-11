@@ -20,10 +20,12 @@ class RuntimeVariableControllerTest extends TestCase
         $payload = json_decode($response->getContent(), true);
 
         $this->assertIsArray($payload);
-        $this->assertSame('app.env', $payload[0]['key']);
-        $this->assertSame('auth.company_id', $payload[1]['key']);
-        $this->assertSame('auth.id', $payload[3]['key']);
-        $this->assertArrayHasKey('type', $payload[0]);
-        $this->assertArrayHasKey('description', $payload[0]);
+        $this->assertArrayHasKey('data', $payload);
+        $this->assertIsArray($payload['data']);
+        $this->assertSame('app.env', $payload['data'][0]['key']);
+        $this->assertSame('auth.company_id', $payload['data'][1]['key']);
+        $this->assertSame('auth.id', $payload['data'][3]['key']);
+        $this->assertArrayHasKey('type', $payload['data'][0]);
+        $this->assertArrayHasKey('description', $payload['data'][0]);
     }
 }
