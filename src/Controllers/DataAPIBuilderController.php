@@ -175,6 +175,20 @@ class DataAPIBuilderController extends Controller
     }
 
     /**
+     * Return package defaults used by the frontend create form.
+     *
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function defaults(): \Illuminate\Http\JsonResponse
+    {
+        return response()->json([
+            'data' => [
+                'default_api_middlewares' => $this->getDefaultApiMiddlewares(),
+            ],
+        ]);
+    }
+
+    /**
      * Normalize selected record ids from request input.
      *
      * @param mixed $ids
@@ -1090,6 +1104,7 @@ class DataAPIBuilderController extends Controller
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
       'middlewares.*' => 'nullable|string',
+      'use_default_middlewares' => 'nullable|boolean',
       'validation_rules' => 'nullable|string',
       'generate_listener' => 'nullable|boolean',
       'listener_path' => 'nullable|string',
@@ -1118,7 +1133,10 @@ class DataAPIBuilderController extends Controller
               'params' => ($validated['params'] ?? []),
               'enabled' => array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true,
               'description' => $validated['description'] ?? null,
-              'middlewares' => $this->normalizeMiddlewares($validated['middlewares'] ?? null),
+              'middlewares' => $this->resolveCreateMiddlewares(
+                  $validated['middlewares'] ?? null,
+                  $validated['use_default_middlewares'] ?? true
+              ),
             ]);
 
             $parentTable = new ApiTable([
@@ -1265,6 +1283,7 @@ class DataAPIBuilderController extends Controller
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
       'middlewares.*' => 'nullable|string',
+      'use_default_middlewares' => 'nullable|boolean',
       'generate_listener' => 'nullable|boolean',
       'listener_path' => 'nullable|string',
     ]);
@@ -1429,7 +1448,10 @@ class DataAPIBuilderController extends Controller
                 );
                 $bundlePayload['enabled'] = array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true;
                 $bundlePayload['description'] = $validated['description'] ?? null;
-                $bundlePayload['middlewares'] = $this->normalizeMiddlewares($validated['middlewares'] ?? null);
+                $bundlePayload['middlewares'] = $this->resolveCreateMiddlewares(
+                    $validated['middlewares'] ?? null,
+                    $validated['use_default_middlewares'] ?? true
+                );
                 $bundlePayload['generate_listener'] = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
                 $bundlePayload['listener_path'] = $this->normalizeListenerPath($validated['listener_path'] ?? null);
 
@@ -1548,6 +1570,54 @@ class DataAPIBuilderController extends Controller
             ));
 
             return $normalized === [] ? null : $normalized;
+      }
+
+      protected function resolveCreateMiddlewares(mixed $middlewares, mixed $useDefaultMiddlewares = true): ?array
+      {
+            $normalized = $this->normalizeMiddlewares(is_array($middlewares) ? $middlewares : null);
+
+            if ($normalized !== null) {
+                return $normalized;
+            }
+
+            if (! $this->normalizeUseDefaultMiddlewares($useDefaultMiddlewares)) {
+                return null;
+            }
+
+            $defaultMiddlewares = $this->getDefaultApiMiddlewares();
+
+            return $defaultMiddlewares === [] ? null : $defaultMiddlewares;
+      }
+
+      protected function getDefaultApiMiddlewares(): array
+      {
+            $defaultMiddlewares = config('datasources.default_api_middlewares', []);
+
+            if (! is_array($defaultMiddlewares)) {
+                return [];
+            }
+
+            return array_values(array_filter(
+                array_map(static fn ($middleware) => is_string($middleware) ? trim($middleware) : '', $defaultMiddlewares),
+                static fn (string $middleware) => $middleware !== ''
+            ));
+      }
+
+      protected function normalizeUseDefaultMiddlewares(mixed $value): bool
+      {
+            if (is_bool($value)) {
+                return $value;
+            }
+
+            if (is_int($value)) {
+                return $value === 1;
+            }
+
+            if (is_string($value)) {
+                return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+            }
+
+            return true;
       }
 
       protected function syncAfterHitHook(

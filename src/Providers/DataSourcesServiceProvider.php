@@ -103,6 +103,8 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-api-builder.import');
                 Route::post('data-api-builder/bundle-crud', [DataAPIBuilderController::class, 'bundleCrud'])
                     ->name('management.data-api-builder.bundle-crud');
+                Route::get('data-api-builder/defaults', [DataAPIBuilderController::class, 'defaults'])
+                    ->name('management.data-api-builder.defaults');
                 Route::get('runtime-variables', [RuntimeVariableController::class, 'index'])
                     ->name('management.runtime-variables.index');
 

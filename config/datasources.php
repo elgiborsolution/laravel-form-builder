@@ -42,6 +42,8 @@ return [
 
     'runtime_variable_registry' => null,
 
+    'default_api_middlewares' => ['auth:api'],
+
     'routes' => [
         'prefix' => env('DATASOURCES_ROUTE_PREFIX', 'api'),
         'version' => env('DATASOURCES_ROUTE_VERSION'),
