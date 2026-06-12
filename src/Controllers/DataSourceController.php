@@ -4,6 +4,7 @@ namespace ESolution\DataSources\Controllers;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
+use ESolution\DataSources\Services\CustomQueryService;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Http\Request;
@@ -19,6 +20,7 @@ class DataSourceController extends Controller
 {
   public function __construct(
     protected DataQueryService $dataQueryService,
+    protected CustomQueryService $customQueryService,
     protected Pipeline $pipeline,
     protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
   ) {
@@ -325,6 +327,7 @@ class DataSourceController extends Controller
       ],
       'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
+      'filter_parameters' => ['nullable', 'array'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
       'custom_query' => [
@@ -336,49 +339,49 @@ class DataSourceController extends Controller
       ],
     ]);
 
-    if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
-      return response()->json(['error' => 'Only SELECT queries are allowed', 'message' => 'Only SELECT queries are allowed'], 422);
+    $dataParam = $this->validateDataSourceParameters(
+      $this->resolveParameterPayload($request),
+      (bool) $validated['use_custom_query']
+    );
+
+    if (isset($dataParam['error'])) {
+      return response()->json([
+        'error' => $dataParam['error'],
+        'message' => $dataParam['error'],
+      ], 422);
     }
 
-    $validateParam = [
-      'param_name' => 'required|string',
-      'param_default_value' => 'nullable|string',
-      'param_type' => ["required" , "string", "in:string,integer,boolean,date,float"],
-      'operator' => 'nullable|string|in:=,!=,>,<,>=,<=,LIKE,NOT LIKE,like,not like',
-      'is_required' => 'nullable|integer',
-    ];
-    $dataParam = [];
-    foreach ($request->input('parameters', []) as $key => $value) {
+    $dataParam = $dataParam['data'];
+    $validated['columns'] = $validated['columns'] ?? [];
 
-        $validator = Validator::make($value, $validateParam);
+    if ($validated['use_custom_query']) {
+      $customQueryInspection = $this->inspectCustomQuery(
+        $request,
+        (string) ($validated['custom_query'] ?? '')
+      );
 
-        if ($validator->fails()) {
-            return response()->json(['error'=>$validator->errors()], 422);
+      if (! $customQueryInspection['valid']) {
+        return response()->json([
+          'error' => $customQueryInspection['message'],
+          'message' => $customQueryInspection['message'],
+          'valid' => false,
+        ], 422);
+      }
+
+      $validated['columns'] = $customQueryInspection['columns'];
+
+      $parameterColumns = $customQueryInspection['columns'];
+      foreach ($dataParam as $parameter) {
+        $columnName = (string) ($parameter['param_name'] ?? '');
+
+        if ($columnName !== '' && ! in_array($columnName, $parameterColumns, true)) {
+          return response()->json([
+            'error' => "Unknown column '{$columnName}'",
+            'message' => "Unknown column '{$columnName}'",
+            'valid' => false,
+          ], 422);
         }
-
-        $dataParam[] = $value;
-
-    }
-
-    if($validated['use_custom_query']){
-
-        $dataPrepare = $this->findAttributeSQlBuilder($request, $validated['custom_query']);
-        if(!empty($dataPrepare['error'])){
-            return response()->json([
-              'error' => $dataPrepare['error'],
-              'message' => $dataPrepare['error'],
-            ], 422);
-        }
-        $validated['columns'] = [];
-        foreach (array_filter(($dataPrepare['columns'] ?? []), static fn ($column) => is_string($column) && $column !== '') as $key => $value) {
-          $dataParam[] = [
-                            'param_name' => $value,
-                            'param_type' => 'string',
-                            'operator' => '=',
-                            'is_required' => 0
-                        ];
-          $validated['columns'][] = $value;
-        }
+      }
     }
 
     $dataSource = DataSource::create([
@@ -410,7 +413,11 @@ class DataSourceController extends Controller
     if (empty($dataSource)) {
       return response()->json(['error' => 'Data source not found'], 422);
     }
-    return response()->json($dataSource);
+
+    $payload = $dataSource->toArray();
+    $payload['filter_parameters'] = $payload['parameters'] ?? [];
+
+    return response()->json($payload);
   }
 
   /**
@@ -451,6 +458,7 @@ class DataSourceController extends Controller
       ],
       'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
+      'filter_parameters' => ['nullable', 'array'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
       'custom_query' => [
@@ -462,49 +470,49 @@ class DataSourceController extends Controller
       ],
     ]);
 
-    if (!empty($validated['custom_query']) && !DataSource::validateQuery($validated['custom_query'])) {
-      return response()->json(['error' => 'Only SELECT queries are allowed'], 422);
+    $dataParam = $this->validateDataSourceParameters(
+      $this->resolveParameterPayload($request),
+      (bool) $validated['use_custom_query']
+    );
+
+    if (isset($dataParam['error'])) {
+      return response()->json([
+        'error' => $dataParam['error'],
+        'message' => $dataParam['error'],
+      ], 422);
     }
 
-    $validateParam = [
-      'param_name' => 'required|string',
-      'param_default_value' => 'nullable|string',
-      'param_type' => ["required" , "string", "in:string,integer,boolean,date,float"],
-      'operator' => 'nullable|string|in:=,!=,>,<,>=,<=,LIKE,NOT LIKE,like,not like',
-      'is_required' => 'nullable|integer',
-    ];
-    $dataParam = [];
-    foreach ($request->input('parameters', []) as $key => $value) {
+    $dataParam = $dataParam['data'];
+    $validated['columns'] = $validated['columns'] ?? [];
 
-        $validator = Validator::make($value, $validateParam);
+    if ($validated['use_custom_query']) {
+      $customQueryInspection = $this->inspectCustomQuery(
+        $request,
+        (string) ($validated['custom_query'] ?? '')
+      );
 
-        if ($validator->fails()) {
-            return response()->json(['error'=>$validator->errors()], 401);
+      if (! $customQueryInspection['valid']) {
+        return response()->json([
+          'error' => $customQueryInspection['message'],
+          'message' => $customQueryInspection['message'],
+          'valid' => false,
+        ], 422);
+      }
+
+      $validated['columns'] = $customQueryInspection['columns'];
+
+      $parameterColumns = $customQueryInspection['columns'];
+      foreach ($dataParam as $parameter) {
+        $columnName = (string) ($parameter['param_name'] ?? '');
+
+        if ($columnName !== '' && ! in_array($columnName, $parameterColumns, true)) {
+          return response()->json([
+            'error' => "Unknown column '{$columnName}'",
+            'message' => "Unknown column '{$columnName}'",
+            'valid' => false,
+          ], 422);
         }
-
-        $dataParam[] = $value;
-
-    }
-
-    if($validated['use_custom_query']){
-
-        $dataPrepare = $this->findAttributeSQlBuilder($request, $validated['custom_query']);
-        if(!empty($dataPrepare['error'])){
-            return response()->json([
-              'error' => $dataPrepare['error'],
-              'message' => $dataPrepare['error'],
-            ], 422);
-        }
-        $validated['columns'] = [];
-        foreach (array_filter(($dataPrepare['columns'] ?? []), static fn ($column) => is_string($column) && $column !== '') as $key => $value) {
-          $dataParam[] = [
-                            'param_name' => $value,
-                            'param_type' => 'string',
-                            'operator' => '=',
-                            'is_required' => 0
-                        ];
-          $validated['columns'][] = $value;
-        }
+      }
     }
 
 
@@ -526,6 +534,38 @@ class DataSourceController extends Controller
     
 
     return response()->json($dataSource->load(['parameters']));
+  }
+
+  /**
+   * Validate a custom query before save or manual verification.
+   *
+   * @param Request $request
+   * @return \Illuminate\Http\JsonResponse
+   */
+  public function validateQuery(Request $request)
+  {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request) {
+      $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+      $result = $this->customQueryService->validate((string) $request->input('query', ''), $connectionName);
+
+      return response()->json($result, $result['valid'] ? 200 : 422);
+    });
+  }
+
+  /**
+   * Extract column names from a custom query.
+   *
+   * @param Request $request
+   * @return \Illuminate\Http\JsonResponse
+   */
+  public function extractQueryColumns(Request $request)
+  {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request) {
+      $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+      $result = $this->customQueryService->extractColumns((string) $request->input('query', ''), $connectionName);
+
+      return response()->json($result, $result['valid'] ? 200 : 422);
+    });
   }
 
   /**
@@ -681,6 +721,103 @@ class DataSourceController extends Controller
     ));
 
     return $normalized;
+  }
+
+  /**
+   * Validate parameter payloads and normalize them into a predictable array.
+   *
+   * @param mixed $parameters
+   * @param bool $customQueryMode
+   * @return array{data:array<int, array<string, mixed>>}|array{error:string}
+   */
+  protected function validateDataSourceParameters(mixed $parameters, bool $customQueryMode): array
+  {
+    if (! is_array($parameters)) {
+      $parameters = [];
+    }
+
+    $validateParam = [
+      'param_name' => 'required|string',
+      'param_default_value' => 'nullable|string',
+      'param_type' => ['required', 'string', 'in:string,integer,boolean,date,float'],
+      'operator' => 'nullable|string|in:=,!=,>,<,>=,<=,LIKE,NOT LIKE,like,not like',
+      'is_required' => 'nullable|integer',
+    ];
+
+    $dataParam = [];
+
+    foreach ($parameters as $value) {
+      if (! is_array($value)) {
+        return ['error' => 'Invalid parameter payload.'];
+      }
+
+      $validator = Validator::make($value, $validateParam);
+
+      if ($validator->fails()) {
+        return ['error' => $validator->errors()->first()];
+      }
+
+      $dataParam[] = $value;
+    }
+
+    return ['data' => $dataParam];
+  }
+
+  /**
+   * Resolve parameter rows from supported payload aliases.
+   *
+   * @param Request $request
+   * @return array<int, array<string, mixed>>
+   */
+  protected function resolveParameterPayload(Request $request): array
+  {
+    $payload = $request->input('parameters');
+
+    if (! is_array($payload)) {
+      $payload = $request->input('filter_parameters');
+    }
+
+    if (! is_array($payload)) {
+      $payload = $request->input('filters', []);
+    }
+
+    if (! is_array($payload)) {
+      return [];
+    }
+
+    return array_values(array_filter(array_map(function (mixed $row): ?array {
+      if (! is_array($row)) {
+        return null;
+      }
+
+      $paramName = $row['param_name'] ?? $row['name'] ?? $row['field'] ?? $row['column'] ?? null;
+      $paramDefaultValue = $row['param_default_value'] ?? $row['value'] ?? $row['param_value'] ?? null;
+      $paramType = $row['param_type'] ?? $row['type'] ?? null;
+
+      return [
+        'param_name' => is_string($paramName) ? trim($paramName) : '',
+        'param_default_value' => $paramDefaultValue,
+        'param_type' => is_string($paramType) && trim($paramType) !== '' ? trim($paramType) : 'string',
+        'operator' => $row['operator'] ?? $row['param_operation'] ?? '=',
+        'is_required' => $row['is_required'] ?? 0,
+      ];
+    }, $payload), static fn (?array $row): bool => is_array($row) && (($row['param_name'] ?? '') !== '')));
+  }
+
+  /**
+   * Inspect a custom query using the active tenant context when available.
+   *
+   * @param Request $request
+   * @param string $query
+   * @return array{valid:bool,columns:array<int, string>,message?:string}
+   */
+  protected function inspectCustomQuery(Request $request, string $query): array
+  {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $query) {
+      $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+
+      return $this->customQueryService->validateAndExtract($query, $connectionName);
+    });
   }
 
   /**
@@ -903,90 +1040,18 @@ class DataSourceController extends Controller
   {
       return $this->runWithDatasourceTenantContext($request, function () use ($request, $query) {
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-        $re = '/select (.*?)from/';
-        $str = str_replace("\n", "", strtolower($query));
-        $return = [];
+        $result = $this->customQueryService->extractColumns((string) $query, $connectionName);
 
-        preg_match($re, $str, $matches);
-        if (count($matches) > 1) {
-          // $lineColum = str_replace("as ","as#",$matches[1]);
-          $lineColum = preg_replace('/\s+/', ' ', $matches[1]);
-          $dataColumnName = explode(',', $lineColum);
-          foreach ($dataColumnName as $key => $value) {
-            if (substr($value, 0, 1) == ' ') {
-              $value = substr($value, 1);
-            }
-
-            if (substr($value, -1) == ' ') {
-              $value = substr($value, 0, -1);
-            }
-
-            $arraySValue = explode(' ', $value);
-            $value = $arraySValue[count($arraySValue) - 1];
-
-            $coulmnAlias = $value;
-            if (str_contains($value, ')')) {
-              $columnFn = explode(')', $value);
-              //its mean this column dosent have alias column
-              if (count($columnFn) == 1) {
-                continue;
-              }
-
-              $coulmnAlias = $columnFn[count($columnFn) - 1];
-            } elseif (str_contains($value, '.')) {
-              $columnFn = explode('.', $value);
-
-              $coulmnAlias = $columnFn[count($columnFn) - 1];
-            }
-
-            $dataColumnName[$key] = $coulmnAlias;
-          }
-
-          if (in_array('*', $dataColumnName)) {
-            // find first table
-            // dd($dataColumnName);
-            $re = '/from (.*)/';
-            $str = str_replace("\n", "", strtolower($query));
-            preg_match($re, $str, $matches);
-            $array = array_diff($dataColumnName, ["*"]);
-            $dataColumnName = array_values($array);
-            if (count($matches) > 1) {
-              $tquery = str_replace(['`', '"'], "", strtolower($matches[1]));
-              $tquery = preg_replace('/\s+/', ' ', $tquery);
-              if (substr($tquery, 0, 1) == ' ') {
-                $tquery = substr($tquery, 1);
-              }
-
-              if (substr($tquery, -1) == ' ') {
-                $tquery = substr($tquery, 0, -1);
-              }
-
-              $tableName = explode(' ', $tquery);
-
-              $selectTable = $tableName[0];
-
-              try {
-                $columns = $this->databaseMetadataProvider->listColumns($selectTable, $connectionName);
-                foreach ($columns as $column) {
-                  $dataColumnName[] = $column['name'] ?? null;
-                }
-              } catch (\Exception $e) {
-                $return['error'] = 'Table ' . $selectTable . ' not found';
-              }
-
-              $dataColumnName = array_values(array_filter($dataColumnName, static fn ($column) => is_string($column) && $column !== ''));
-
-              $arr = array_diff_assoc($dataColumnName, array_unique($dataColumnName));
-              if (count($arr) > 0) {
-                $return['error'] = 'Duplicate column ' . implode(', ', $arr);
-              }
-            }
-          }
-
-          $return['columns'] = $dataColumnName;
+        if (! $result['valid']) {
+          return [
+            'error' => $result['message'],
+            'columns' => [],
+          ];
         }
 
-        return $return;
+        return [
+          'columns' => $result['columns'],
+        ];
       });
   }
 
