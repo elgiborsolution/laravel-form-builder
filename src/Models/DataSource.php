@@ -16,7 +16,7 @@ class DataSource extends Model
      *
      * @var array
      */
-    protected $fillable = ['name', 'table_name', 'use_custom_query', 'columns', 'custom_query', 'middlewares'];
+    protected $fillable = ['name', 'table_name', 'use_custom_query', 'columns', 'custom_query', 'middlewares', 'response_type'];
 
     /**
      * Cast attributes to specific data types.

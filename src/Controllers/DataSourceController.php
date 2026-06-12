@@ -306,11 +306,22 @@ class DataSourceController extends Controller
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
+      'response_type' => $this->normalizeResponseType($request->input('response_type', 'array')),
     ]);
 
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
-      'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name',
+      'name' => [
+        'required',
+        'string',
+        'unique:' . DatabaseConnection::validationTable('data_sources') . ',name',
+        function (string $attribute, mixed $value, \Closure $fail): void {
+          $message = $this->validateRouteTemplate((string) $value);
+          if ($message !== null) {
+            $fail($message);
+          }
+        },
+      ],
       'table_name' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -330,6 +341,7 @@ class DataSourceController extends Controller
       'filter_parameters' => ['nullable', 'array'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
+      'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -391,6 +403,7 @@ class DataSourceController extends Controller
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
+      'response_type' => $validated['response_type'] ?? 'array',
     ]);
 
     if(count($dataParam) > 0){
@@ -416,6 +429,7 @@ class DataSourceController extends Controller
 
     $payload = $dataSource->toArray();
     $payload['filter_parameters'] = $payload['parameters'] ?? [];
+    $payload['response_type'] = $this->normalizeResponseType($payload['response_type'] ?? 'array');
 
     return response()->json($payload);
   }
@@ -437,11 +451,13 @@ class DataSourceController extends Controller
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
+      'response_type' => $this->normalizeResponseType($request->input('response_type', $dataSource->response_type ?? 'array')),
     ]);
 
     $validated = $request->validate([
       'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
+      'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
       'table_name' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -523,6 +539,7 @@ class DataSourceController extends Controller
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
+      'response_type' => $validated['response_type'] ?? 'array',
     ]);
 
     $dataSource->parameters()->delete();
@@ -1011,22 +1028,140 @@ class DataSourceController extends Controller
   /**
   * Run a datasource command
   *
-  * @param Request $request, String $id (name of datasource)
+  * @param Request $request, String $id (name of datasource or route prefix)
   *
   * @return \Illuminate\Http\JsonResponse
   */
-  public function executeQuery(Request $request, $id)
-  { 
-    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id) {
-      $dataSource = DataSource::on(DatabaseConnection::configuredName())->with('parameters')->where('name', $id)->first();
-      if (empty($dataSource)) {
-        return response()->json(['error' => 'Data source not found'], 422);
+  public function executeQuery(Request $request, $id, ?string $routePath = null)
+  {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id, $routePath) {
+      $dataSourceMatch = $this->resolveDataSourceForExecution((string) $id, $routePath);
+
+      if ($dataSourceMatch === null) {
+        return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
       }
 
-      return $this->runDataSourceMiddlewarePipeline($request, $dataSource, function (Request $request) use ($dataSource, $id) {
-        return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
+      [$dataSource, $routeParameters, $cacheKeySuffix] = $dataSourceMatch;
+
+      if ($routeParameters !== []) {
+        $request->merge($routeParameters);
+      }
+
+      return $this->runDataSourceMiddlewarePipeline($request, $dataSource, function (Request $request) use ($dataSource, $cacheKeySuffix) {
+        return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $cacheKeySuffix);
       });
     });
+  }
+
+  protected function resolveDataSourceForExecution(string $identifier, ?string $routePath = null): ?array
+  {
+    $connection = DatabaseConnection::configuredName();
+
+    if ($routePath === null || trim($routePath, '/') === '') {
+      $exactMatch = DataSource::on($connection)->with('parameters')->where('name', $identifier)->first();
+
+      if ($exactMatch) {
+        return [$exactMatch, [], $identifier];
+      }
+    }
+
+    $candidatePath = trim($identifier . '/' . trim((string) $routePath, '/'), '/');
+    if ($candidatePath === '') {
+      return null;
+    }
+
+    $dataSources = DataSource::on($connection)->with('parameters')->get();
+
+    foreach ($dataSources as $dataSource) {
+      [$matched, $routeParameters] = $this->matchRouteTemplate((string) $dataSource->name, $candidatePath);
+
+      if ($matched) {
+        return [$dataSource, $routeParameters, $this->sanitizeCacheKeySuffix($candidatePath)];
+      }
+    }
+
+    return null;
+  }
+
+  protected function matchRouteTemplate(string $template, string $path): array
+  {
+    $template = trim($template, '/');
+    $path = trim($path, '/');
+
+    if ($template === '' || $path === '') {
+      return [false, []];
+    }
+
+    if (strpos($template, '{') === false) {
+      return [$template === $path, []];
+    }
+
+    $segments = explode('/', $template);
+    $pathSegments = explode('/', $path);
+
+    if (count($segments) !== count($pathSegments)) {
+      return [false, []];
+    }
+
+    $parameters = [];
+
+    foreach ($segments as $index => $segment) {
+      $pathSegment = $pathSegments[$index] ?? '';
+
+      if ($segment === '') {
+        return [false, []];
+      }
+
+      if (preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment, $matches) === 1) {
+        $parameters[$matches[1]] = $pathSegment;
+        continue;
+      }
+
+      if ($segment !== $pathSegment) {
+        return [false, []];
+      }
+    }
+
+    return [true, $parameters];
+  }
+
+  protected function validateRouteTemplate(string $template): ?string
+  {
+    $template = trim($template, '/');
+
+    if ($template === '') {
+      return 'The name field must contain a valid route pattern.';
+    }
+
+    $segments = explode('/', $template);
+
+    foreach ($segments as $segment) {
+      if ($segment === '') {
+        return 'The name field must contain a valid route pattern.';
+      }
+
+      if (str_contains($segment, '{') || str_contains($segment, '}')) {
+        if (! preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment)) {
+          return 'The name field must contain balanced route parameters like {id}.';
+        }
+      }
+    }
+
+    return null;
+  }
+
+  protected function normalizeResponseType(mixed $value): string
+  {
+    $normalized = strtolower(trim((string) $value));
+
+    return in_array($normalized, ['array', 'object'], true) ? $normalized : 'array';
+  }
+
+  protected function sanitizeCacheKeySuffix(string $value): string
+  {
+    $normalized = preg_replace('/[^A-Za-z0-9._-]+/', '_', trim($value));
+
+    return $normalized !== '' ? $normalized : 'default';
   }
 
   protected function runDataSourceMiddlewarePipeline(Request $request, DataSource $dataSource, \Closure $destination): mixed

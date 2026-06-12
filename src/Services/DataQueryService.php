@@ -57,10 +57,16 @@ class DataQueryService
                 'table_name' => $this->parseRuntimeValue($dataSource->table_name),
                 'columns' => $this->normalizeColumns($dataSource->columns),
                 'debug_index_table' => $this->parseRuntimeValue($dataSource->table_name),
+                'response_type' => $this->normalizeResponseType($dataSource->response_type ?? 'array'),
             ];
 
             return $this->execute($request, $definition);
         } catch (InvalidRuntimeVariableException $e) {
+            return response()->json([
+                'error' => $e->getMessage(),
+                'message' => $e->getMessage(),
+            ], 422);
+        } catch (\InvalidArgumentException $e) {
             return response()->json([
                 'error' => $e->getMessage(),
                 'message' => $e->getMessage(),
@@ -118,7 +124,12 @@ class DataQueryService
 
             if (!empty($definition['custom_query'])) {
                 try {
-                    $definition['custom_query'] = $this->ensureStringQuery($this->parseRuntimeValue($definition['custom_query']));
+                    $definition['custom_query'] = $this->ensureStringQuery(
+                        $this->applyRouteParameterPlaceholders(
+                            (string) $this->parseRuntimeValue($definition['custom_query']),
+                            $request
+                        )
+                    );
                 } catch (\InvalidArgumentException $e) {
                     return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
                 }
@@ -203,8 +214,10 @@ class DataQueryService
                 return response()->json(['error' => $result['error'], 'message' => $result['error']], 400);
             }
 
-            return response()->json($result);
+            return response()->json($this->applyResponseType($result, (string) ($definition['response_type'] ?? 'array')));
         } catch (InvalidRuntimeVariableException $e) {
+            return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
+        } catch (\InvalidArgumentException $e) {
             return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
         } finally {
             $this->executionConnectionName = $previousExecutionConnectionName;
@@ -241,6 +254,31 @@ class DataQueryService
         $query = trim($query);
 
         return trim((string) preg_replace('/;+\s*$/', '', $query));
+    }
+
+    /**
+     * Replace route-style placeholders such as {customer_id} with request values.
+     *
+     * @param string $query
+     * @param Request $request
+     * @return string
+     */
+    protected function applyRouteParameterPlaceholders(string $query, Request $request): string
+    {
+        return preg_replace_callback(
+            '/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/',
+            function (array $matches) use ($request): string {
+                $key = $matches[1];
+                $value = $request->input($key);
+
+                if ($value === null || $value === '') {
+                    throw new \InvalidArgumentException("Missing route parameter: {$key}");
+                }
+
+                return $this->quoteSqlValue($value);
+            },
+            $query
+        ) ?? $query;
     }
 
     /**
@@ -639,6 +677,46 @@ class DataQueryService
         }
 
         return ['*'];
+    }
+
+    protected function normalizeResponseType(mixed $value): string
+    {
+        $normalized = strtolower(trim((string) $value));
+
+        return in_array($normalized, ['array', 'object'], true) ? $normalized : 'array';
+    }
+
+    protected function applyResponseType(mixed $result, string $responseType): mixed
+    {
+        if ($this->normalizeResponseType($responseType) !== 'object') {
+            return $result;
+        }
+
+        $data = null;
+
+        if ($result instanceof LengthAwarePaginator) {
+            $data = $result->items();
+        } elseif ($result instanceof Collection) {
+            $data = $result->values()->all();
+        } elseif (is_array($result)) {
+            $data = $result['data'] ?? $result;
+        }
+
+        if (! is_array($data)) {
+            return (object) [];
+        }
+
+        $first = $data[0] ?? null;
+
+        if (is_array($first)) {
+            return $first;
+        }
+
+        if (is_object($first)) {
+            return $first;
+        }
+
+        return (object) [];
     }
 
     protected function columnsFromApiConfig(ApiConfig $apiConfig): array

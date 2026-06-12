@@ -94,6 +94,7 @@ class CustomQueryService
     protected function inspect(string $query, ?string $connectionName = null): array
     {
         $query = $this->runtimeVariableParser->parse($query);
+        $query = $this->replaceRoutePlaceholders((string) $query);
         $normalizedQuery = $this->normalizeQuery((string) $query);
 
         if ($normalizedQuery === '') {
@@ -154,6 +155,24 @@ class CustomQueryService
         $query = trim($query);
 
         return trim((string) preg_replace('/;+\s*$/', '', $query));
+    }
+
+    /**
+     * Replace single-brace route placeholders with a safe dummy literal so
+     * query validation/extraction can still parse the SQL shape.
+     *
+     * @param string $query
+     * @return string
+     */
+    protected function replaceRoutePlaceholders(string $query): string
+    {
+        return preg_replace_callback(
+            '/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/',
+            static function (array $matches): string {
+                return '1';
+            },
+            $query
+        ) ?? $query;
     }
 
     protected function normalizeExceptionMessage(\Throwable $exception): string
