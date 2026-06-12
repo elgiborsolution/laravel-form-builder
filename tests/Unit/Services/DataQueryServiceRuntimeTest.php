@@ -178,17 +178,142 @@ class DataQueryServiceRuntimeTest extends TestCase
             $pgsqlService->exposeBuildFilterClause('name', 'ILIKE', 'john')
         );
     }
+
+    public function test_it_removes_conditional_block_when_custom_parameter_is_missing(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 1;
+        $dataSource->custom_query = <<<SQL
+SELECT id, code, name, barcode
+FROM es_products
+WHERE 1 = 1
+[[ AND id = :key ]]
+SQL;
+        $dataSource->table_name = 'es_products';
+        $dataSource->columns = ['id', 'code', 'name', 'barcode'];
+        $dataSource->custom_parameters = [
+            [
+                'name' => 'key',
+                'type' => 'integer',
+                'required' => false,
+                'default' => null,
+                'description' => '',
+            ],
+        ];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $service->executeForDataSource(new Request(), $dataSource, 'datasource_q_conditional_missing');
+
+        $this->assertStringContainsString('FROM (SELECT id, code, name, barcode', $service->capturedQuery);
+        $this->assertStringNotContainsString('AND id =', $service->capturedQuery);
+        $this->assertStringNotContainsString(':key', $service->capturedQuery);
+    }
+
+    public function test_it_keeps_conditional_block_when_custom_parameter_is_present(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 1;
+        $dataSource->custom_query = <<<SQL
+SELECT id, code, name, barcode
+FROM es_products
+WHERE 1 = 1
+[[ AND id = :key ]]
+SQL;
+        $dataSource->table_name = 'es_products';
+        $dataSource->columns = ['id', 'code', 'name', 'barcode'];
+        $dataSource->custom_parameters = [
+            [
+                'name' => 'key',
+                'type' => 'integer',
+                'required' => false,
+                'default' => null,
+                'description' => '',
+            ],
+        ];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $request = Request::create('/api/data-source/products', 'GET', ['key' => 10]);
+        $service->executeForDataSource($request, $dataSource, 'datasource_q_conditional_present');
+
+        $this->assertStringContainsString('AND id = 10', $service->capturedQuery);
+        $this->assertStringNotContainsString(':key', $service->capturedQuery);
+    }
+
+    public function test_it_removes_entire_block_when_one_of_multiple_custom_parameters_is_missing(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 1;
+        $dataSource->custom_query = <<<SQL
+SELECT id, code, name, barcode
+FROM es_products
+WHERE 1 = 1
+[[ AND customer_id = :customer_id AND status = :status ]]
+SQL;
+        $dataSource->table_name = 'es_products';
+        $dataSource->columns = ['id', 'code', 'name', 'barcode'];
+        $dataSource->custom_parameters = [
+            [
+                'name' => 'customer_id',
+                'type' => 'integer',
+                'required' => false,
+                'default' => null,
+                'description' => '',
+            ],
+            [
+                'name' => 'status',
+                'type' => 'string',
+                'required' => false,
+                'default' => null,
+                'description' => '',
+            ],
+        ];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $request = Request::create('/api/data-source/products', 'GET', ['customer_id' => 1]);
+        $service->executeForDataSource($request, $dataSource, 'datasource_q_conditional_multiple');
+
+        $this->assertStringNotContainsString('customer_id = 1', $service->capturedQuery);
+        $this->assertStringNotContainsString('status', $service->capturedQuery);
+    }
 }
 
 class CapturingDataQueryService extends DataQueryService
 {
     public array $capturedDefinition = [];
+    public string $capturedQuery = '';
+    public string $capturedQueryCount = '';
 
     public function execute(Request $request, array $definition): JsonResponse
     {
         $this->capturedDefinition = $definition;
 
         return new JsonResponse(['ok' => true], 200);
+    }
+
+    protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|Collection|\Illuminate\Pagination\LengthAwarePaginator
+    {
+        $this->capturedQuery = (string) $query;
+        $this->capturedQueryCount = (string) $queryCount;
+
+        return ['data' => []];
     }
 
     public function exposeBuildBaseQueries(array $definition): array

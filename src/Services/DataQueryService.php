@@ -58,6 +58,10 @@ class DataQueryService
                 'columns' => $this->normalizeColumns($dataSource->columns),
                 'debug_index_table' => $this->parseRuntimeValue($dataSource->table_name),
                 'response_type' => $this->normalizeResponseType($dataSource->response_type ?? 'array'),
+                'custom_parameters' => $this->syncCustomParameters(
+                    $this->normalizeCustomParameters($dataSource->custom_parameters ?? []),
+                    (string) $this->parseRuntimeValue($dataSource->custom_query)
+                ),
             ];
 
             return $this->execute($request, $definition);
@@ -125,9 +129,16 @@ class DataQueryService
             if (!empty($definition['custom_query'])) {
                 try {
                     $definition['custom_query'] = $this->ensureStringQuery(
-                        $this->applyRouteParameterPlaceholders(
-                            (string) $this->parseRuntimeValue($definition['custom_query']),
-                            $request
+                        $this->applyCustomParameterPlaceholders(
+                            $this->applyConditionalBlocks(
+                                $this->applyRouteParameterPlaceholders(
+                                    (string) $this->parseRuntimeValue($definition['custom_query']),
+                                    $request
+                                ),
+                                $request
+                            ),
+                            $request,
+                            is_array($definition['custom_parameters'] ?? null) ? $definition['custom_parameters'] : []
                         )
                     );
                 } catch (\InvalidArgumentException $e) {
@@ -257,6 +268,36 @@ class DataQueryService
     }
 
     /**
+     * Resolve conditional SQL blocks using request-provided custom parameters.
+     *
+     * A block is kept only when every custom parameter referenced inside it
+     * has a non-empty value on the request.
+     *
+     * @param string $query
+     * @param Request $request
+     * @return string
+     */
+    protected function applyConditionalBlocks(string $query, Request $request): string
+    {
+        return preg_replace_callback(
+            '/\[\[\s*(.*?)\s*\]\]/s',
+            function (array $matches) use ($request): string {
+                $inner = (string) ($matches[1] ?? '');
+                $parameterNames = $this->extractCustomParameterNames($inner);
+
+                foreach ($parameterNames as $name) {
+                    if (! $this->requestHasCustomParameter($request, $name)) {
+                        return '';
+                    }
+                }
+
+                return $inner;
+            },
+            $query
+        ) ?? $query;
+    }
+
+    /**
      * Replace route-style placeholders such as {customer_id} with request values.
      *
      * @param string $query
@@ -269,7 +310,11 @@ class DataQueryService
             '/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/',
             function (array $matches) use ($request): string {
                 $key = $matches[1];
-                $value = $request->input($key);
+                $value = $request->route($key);
+
+                if ($value === null || $value === '') {
+                    $value = $request->input($key);
+                }
 
                 if ($value === null || $value === '') {
                     throw new \InvalidArgumentException("Missing route parameter: {$key}");
@@ -279,6 +324,189 @@ class DataQueryService
             },
             $query
         ) ?? $query;
+    }
+
+    /**
+     * Replace custom parameters such as :keyword using query/body values.
+     *
+     * @param string $query
+     * @param Request $request
+     * @param array<int, mixed> $customParameters
+     * @return string
+     */
+    protected function applyCustomParameterPlaceholders(string $query, Request $request, array $customParameters): string
+    {
+        $definitions = $this->normalizeCustomParameters($customParameters);
+        $usedParameters = $this->extractCustomParameterNames($query);
+
+        foreach ($usedParameters as $name) {
+            if (! array_key_exists($name, $definitions)) {
+                throw new \InvalidArgumentException("Custom parameter \"{$name}\" is not defined.");
+            }
+        }
+
+        return preg_replace_callback(
+            '/(?<!:):([A-Za-z_][A-Za-z0-9_]*)\b/',
+            function (array $matches) use ($request, $definitions): string {
+                $name = $matches[1];
+                $definition = $definitions[$name] ?? null;
+
+                if (! is_array($definition)) {
+                    throw new \InvalidArgumentException("Custom parameter \"{$name}\" is not defined.");
+                }
+
+                $value = $request->query($name);
+
+                if (($value === null || $value === '') && array_key_exists('default', $definition)) {
+                    $value = $definition['default'];
+                }
+
+                if (($value === null || $value === '') && ! empty($definition['required'])) {
+                    throw new \InvalidArgumentException("Custom parameter \"{$name}\" is required.");
+                }
+
+                $value = $this->parseRuntimeValue($value);
+                $value = $this->formatCustomParameterValue($definition['type'] ?? 'string', $value);
+
+                return $this->quoteSqlValue($value);
+            },
+            $query
+        ) ?? $query;
+    }
+
+    /**
+     * Determine whether the current request contains a usable value for a custom parameter.
+     *
+     * @param Request $request
+     * @param string $name
+     * @return bool
+     */
+    protected function requestHasCustomParameter(Request $request, string $name): bool
+    {
+        $value = $request->query($name);
+
+        if ($value === null || $value === '') {
+            $value = $request->input($name);
+        }
+
+        return $value !== null && $value !== '';
+    }
+
+    /**
+     * Extract custom parameter names from a SQL string.
+     *
+     * @param string $query
+     * @return array<int, string>
+     */
+    protected function extractCustomParameterNames(string $query): array
+    {
+        if ($query === '') {
+            return [];
+        }
+
+        preg_match_all('/(?<!:):([A-Za-z_][A-Za-z0-9_]*)\b/', $query, $matches);
+
+        $names = $matches[1] ?? [];
+
+        return array_values(array_unique(array_filter($names, static fn ($name) => is_string($name) && trim($name) !== '')));
+    }
+
+    /**
+     * Normalize custom parameter definitions into a keyed array.
+     *
+     * @param array<int, mixed> $customParameters
+     * @return array<string, array<string, mixed>>
+     */
+    protected function normalizeCustomParameters(array $customParameters): array
+    {
+        $normalized = [];
+
+        foreach ($customParameters as $parameter) {
+            if (! is_array($parameter)) {
+                continue;
+            }
+
+            $name = trim((string) ($parameter['name'] ?? ''));
+
+            if ($name === '') {
+                continue;
+            }
+
+            $normalized[$name] = [
+                'name' => $name,
+                'type' => $this->normalizeCustomParameterType($parameter['type'] ?? 'string'),
+                'required' => (bool) ($parameter['required'] ?? false),
+                'default' => $parameter['default'] ?? $parameter['default_value'] ?? null,
+                'description' => is_string($parameter['description'] ?? null) ? trim((string) $parameter['description']) : '',
+                'unused' => (bool) ($parameter['unused'] ?? false),
+            ];
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Sync custom parameter metadata with placeholders found in the query.
+     *
+     * @param array<int, array<string, mixed>> $customParameters
+     * @param string $query
+     * @return array<int, array<string, mixed>>
+     */
+    protected function syncCustomParameters(array $customParameters, string $query): array
+    {
+        $definitions = $this->normalizeCustomParameters($customParameters);
+        $usedNames = $this->extractCustomParameterNames($query);
+        $synced = [];
+
+        foreach ($definitions as $name => $definition) {
+            $definition['unused'] = ! in_array($name, $usedNames, true);
+            $synced[$name] = $definition;
+        }
+
+        foreach ($usedNames as $name) {
+            if (array_key_exists($name, $synced)) {
+                $synced[$name]['unused'] = false;
+                continue;
+            }
+
+            $synced[$name] = [
+                'name' => $name,
+                'type' => 'string',
+                'required' => false,
+                'default' => null,
+                'description' => '',
+                'unused' => false,
+            ];
+        }
+
+        return array_values($synced);
+    }
+
+    /**
+     * Normalize the declared custom parameter type.
+     *
+     * @param mixed $value
+     * @return string
+     */
+    protected function normalizeCustomParameterType(mixed $value): string
+    {
+        $normalized = strtolower(trim((string) $value));
+
+        return in_array($normalized, ['string', 'integer', 'boolean', 'date', 'float'], true)
+            ? $normalized
+            : 'string';
+    }
+
+    /**
+     * Convert a custom parameter value according to its declared type.
+     *
+     * @param string $type
+     * @param mixed $value
+     * @return mixed
+     */
+    protected function formatCustomParameterValue(string $type, mixed $value): mixed
+    {
+        return $this->findFormatValue($this->normalizeCustomParameterType($type), $value, false);
     }
 
     /**
