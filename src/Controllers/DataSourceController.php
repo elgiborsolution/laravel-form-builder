@@ -188,6 +188,7 @@ class DataSourceController extends Controller
         $row['use_custom_query'] = $useCustomQuery;
         $row['columns'] = $this->normalizeColumnsInput($row['columns'] ?? []);
         $row['middlewares'] = $this->normalizeMiddlewaresInput($row['middlewares'] ?? null);
+        $row['custom_parameters'] = $this->normalizeCustomParametersInput($row['custom_parameters'] ?? []);
 
         $validated = Validator::make($row, [
           'name' => ['required', 'string'],
@@ -202,6 +203,12 @@ class DataSourceController extends Controller
           'custom_query' => ['nullable', 'string'],
           'middlewares' => ['nullable', 'array'],
           'middlewares.*' => ['nullable', 'string'],
+          'custom_parameters' => ['nullable', 'array'],
+          'custom_parameters.*.name' => ['required', 'string'],
+          'custom_parameters.*.type' => ['required', 'string', Rule::in(['string', 'integer', 'boolean', 'date', 'float'])],
+          'custom_parameters.*.required' => ['nullable', 'boolean', 'integer'],
+          'custom_parameters.*.default' => ['nullable'],
+          'custom_parameters.*.description' => ['nullable', 'string'],
         ]);
 
         if ($validated->fails()) {
@@ -234,6 +241,7 @@ class DataSourceController extends Controller
           'columns' => $row['columns'] ?? [],
           'custom_query' => $row['custom_query'] ?? null,
           'middlewares' => $row['middlewares'] ?? null,
+          'custom_parameters' => $row['custom_parameters'] ?? [],
         ];
 
         try {
@@ -306,11 +314,23 @@ class DataSourceController extends Controller
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
+      'response_type' => $this->normalizeResponseType($request->input('response_type', 'array')),
+      'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters')),
     ]);
 
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
-      'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name',
+      'name' => [
+        'required',
+        'string',
+        'unique:' . DatabaseConnection::validationTable('data_sources') . ',name',
+        function (string $attribute, mixed $value, \Closure $fail): void {
+          $message = $this->validateRouteTemplate((string) $value);
+          if ($message !== null) {
+            $fail($message);
+          }
+        },
+      ],
       'table_name' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -330,6 +350,14 @@ class DataSourceController extends Controller
       'filter_parameters' => ['nullable', 'array'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
+      'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
+      'custom_parameters' => ['nullable', 'array'],
+      'custom_parameters.*.name' => ['required', 'string'],
+      'custom_parameters.*.type' => ['required', 'string', Rule::in(['string', 'integer', 'boolean', 'date', 'float'])],
+      'custom_parameters.*.required' => ['nullable', 'boolean', 'integer'],
+      'custom_parameters.*.default' => ['nullable'],
+      'custom_parameters.*.description' => ['nullable', 'string'],
+      'custom_parameters.*.unused' => ['nullable', 'boolean'],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -355,9 +383,15 @@ class DataSourceController extends Controller
     $validated['columns'] = $validated['columns'] ?? [];
 
     if ($validated['use_custom_query']) {
+      $validated['custom_parameters'] = $this->syncCustomParametersInput(
+        $validated['custom_parameters'] ?? [],
+        (string) ($validated['custom_query'] ?? '')
+      );
+
       $customQueryInspection = $this->inspectCustomQuery(
         $request,
-        (string) ($validated['custom_query'] ?? '')
+        (string) ($validated['custom_query'] ?? ''),
+        $validated['custom_parameters'] ?? []
       );
 
       if (! $customQueryInspection['valid']) {
@@ -391,6 +425,8 @@ class DataSourceController extends Controller
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
+      'response_type' => $validated['response_type'] ?? 'array',
+      'custom_parameters' => $validated['custom_parameters'] ?? [],
     ]);
 
     if(count($dataParam) > 0){
@@ -416,6 +452,8 @@ class DataSourceController extends Controller
 
     $payload = $dataSource->toArray();
     $payload['filter_parameters'] = $payload['parameters'] ?? [];
+    $payload['response_type'] = $this->normalizeResponseType($payload['response_type'] ?? 'array');
+    $payload['custom_parameters'] = $this->normalizeCustomParametersInput($payload['custom_parameters'] ?? []);
 
     return response()->json($payload);
   }
@@ -437,11 +475,14 @@ class DataSourceController extends Controller
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
+      'response_type' => $this->normalizeResponseType($request->input('response_type', $dataSource->response_type ?? 'array')),
+      'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters', $dataSource->custom_parameters ?? [])),
     ]);
 
     $validated = $request->validate([
       'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
+      'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
       'table_name' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -459,6 +500,13 @@ class DataSourceController extends Controller
       'columns.*' => ['string'],
       'parameters' => ['nullable', "array"],
       'filter_parameters' => ['nullable', 'array'],
+      'custom_parameters' => ['nullable', 'array'],
+      'custom_parameters.*.name' => ['required', 'string'],
+      'custom_parameters.*.type' => ['required', 'string', Rule::in(['string', 'integer', 'boolean', 'date', 'float'])],
+      'custom_parameters.*.required' => ['nullable', 'boolean', 'integer'],
+      'custom_parameters.*.default' => ['nullable'],
+      'custom_parameters.*.description' => ['nullable', 'string'],
+      'custom_parameters.*.unused' => ['nullable', 'boolean'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
       'custom_query' => [
@@ -486,9 +534,15 @@ class DataSourceController extends Controller
     $validated['columns'] = $validated['columns'] ?? [];
 
     if ($validated['use_custom_query']) {
+      $validated['custom_parameters'] = $this->syncCustomParametersInput(
+        $validated['custom_parameters'] ?? [],
+        (string) ($validated['custom_query'] ?? '')
+      );
+
       $customQueryInspection = $this->inspectCustomQuery(
         $request,
-        (string) ($validated['custom_query'] ?? '')
+        (string) ($validated['custom_query'] ?? ''),
+        $validated['custom_parameters'] ?? []
       );
 
       if (! $customQueryInspection['valid']) {
@@ -523,6 +577,8 @@ class DataSourceController extends Controller
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
+      'response_type' => $validated['response_type'] ?? 'array',
+      'custom_parameters' => $validated['custom_parameters'] ?? [],
     ]);
 
     $dataSource->parameters()->delete();
@@ -546,7 +602,14 @@ class DataSourceController extends Controller
   {
     return $this->runWithDatasourceTenantContext($request, function () use ($request) {
       $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-      $result = $this->customQueryService->validate((string) $request->input('query', ''), $connectionName);
+      $result = $this->customQueryService->validate(
+        (string) $request->input('query', ''),
+        $connectionName,
+        $this->syncCustomParametersInput(
+          $this->normalizeCustomParametersInput($request->input('custom_parameters', [])),
+          (string) $request->input('query', '')
+        )
+      );
 
       return response()->json($result, $result['valid'] ? 200 : 422);
     });
@@ -562,7 +625,14 @@ class DataSourceController extends Controller
   {
     return $this->runWithDatasourceTenantContext($request, function () use ($request) {
       $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-      $result = $this->customQueryService->extractColumns((string) $request->input('query', ''), $connectionName);
+      $result = $this->customQueryService->extractColumns(
+        (string) $request->input('query', ''),
+        $connectionName,
+        $this->syncCustomParametersInput(
+          $this->normalizeCustomParametersInput($request->input('custom_parameters', [])),
+          (string) $request->input('query', '')
+        )
+      );
 
       return response()->json($result, $result['valid'] ? 200 : 422);
     });
@@ -724,6 +794,68 @@ class DataSourceController extends Controller
   }
 
   /**
+   * Normalize custom parameter payloads into a predictable array.
+   *
+   * @param mixed $customParameters
+   * @return array<int, array<string, mixed>>
+   */
+  protected function normalizeCustomParametersInput(mixed $customParameters): array
+  {
+    if (is_string($customParameters)) {
+      $decoded = json_decode($customParameters, true);
+      $customParameters = is_array($decoded) ? $decoded : [];
+    }
+
+    if (! is_array($customParameters)) {
+      return [];
+    }
+
+    $normalized = [];
+
+    foreach ($customParameters as $parameter) {
+      if (! is_array($parameter)) {
+        continue;
+      }
+
+      $name = trim((string) ($parameter['name'] ?? ''));
+
+      if ($name === '') {
+        continue;
+      }
+
+      $type = strtolower(trim((string) ($parameter['type'] ?? 'string')));
+      if (! in_array($type, ['string', 'integer', 'boolean', 'date', 'float'], true)) {
+        $type = 'string';
+      }
+
+      $normalized[] = [
+        'name' => $name,
+        'type' => $type,
+        'required' => $this->normalizeRequiredFlag($parameter['required'] ?? $parameter['is_required'] ?? 0),
+        'default' => $parameter['default'] ?? $parameter['default_value'] ?? null,
+        'description' => isset($parameter['description']) && is_string($parameter['description'])
+          ? trim($parameter['description'])
+          : '',
+        'unused' => $this->normalizeRequiredFlag($parameter['unused'] ?? 0) === 1,
+      ];
+    }
+
+    return array_values($normalized);
+  }
+
+  /**
+   * Sync custom parameter metadata with placeholders found in query.
+   *
+   * @param array<int, array<string, mixed>> $customParameters
+   * @param string $query
+   * @return array<int, array<string, mixed>>
+   */
+  protected function syncCustomParametersInput(array $customParameters, string $query): array
+  {
+    return $this->customQueryService->syncCustomParameters($customParameters, $query);
+  }
+
+  /**
    * Validate parameter payloads and normalize them into a predictable array.
    *
    * @param mixed $parameters
@@ -799,9 +931,30 @@ class DataSourceController extends Controller
         'param_default_value' => $paramDefaultValue,
         'param_type' => is_string($paramType) && trim($paramType) !== '' ? trim($paramType) : 'string',
         'operator' => $row['operator'] ?? $row['param_operation'] ?? '=',
-        'is_required' => $row['is_required'] ?? 0,
+        'is_required' => $this->normalizeRequiredFlag($row['is_required'] ?? 0),
       ];
     }, $payload), static fn (?array $row): bool => is_array($row) && (($row['param_name'] ?? '') !== '')));
+  }
+
+  /**
+   * Normalize boolean-ish flags into database-safe integers.
+   *
+   * @param mixed $value
+   * @return int
+   */
+  protected function normalizeRequiredFlag(mixed $value): int
+  {
+    if (is_bool($value)) {
+      return $value ? 1 : 0;
+    }
+
+    if (is_numeric($value)) {
+      return (int) ((int) $value !== 0);
+    }
+
+    $normalized = strtolower(trim((string) $value));
+
+    return in_array($normalized, ['1', 'true', 'yes', 'on'], true) ? 1 : 0;
   }
 
   /**
@@ -811,12 +964,18 @@ class DataSourceController extends Controller
    * @param string $query
    * @return array{valid:bool,columns:array<int, string>,message?:string}
    */
-  protected function inspectCustomQuery(Request $request, string $query): array
+  protected function inspectCustomQuery(Request $request, string $query, array $customParameters = []): array
   {
-    return $this->runWithDatasourceTenantContext($request, function () use ($request, $query) {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $query, $customParameters) {
       $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-
-      return $this->customQueryService->validateAndExtract($query, $connectionName);
+      return $this->customQueryService->validateAndExtract(
+        $query,
+        $connectionName,
+        $this->syncCustomParametersInput(
+          $this->normalizeCustomParametersInput($customParameters ?: $request->input('custom_parameters', [])),
+          $query
+        )
+      );
     });
   }
 
@@ -990,22 +1149,140 @@ class DataSourceController extends Controller
   /**
   * Run a datasource command
   *
-  * @param Request $request, String $id (name of datasource)
+  * @param Request $request, String $id (name of datasource or route prefix)
   *
   * @return \Illuminate\Http\JsonResponse
   */
-  public function executeQuery(Request $request, $id)
-  { 
-    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id) {
-      $dataSource = DataSource::on(DatabaseConnection::configuredName())->with('parameters')->where('name', $id)->first();
-      if (empty($dataSource)) {
-        return response()->json(['error' => 'Data source not found'], 422);
+  public function executeQuery(Request $request, $id, ?string $routePath = null)
+  {
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id, $routePath) {
+      $dataSourceMatch = $this->resolveDataSourceForExecution((string) $id, $routePath);
+
+      if ($dataSourceMatch === null) {
+        return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
       }
 
-      return $this->runDataSourceMiddlewarePipeline($request, $dataSource, function (Request $request) use ($dataSource, $id) {
-        return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $id);
+      [$dataSource, $routeParameters, $cacheKeySuffix] = $dataSourceMatch;
+
+      if ($routeParameters !== []) {
+        $request->merge($routeParameters);
+      }
+
+      return $this->runDataSourceMiddlewarePipeline($request, $dataSource, function (Request $request) use ($dataSource, $cacheKeySuffix) {
+        return $this->dataQueryService->executeForDataSource($request, $dataSource, 'data_source_q' . $cacheKeySuffix);
       });
     });
+  }
+
+  protected function resolveDataSourceForExecution(string $identifier, ?string $routePath = null): ?array
+  {
+    $connection = DatabaseConnection::configuredName();
+
+    if ($routePath === null || trim($routePath, '/') === '') {
+      $exactMatch = DataSource::on($connection)->with('parameters')->where('name', $identifier)->first();
+
+      if ($exactMatch) {
+        return [$exactMatch, [], $identifier];
+      }
+    }
+
+    $candidatePath = trim($identifier . '/' . trim((string) $routePath, '/'), '/');
+    if ($candidatePath === '') {
+      return null;
+    }
+
+    $dataSources = DataSource::on($connection)->with('parameters')->get();
+
+    foreach ($dataSources as $dataSource) {
+      [$matched, $routeParameters] = $this->matchRouteTemplate((string) $dataSource->name, $candidatePath);
+
+      if ($matched) {
+        return [$dataSource, $routeParameters, $this->sanitizeCacheKeySuffix($candidatePath)];
+      }
+    }
+
+    return null;
+  }
+
+  protected function matchRouteTemplate(string $template, string $path): array
+  {
+    $template = trim($template, '/');
+    $path = trim($path, '/');
+
+    if ($template === '' || $path === '') {
+      return [false, []];
+    }
+
+    if (strpos($template, '{') === false) {
+      return [$template === $path, []];
+    }
+
+    $segments = explode('/', $template);
+    $pathSegments = explode('/', $path);
+
+    if (count($segments) !== count($pathSegments)) {
+      return [false, []];
+    }
+
+    $parameters = [];
+
+    foreach ($segments as $index => $segment) {
+      $pathSegment = $pathSegments[$index] ?? '';
+
+      if ($segment === '') {
+        return [false, []];
+      }
+
+      if (preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment, $matches) === 1) {
+        $parameters[$matches[1]] = $pathSegment;
+        continue;
+      }
+
+      if ($segment !== $pathSegment) {
+        return [false, []];
+      }
+    }
+
+    return [true, $parameters];
+  }
+
+  protected function validateRouteTemplate(string $template): ?string
+  {
+    $template = trim($template, '/');
+
+    if ($template === '') {
+      return 'The name field must contain a valid route pattern.';
+    }
+
+    $segments = explode('/', $template);
+
+    foreach ($segments as $segment) {
+      if ($segment === '') {
+        return 'The name field must contain a valid route pattern.';
+      }
+
+      if (str_contains($segment, '{') || str_contains($segment, '}')) {
+        if (! preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment)) {
+          return 'The name field must contain balanced route parameters like {id}.';
+        }
+      }
+    }
+
+    return null;
+  }
+
+  protected function normalizeResponseType(mixed $value): string
+  {
+    $normalized = strtolower(trim((string) $value));
+
+    return in_array($normalized, ['array', 'object'], true) ? $normalized : 'array';
+  }
+
+  protected function sanitizeCacheKeySuffix(string $value): string
+  {
+    $normalized = preg_replace('/[^A-Za-z0-9._-]+/', '_', trim($value));
+
+    return $normalized !== '' ? $normalized : 'default';
   }
 
   protected function runDataSourceMiddlewarePipeline(Request $request, DataSource $dataSource, \Closure $destination): mixed
@@ -1040,7 +1317,14 @@ class DataSourceController extends Controller
   {
       return $this->runWithDatasourceTenantContext($request, function () use ($request, $query) {
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
-        $result = $this->customQueryService->extractColumns((string) $query, $connectionName);
+        $result = $this->customQueryService->extractColumns(
+          (string) $query,
+          $connectionName,
+          $this->syncCustomParametersInput(
+            $this->normalizeCustomParametersInput($request->input('custom_parameters', [])),
+            (string) $query
+          )
+        );
 
         if (! $result['valid']) {
           return [

@@ -95,6 +95,9 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-source.query.columns');
                 Route::get('data-source/{id}/query', [DataSourceController::class, 'executeQuery'])
                     ->name('management.data-source.query');
+                Route::get('data-source/{id}/{routePath}', [DataSourceController::class, 'executeQuery'])
+                    ->where('routePath', '.+')
+                    ->name('management.data-source.route');
                 Route::get('data-source/{id}', [DataSourceController::class, 'executeQuery'])
                     ->name('management.data-source.api');
                 Route::post('data-source/export', [DataSourceController::class, 'export'])
@@ -157,6 +160,9 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('data-source-tenant.query.columns');
                 Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
                     ->name('data-source-tenant.query');
+                Route::get('data-source-tenant/{id}/{routePath}', [DataSourceController::class, 'executeQuery'])
+                    ->where('routePath', '.+')
+                    ->name('data-source-tenant.route');
                 Route::get('data-source-tenant/{id}', [DataSourceController::class, 'executeQuery'])
                     ->name('data-source-tenant.api');
                 Route::apiResource('data-source-tenant', DataSourceController::class)
