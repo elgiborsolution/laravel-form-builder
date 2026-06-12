@@ -89,6 +89,10 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-source.tables');
                 Route::get('data-source/tables/{table}/columns', [DataSourceController::class, 'listColumns'])
                     ->name('management.data-source.columns');
+                Route::post('data-source/query/validate', [DataSourceController::class, 'validateQuery'])
+                    ->name('management.data-source.query.validate');
+                Route::post('data-source/query/columns', [DataSourceController::class, 'extractQueryColumns'])
+                    ->name('management.data-source.query.columns');
                 Route::get('data-source/{id}/query', [DataSourceController::class, 'executeQuery'])
                     ->name('management.data-source.query');
                 Route::get('data-source/{id}', [DataSourceController::class, 'executeQuery'])
@@ -147,6 +151,10 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('data-source-tenant.tables');
                 Route::get('data-source-tenant/tables/{table}/columns', [DataSourceController::class, 'listColumns'])
                     ->name('data-source-tenant.columns');
+                Route::post('data-source-tenant/query/validate', [DataSourceController::class, 'validateQuery'])
+                    ->name('data-source-tenant.query.validate');
+                Route::post('data-source-tenant/query/columns', [DataSourceController::class, 'extractQueryColumns'])
+                    ->name('data-source-tenant.query.columns');
                 Route::get('data-source-tenant/{id}/query', [DataSourceController::class, 'executeQuery'])
                     ->name('data-source-tenant.query');
                 Route::get('data-source-tenant/{id}', [DataSourceController::class, 'executeQuery'])

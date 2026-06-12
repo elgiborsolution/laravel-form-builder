@@ -130,6 +130,29 @@ class DataQueryServiceRuntimeTest extends TestCase
         );
     }
 
+    public function test_it_strips_trailing_semicolons_from_custom_queries_before_wrapping(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        [$countQuery, $selectQuery] = $service->exposeBuildBaseQueries([
+            'use_custom_query' => true,
+            'custom_query' => "SELECT id FROM products;\n",
+        ]);
+
+        $this->assertSame(
+            'SELECT count(*) as aggregate FROM (SELECT id FROM products) AS tableCustom WHERE 1=1',
+            $countQuery
+        );
+        $this->assertSame(
+            'SELECT * FROM (SELECT id FROM products) AS tableCustom WHERE 1=1',
+            $selectQuery
+        );
+    }
+
     public function test_it_maps_ilike_operator_to_driver_specific_sql(): void
     {
         $mysqlService = new CapturingDataQueryService(
@@ -171,6 +194,11 @@ class CapturingDataQueryService extends DataQueryService
     public function exposeBuildBaseQueries(array $definition): array
     {
         return $this->buildBaseQueries($definition);
+    }
+
+    public function exposeNormalizeCustomQuery(string $query): string
+    {
+        return $this->normalizeCustomQuery($query);
     }
 
     public function useConnectionName(string $connectionName): void

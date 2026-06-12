@@ -45,11 +45,12 @@ class DataSource extends Model
      * Ensures that only SELECT queries are used to prevent modifications to the database.
      *
      * @param string $query The SQL query to be validated.
-     * @return bool Returns true if the query starts with 'SELECT ', otherwise false.
+     * @return bool Returns true if the query starts with SELECT followed by whitespace, otherwise false.
      */
     public static function validateQuery($query)
     {
-        $query = trim(strtolower($query)); // Convert to lowercase and trim spaces
-        return str_starts_with($query, 'select '); // Check if query starts with 'select '
+        $query = trim((string) $query);
+
+        return preg_match('/^\s*select\b/i', $query) === 1;
     }
 }

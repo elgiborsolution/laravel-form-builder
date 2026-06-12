@@ -214,11 +214,11 @@ class DataQueryService
     protected function buildBaseQueries(array $definition): array
     {
         if (!empty($definition['use_custom_query']) && !empty($definition['custom_query'])) {
-            $customQuery = $definition['custom_query'];
+            $customQuery = $this->normalizeCustomQuery((string) $definition['custom_query']);
 
             return [
-                "SELECT count(*) as aggregate FROM ({$customQuery}) tableCustom WHERE 1=1",
-                "SELECT * FROM ({$customQuery}) tableCustom WHERE 1=1",
+                "SELECT count(*) as aggregate FROM ({$customQuery}) AS tableCustom WHERE 1=1",
+                "SELECT * FROM ({$customQuery}) AS tableCustom WHERE 1=1",
             ];
         }
 
@@ -228,6 +228,19 @@ class DataQueryService
             "SELECT count(*) as aggregate FROM {$definition['table_name']} WHERE 1=1",
             "SELECT {$columns} FROM {$definition['table_name']} WHERE 1=1",
         ];
+    }
+
+    /**
+     * Normalize a custom query before wrapping it in a derived table.
+     *
+     * @param string $query
+     * @return string
+     */
+    protected function normalizeCustomQuery(string $query): string
+    {
+        $query = trim($query);
+
+        return trim((string) preg_replace('/;+\s*$/', '', $query));
     }
 
     /**
