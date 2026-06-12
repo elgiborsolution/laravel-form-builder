@@ -799,9 +799,30 @@ class DataSourceController extends Controller
         'param_default_value' => $paramDefaultValue,
         'param_type' => is_string($paramType) && trim($paramType) !== '' ? trim($paramType) : 'string',
         'operator' => $row['operator'] ?? $row['param_operation'] ?? '=',
-        'is_required' => $row['is_required'] ?? 0,
+        'is_required' => $this->normalizeRequiredFlag($row['is_required'] ?? 0),
       ];
     }, $payload), static fn (?array $row): bool => is_array($row) && (($row['param_name'] ?? '') !== '')));
+  }
+
+  /**
+   * Normalize boolean-ish flags into database-safe integers.
+   *
+   * @param mixed $value
+   * @return int
+   */
+  protected function normalizeRequiredFlag(mixed $value): int
+  {
+    if (is_bool($value)) {
+      return $value ? 1 : 0;
+    }
+
+    if (is_numeric($value)) {
+      return (int) ((int) $value !== 0);
+    }
+
+    $normalized = strtolower(trim((string) $value));
+
+    return in_array($normalized, ['1', 'true', 'yes', 'on'], true) ? 1 : 0;
   }
 
   /**
