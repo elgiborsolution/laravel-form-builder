@@ -1,0 +1,566 @@
+{
+  "info": {
+    "_postman_id": "5c0b6f7a-7c1d-4b30-bf70-2f5f0af2a1f5",
+    "name": "Laravel Form Builder - Data Sources Management",
+    "description": "Collection generated from the actual package routes and controller behavior for data-picker and table-builder endpoints.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost"
+    },
+    {
+      "key": "tenant",
+      "value": ""
+    },
+    {
+      "key": "dataPickerCode",
+      "value": "{{code}}"
+    },
+    {
+      "key": "tableBuilderCode",
+      "value": "{{code}}"
+    }
+  ],
+  "item": [
+    {
+      "name": "Data Picker",
+      "item": [
+        {
+          "name": "List",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/data-picker",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "data-picker"
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "x-tenant",
+                    "value": "{{tenant}}",
+                    "type": "text"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/api/data-picker",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "data-picker"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\n  \"data\": []\n}"
+            }
+          ]
+        },
+        {
+          "name": "Create",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [\n    {\n      \"type\": \"text\",\n      \"label\": \"{{label}}\",\n      \"name\": \"{{field_name}}\",\n      \"operator\": \"=\",\n      \"value\": null,\n      \"options\": []\n    }\n  ],\n  \"columns\": [\n    {\n      \"header\": \"{{header}}\",\n      \"detail\": \"{{detail}}\"\n    }\n  ],\n  \"params\": {\n    \"enable_no\": true,\n    \"pagination\": true,\n    \"data_source_id\": 1,\n    \"data_source_name\": \"{{data_source_name}}\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/data-picker",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "data-picker"
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "201 Created",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json",
+                    "type": "text"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [],\n  \"columns\": [],\n  \"params\": {}\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/api/data-picker",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "data-picker"
+                  ]
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\n  \"status\": 200,\n  \"message\": \"data picker created\",\n  \"data\": {\n    \"id\": \"{{id}}\",\n    \"code\": \"{{code}}\",\n    \"name\": \"{{name}}\",\n    \"filters\": [],\n    \"columns\": [],\n    \"params\": {},\n    \"created_at\": \"{{created_at}}\",\n    \"updated_at\": \"{{updated_at}}\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Show",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/data-picker/{{dataPickerCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "data-picker",
+                "{{dataPickerCode}}"
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "x-tenant",
+                    "value": "{{tenant}}",
+                    "type": "text"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/api/data-picker/{{dataPickerCode}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "data-picker",
+                    "{{dataPickerCode}}"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\n  \"status\": 200,\n  \"data\": {\n    \"id\": \"{{id}}\",\n    \"code\": \"{{code}}\",\n    \"name\": \"{{name}}\",\n    \"filters\": [],\n    \"columns\": [],\n    \"params\": {},\n    \"created_at\": \"{{created_at}}\",\n    \"updated_at\": \"{{updated_at}}\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Update - PUT",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [\n    {\n      \"type\": \"text\",\n      \"label\": \"{{label}}\",\n      \"name\": \"{{field_name}}\",\n      \"operator\": \"=\",\n      \"value\": null,\n      \"options\": []\n    }\n  ],\n  \"columns\": [\n    {\n      \"header\": \"{{header}}\",\n      \"detail\": \"{{detail}}\"\n    }\n  ],\n  \"params\": {\n    \"enable_no\": true,\n    \"pagination\": true,\n    \"data_source_id\": 1,\n    \"data_source_name\": \"{{data_source_name}}\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/data-picker/{{dataPickerCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "data-picker",
+                "{{dataPickerCode}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update - PATCH",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [\n    {\n      \"type\": \"text\",\n      \"label\": \"{{label}}\",\n      \"name\": \"{{field_name}}\",\n      \"operator\": \"=\",\n      \"value\": null,\n      \"options\": []\n    }\n  ],\n  \"columns\": [\n    {\n      \"header\": \"{{header}}\",\n      \"detail\": \"{{detail}}\"\n    }\n  ],\n  \"params\": {\n    \"enable_no\": true,\n    \"pagination\": true,\n    \"data_source_id\": 1,\n    \"data_source_name\": \"{{data_source_name}}\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/data-picker/{{dataPickerCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "data-picker",
+                "{{dataPickerCode}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/data-picker/{{dataPickerCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "data-picker",
+                "{{dataPickerCode}}"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Table Builder",
+      "item": [
+        {
+          "name": "List",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/table-builder",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "table-builder"
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "x-tenant",
+                    "value": "{{tenant}}",
+                    "type": "text"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/api/table-builder",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "table-builder"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\n  \"data\": []\n}"
+            }
+          ]
+        },
+        {
+          "name": "Create",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [\n    {\n      \"type\": \"number\",\n      \"label\": \"type\",\n      \"name\": \"type\",\n      \"operator\": \"=\",\n      \"value\": null,\n      \"options\": []\n    }\n  ],\n  \"columns\": [\n    {\n      \"header\": \"name\",\n      \"detail\": \"name\"\n    }\n  ],\n  \"actions\": [\n    {\n      \"label\": \"Edit Data\",\n      \"type\": \"link\",\n      \"icon\": null,\n      \"class\": null,\n      \"url\": \"{{url}}\"\n    }\n  ],\n  \"params\": {\n    \"enable_no\": true,\n    \"pagination\": true,\n    \"data_source_id\": 3,\n    \"data_source_name\": \"product\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/table-builder",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "table-builder"
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "201 Created",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json",
+                    "type": "text"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [],\n  \"columns\": [],\n  \"actions\": [],\n  \"params\": {}\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/api/table-builder",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "table-builder"
+                  ]
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\n  \"status\": 200,\n  \"message\": \"Data table builder created\",\n  \"data\": {\n    \"id\": \"{{id}}\",\n    \"code\": \"{{code}}\",\n    \"name\": \"{{name}}\",\n    \"filters\": [],\n    \"columns\": [],\n    \"actions\": [],\n    \"params\": {},\n    \"created_at\": \"{{created_at}}\",\n    \"updated_at\": \"{{updated_at}}\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Show",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/table-builder/{{tableBuilderCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "table-builder",
+                "{{tableBuilderCode}}"
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [
+                  {
+                    "key": "x-tenant",
+                    "value": "{{tenant}}",
+                    "type": "text"
+                  }
+                ],
+                "url": {
+                  "raw": "{{baseUrl}}/api/table-builder/{{tableBuilderCode}}",
+                  "host": [
+                    "{{baseUrl}}"
+                  ],
+                  "path": [
+                    "api",
+                    "table-builder",
+                    "{{tableBuilderCode}}"
+                  ]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [],
+              "body": "{\n  \"status\": 200,\n  \"data\": {\n    \"id\": \"{{id}}\",\n    \"code\": \"{{code}}\",\n    \"name\": \"{{name}}\",\n    \"filters\": [],\n    \"columns\": [],\n    \"actions\": [],\n    \"params\": {},\n    \"created_at\": \"{{created_at}}\",\n    \"updated_at\": \"{{updated_at}}\"\n  }\n}"
+            }
+          ]
+        },
+        {
+          "name": "Update - PUT",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [\n    {\n      \"type\": \"number\",\n      \"label\": \"type\",\n      \"name\": \"type\",\n      \"operator\": \"=\",\n      \"value\": null,\n      \"options\": []\n    }\n  ],\n  \"columns\": [\n    {\n      \"header\": \"name\",\n      \"detail\": \"name\"\n    }\n  ],\n  \"actions\": [\n    {\n      \"label\": \"Edit Data\",\n      \"type\": \"link\",\n      \"icon\": null,\n      \"class\": null,\n      \"url\": \"{{url}}\"\n    }\n  ],\n  \"params\": {\n    \"enable_no\": true,\n    \"pagination\": true,\n    \"data_source_id\": 3,\n    \"data_source_name\": \"product\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/table-builder/{{tableBuilderCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "table-builder",
+                "{{tableBuilderCode}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Update - PATCH",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{code}}\",\n  \"name\": \"{{name}}\",\n  \"filters\": [\n    {\n      \"type\": \"number\",\n      \"label\": \"type\",\n      \"name\": \"type\",\n      \"operator\": \"=\",\n      \"value\": null,\n      \"options\": []\n    }\n  ],\n  \"columns\": [\n    {\n      \"header\": \"name\",\n      \"detail\": \"name\"\n    }\n  ],\n  \"actions\": [\n    {\n      \"label\": \"Edit Data\",\n      \"type\": \"link\",\n      \"icon\": null,\n      \"class\": null,\n      \"url\": \"{{url}}\"\n    }\n  ],\n  \"params\": {\n    \"enable_no\": true,\n    \"pagination\": true,\n    \"data_source_id\": 3,\n    \"data_source_name\": \"product\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/table-builder/{{tableBuilderCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "table-builder",
+                "{{tableBuilderCode}}"
+              ]
+            }
+          }
+        },
+        {
+          "name": "Delete",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "x-tenant",
+                "value": "{{tenant}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/table-builder/{{tableBuilderCode}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "table-builder",
+                "{{tableBuilderCode}}"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

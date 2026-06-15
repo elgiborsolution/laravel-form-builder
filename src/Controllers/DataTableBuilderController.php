@@ -79,12 +79,11 @@ class DataTableBuilderController extends Controller
   {
 
       $validateFilter = [
-        'type' => ["required" , "string", "in:text,number,date,checkbox,dropdown,radio"],
+        'type' => ["required" , "string", "in:text,textarea,email,number,currency,date,datetime,select,radio,checkbox,switch,data-picker,dropdown"],
         'label' => 'required|string',
         'name' => 'required|string',
-        'operator' => ["required" , "string", "in:=,!=,>,<,>=,<=,like,LIKE,not like,NOT LIKE"],
         'value' => 'nullable',
-        'options' => 'nullable|array'
+      'options' => 'nullable|array'
       ];
       foreach ($request->filters as $key => $value) {
 
@@ -144,6 +143,25 @@ class DataTableBuilderController extends Controller
       return null;
   }
 
+  /**
+   * Remove legacy operator data before persisting a builder payload.
+   *
+   * @param array<int, mixed> $filters
+   * @return array<int, mixed>
+   */
+  protected function normalizeFiltersForSave(array $filters): array
+  {
+      return array_map(static function (mixed $filter): mixed {
+          if (! is_array($filter)) {
+              return $filter;
+          }
+
+          unset($filter['operator']);
+
+          return $filter;
+      }, $filters);
+  }
+
 
   /**
   * Create new data table builder configuration
@@ -173,7 +191,7 @@ class DataTableBuilderController extends Controller
     $dataTableBuilder = DataTableBuilder::create([
       'code' => $validated['code'],
       'name' => $validated['name'],
-      'filters' => $validated['filters'],
+      'filters' => $this->normalizeFiltersForSave($validated['filters'] ?? []),
       'columns' => $validated['columns'],
       'params' => $validated['params'],
       'actions' => $validated['actions'],
@@ -256,9 +274,9 @@ class DataTableBuilderController extends Controller
         if(DatabaseConnection::schema()->hasTable('data_table_builders')){
           $dataTableBuilder = DatabaseConnection::table('data_table_builders')->updateOrInsert(
                                    [ 'code' => $validated['code'] ],
-                                   [
+                                  [
                                      'name' => $validated['name'],
-                                     'filters' => json_encode($validated['filters']),
+                                     'filters' => json_encode($this->normalizeFiltersForSave($validated['filters'] ?? [])),
                                      'columns' => json_encode($validated['columns']),
                                      'params' => json_encode($validated['params']),
                                      'actions' => json_encode($validated['actions'])
@@ -276,7 +294,7 @@ class DataTableBuilderController extends Controller
         $dataTableBuilder->update([
           'code' => $validated['code'],
           'name' => $validated['name'],
-          'filters' => $validated['filters'],
+          'filters' => $this->normalizeFiltersForSave($validated['filters'] ?? []),
           'columns' => $validated['columns'],
           'params' => $validated['params'],
           'actions' => $validated['actions']

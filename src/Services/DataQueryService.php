@@ -6,6 +6,7 @@ use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use ESolution\DataSources\Support\FilterOperatorResolver;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
@@ -49,7 +50,7 @@ class DataQueryService
                         'type' => $param->param_type,
                         'required' => (bool) $param->is_required,
                         'default' => $this->parseRuntimeValue($param->param_default_value),
-                        'operator' => $param->operator ?? '=',
+                        'operator' => $param->operator ?? FilterOperatorResolver::resolve((string) $param->param_type),
                     ];
                 })->all(),
                 'use_custom_query' => (bool) $dataSource->use_custom_query,
@@ -654,15 +655,15 @@ class DataQueryService
     protected function validateDetail(Request $request): ?JsonResponse
     {
         foreach ($this->incomingFilters($request) as $key => $value) {
+            $resolvedOperator = $this->resolveIncomingFilterOperator($value);
             $normalizedFilter = [
                 'field' => $value['field'] ?? $value['param_name'] ?? $value['name'] ?? null,
-                'operator' => $value['operator'] ?? $value['param_operation'] ?? null,
+                'operator' => $resolvedOperator,
                 'value' => $value['value'] ?? $value['param_value'] ?? null,
             ];
 
             $validator = Validator::make($normalizedFilter, [
                 'field' => 'required',
-                'operator' => 'required',
                 'value' => 'required',
             ]);
 
@@ -673,16 +674,31 @@ class DataQueryService
                 ], 400);
             }
 
-            $operator = strtoupper((string) $normalizedFilter['operator']);
-            if (! in_array($operator, self::ALLOWED_FILTER_OPERATORS, true)) {
+            if (! in_array($normalizedFilter['operator'], self::ALLOWED_FILTER_OPERATORS, true)) {
                 return response()->json([
-                    'error' => "Invalid filter operator: {$operator}",
-                    'message' => "Invalid filter operator: {$operator}",
+                    'error' => "Invalid filter operator: {$normalizedFilter['operator']}",
+                    'message' => "Invalid filter operator: {$normalizedFilter['operator']}",
                 ], 400);
             }
         }
 
         return null;
+    }
+
+    /**
+     * Resolve an operator from the incoming filter payload.
+     *
+     * Legacy payloads that still send `param_operation` are supported, but
+     * type-based resolution is preferred for new configurations.
+     *
+     * @param array<string, mixed> $filter
+     * @return string
+     */
+    protected function resolveIncomingFilterOperator(array $filter): string
+    {
+        $type = trim((string) ($filter['type'] ?? $filter['param_type'] ?? ''));
+
+        return $type !== '' ? FilterOperatorResolver::resolve($type) : '=';
     }
 
     /**
