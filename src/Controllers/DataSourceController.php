@@ -325,6 +325,7 @@ class DataSourceController extends Controller
   {
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
+      'use_soft_delete' => filter_var($request->input('use_soft_delete'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
       'response_type' => $this->normalizeResponseType($request->input('response_type', 'array')),
@@ -333,6 +334,7 @@ class DataSourceController extends Controller
 
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
+      'use_soft_delete' => ['nullable', 'boolean'],
       'name' => [
         'required',
         'string',
@@ -431,10 +433,16 @@ class DataSourceController extends Controller
       }
     }
 
+    $validated['use_soft_delete'] = (bool) ($validated['use_soft_delete'] ?? false);
+    if ((bool) $validated['use_custom_query']) {
+      $validated['use_soft_delete'] = false;
+    }
+
     $dataSource = DataSource::create([
       'name' => $validated['name'],
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
+      'use_soft_delete' => $validated['use_soft_delete'],
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
@@ -467,6 +475,7 @@ class DataSourceController extends Controller
     $payload['filter_parameters'] = $payload['parameters'] ?? [];
     $payload['response_type'] = $this->normalizeResponseType($payload['response_type'] ?? 'array');
     $payload['custom_parameters'] = $this->normalizeCustomParametersInput($payload['custom_parameters'] ?? []);
+    $payload['use_soft_delete'] = (bool) ($payload['use_soft_delete'] ?? false);
 
     return response()->json($payload);
   }
@@ -486,6 +495,9 @@ class DataSourceController extends Controller
     }
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
+      'use_soft_delete' => $request->has('use_soft_delete')
+        ? filter_var($request->input('use_soft_delete'), FILTER_VALIDATE_BOOLEAN)
+        : ($dataSource->use_soft_delete ?? false),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
       'response_type' => $this->normalizeResponseType($request->input('response_type', $dataSource->response_type ?? 'array')),
@@ -495,6 +507,7 @@ class DataSourceController extends Controller
     $validated = $request->validate([
       'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
+      'use_soft_delete' => ['nullable', 'boolean'],
       'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
       'table_name' => [
         'nullable',
@@ -582,11 +595,17 @@ class DataSourceController extends Controller
       }
     }
 
+    $validated['use_soft_delete'] = (bool) ($validated['use_soft_delete'] ?? $dataSource->use_soft_delete ?? false);
+    if ((bool) $validated['use_custom_query']) {
+      $validated['use_soft_delete'] = false;
+    }
+
 
     $dataSource->update([
       'name' => $validated['name'],
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
+      'use_soft_delete' => $validated['use_soft_delete'],
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
@@ -1149,8 +1168,14 @@ class DataSourceController extends Controller
       try {
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
         $columnList = $this->databaseMetadataProvider->listColumns((string) $table, $connectionName);
+        $hasDeletedAt = $this->tableHasColumn((string) $table, 'deleted_at', $connectionName, $columnList);
 
-        return response()->json(['data' => $columnList]);
+        return response()->json([
+          'data' => $columnList,
+          'meta' => [
+            'has_deleted_at' => $hasDeletedAt,
+          ],
+        ]);
       } catch (\Exception $e) {
         return response()->json(['error' => 'Table not found'], 404);
       }
@@ -1289,6 +1314,32 @@ class DataSourceController extends Controller
     $normalized = strtolower(trim((string) $value));
 
     return in_array($normalized, ['array', 'object'], true) ? $normalized : 'array';
+  }
+
+  /**
+   * Determine whether a table contains a given column.
+   *
+   * @param array<int, array<string, mixed>>|null $columns
+   */
+  protected function tableHasColumn(string $tableName, string $columnName, ?string $connectionName = null, ?array $columns = null): bool
+  {
+    try {
+      $columns ??= $this->databaseMetadataProvider->listColumns($tableName, $connectionName);
+    } catch (\Throwable $e) {
+      return false;
+    }
+
+    foreach ($columns as $column) {
+      if (! is_array($column)) {
+        continue;
+      }
+
+      if (strtolower((string) ($column['name'] ?? '')) === strtolower($columnName)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   protected function sanitizeCacheKeySuffix(string $value): string

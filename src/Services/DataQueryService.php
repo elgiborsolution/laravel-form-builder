@@ -54,6 +54,7 @@ class DataQueryService
                     ];
                 })->all(),
                 'use_custom_query' => (bool) $dataSource->use_custom_query,
+                'use_soft_delete' => (bool) $dataSource->use_soft_delete,
                 'custom_query' => $this->parseRuntimeValue($dataSource->custom_query),
                 'table_name' => $this->parseRuntimeValue($dataSource->table_name),
                 'columns' => $this->normalizeColumns($dataSource->columns),
@@ -169,7 +170,14 @@ class DataQueryService
                 return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
             }
 
+            $softDeleteClause = $this->resolveSoftDeleteClause($definition);
+
             [$queryCount, $query] = $this->buildBaseQueries($definition);
+
+            if ($softDeleteClause !== '') {
+                $queryCount .= $softDeleteClause;
+                $query .= $softDeleteClause;
+            }
             $appliedFilters = [];
 
             foreach ($definition['parameters'] as $parameter) {
@@ -253,6 +261,48 @@ class DataQueryService
             "SELECT count(*) as aggregate FROM {$definition['table_name']} WHERE 1=1",
             "SELECT {$columns} FROM {$definition['table_name']} WHERE 1=1",
         ];
+    }
+
+    /**
+     * Build the soft delete clause when the selected table supports deleted_at filtering.
+     */
+    protected function resolveSoftDeleteClause(array $definition): string
+    {
+        if (empty($definition['use_soft_delete']) || ! empty($definition['custom_query'])) {
+            return '';
+        }
+
+        $tableName = trim((string) ($definition['table_name'] ?? ''));
+
+        if ($tableName === '' || ! $this->tableHasColumn($tableName, 'deleted_at')) {
+            return '';
+        }
+
+        return ' AND deleted_at IS NULL';
+    }
+
+    /**
+     * Determine whether a table includes a specific column.
+     */
+    protected function tableHasColumn(string $tableName, string $columnName): bool
+    {
+        try {
+            $columns = $this->databaseMetadataProvider->listColumns($tableName, $this->executionConnectionName);
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        foreach ($columns as $column) {
+            if (! is_array($column)) {
+                continue;
+            }
+
+            if (strtolower((string) ($column['name'] ?? '')) === strtolower($columnName)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

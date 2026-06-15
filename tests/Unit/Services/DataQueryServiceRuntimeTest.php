@@ -153,6 +153,50 @@ class DataQueryServiceRuntimeTest extends TestCase
         );
     }
 
+    public function test_it_appends_soft_delete_filter_for_select_table_when_deleted_at_exists(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            true
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->use_soft_delete = 1;
+        $dataSource->table_name = 'products';
+        $dataSource->columns = ['id', 'name'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $service->executeForDataSource(new Request(), $dataSource, 'datasource_q_soft_delete_enabled');
+
+        $this->assertStringContainsString('WHERE 1=1 AND deleted_at IS NULL', $service->capturedQuery);
+        $this->assertStringContainsString('WHERE 1=1 AND deleted_at IS NULL', $service->capturedQueryCount);
+    }
+
+    public function test_it_skips_soft_delete_filter_when_deleted_at_is_missing(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            false
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->use_soft_delete = 1;
+        $dataSource->table_name = 'products';
+        $dataSource->columns = ['id', 'name'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $service->executeForDataSource(new Request(), $dataSource, 'datasource_q_soft_delete_disabled');
+
+        $this->assertStringNotContainsString('deleted_at IS NULL', $service->capturedQuery);
+        $this->assertStringNotContainsString('deleted_at IS NULL', $service->capturedQueryCount);
+    }
+
     public function test_it_maps_ilike_operator_to_driver_specific_sql(): void
     {
         $mysqlService = new CapturingDataQueryService(
@@ -351,6 +395,34 @@ class CapturingDataQueryService extends DataQueryService
         }
 
         return "'" . str_replace("'", "''", (string) $value) . "'";
+    }
+}
+
+class SoftDeleteCapturingDataQueryService extends DataQueryService
+{
+    public string $capturedQuery = '';
+    public string $capturedQueryCount = '';
+
+    public function __construct(
+        DynamicVariableParser $runtimeVariableParser,
+        ExecutionConnectionResolver $executionConnectionResolver,
+        ?DatabaseDriverResolver $databaseDriverResolver = null,
+        private readonly bool $tableHasDeletedAt = true
+    ) {
+        parent::__construct($runtimeVariableParser, $executionConnectionResolver, $databaseDriverResolver);
+    }
+
+    protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|Collection|\Illuminate\Pagination\LengthAwarePaginator
+    {
+        $this->capturedQuery = (string) $query;
+        $this->capturedQueryCount = (string) $queryCount;
+
+        return ['data' => []];
+    }
+
+    protected function tableHasColumn(string $tableName, string $columnName): bool
+    {
+        return $this->tableHasDeletedAt && strtolower($columnName) === 'deleted_at';
     }
 }
 
