@@ -2,6 +2,7 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataTableBuilder;
+use ESolution\DataSources\Support\Concerns\NormalizesJsonPayload;
 use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
 use App\Http\Controllers\Controller;
@@ -9,6 +10,7 @@ use Illuminate\Support\Facades\Validator;
 
 class DataTableBuilderController extends Controller
 {
+  use NormalizesJsonPayload;
 
   /**
   * Display list data table builder configuration
@@ -21,11 +23,11 @@ class DataTableBuilderController extends Controller
   {
     $dataTableBuilder = DataTableBuilder::get()->toArray();
     foreach ($dataTableBuilder as $key => $value) {
-      
-      $dataTableBuilder[$key]['filters'] = json_decode($value['filters']);
-      $dataTableBuilder[$key]['columns'] = json_decode($value['columns']);
-      $dataTableBuilder[$key]['params'] = json_decode($value['params']);
-      $dataTableBuilder[$key]['actions'] = json_decode($value['actions']);
+
+      $dataTableBuilder[$key]['filters'] = $this->normalizeJsonPayload($value['filters'], 'data_table_builders.filters');
+      $dataTableBuilder[$key]['columns'] = $this->normalizeJsonPayload($value['columns'], 'data_table_builders.columns');
+      $dataTableBuilder[$key]['params'] = $this->normalizeJsonPayload($value['params'], 'data_table_builders.params');
+      $dataTableBuilder[$key]['actions'] = $this->normalizeJsonPayload($value['actions'], 'data_table_builders.actions');
       $dataTableBuilder[$key]['is_central'] = true;
     }
 
@@ -39,11 +41,11 @@ class DataTableBuilderController extends Controller
             $dataTableBuilderInTenant = DatabaseConnection::table('data_table_builders')->get();
             $dataTableBuilderInTenantMap = [];
             foreach ($dataTableBuilderInTenant as $key => $value) { 
-              $dataArray = json_decode(json_encode($value, true), true);
-              $dataArray['filters'] = json_decode($dataArray['filters']);
-              $dataArray['columns'] = json_decode($dataArray['columns']);
-              $dataArray['params'] = json_decode($dataArray['params']);
-              $dataArray['actions'] = json_decode($dataArray['actions']);
+              $dataArray = (array) $value;
+              $dataArray['filters'] = $this->normalizeJsonPayload($dataArray['filters'] ?? null, 'tenant.data_table_builders.filters');
+              $dataArray['columns'] = $this->normalizeJsonPayload($dataArray['columns'] ?? null, 'tenant.data_table_builders.columns');
+              $dataArray['params'] = $this->normalizeJsonPayload($dataArray['params'] ?? null, 'tenant.data_table_builders.params');
+              $dataArray['actions'] = $this->normalizeJsonPayload($dataArray['actions'] ?? null, 'tenant.data_table_builders.actions');
               $dataArray['is_central'] = false;
 
               $dataTableBuilderInTenantMap[$value->code] = $dataArray;
@@ -171,10 +173,10 @@ class DataTableBuilderController extends Controller
     $dataTableBuilder = DataTableBuilder::create([
       'code' => $validated['code'],
       'name' => $validated['name'],
-      'filters' => json_encode($validated['filters']),
-      'columns' => json_encode($validated['columns']),
-      'params' => json_encode($validated['params']),
-      'actions' => json_encode($validated['actions']),
+      'filters' => $validated['filters'],
+      'columns' => $validated['columns'],
+      'params' => $validated['params'],
+      'actions' => $validated['actions'],
     ]);
 
 
@@ -208,10 +210,10 @@ class DataTableBuilderController extends Controller
         }
     }
 
-    $dataTableBuilder->filters = json_decode($dataTableBuilder->filters);
-    $dataTableBuilder->columns = json_decode($dataTableBuilder->columns);
-    $dataTableBuilder->params = json_decode($dataTableBuilder->params);
-    $dataTableBuilder->actions = json_decode($dataTableBuilder->actions);
+    $dataTableBuilder->filters = $this->normalizeJsonPayload($dataTableBuilder->filters ?? null, 'data_table_builders.show.filters');
+    $dataTableBuilder->columns = $this->normalizeJsonPayload($dataTableBuilder->columns ?? null, 'data_table_builders.show.columns');
+    $dataTableBuilder->params = $this->normalizeJsonPayload($dataTableBuilder->params ?? null, 'data_table_builders.show.params');
+    $dataTableBuilder->actions = $this->normalizeJsonPayload($dataTableBuilder->actions ?? null, 'data_table_builders.show.actions');
 
     return response()->json(["status" => 200, 'data'=>$dataTableBuilder], 200);
   }
@@ -274,10 +276,10 @@ class DataTableBuilderController extends Controller
         $dataTableBuilder->update([
           'code' => $validated['code'],
           'name' => $validated['name'],
-          'filters' => json_encode($validated['filters']),
-          'columns' => json_encode($validated['columns']),
-          'params' => json_encode($validated['params']),
-          'actions' => json_encode($validated['actions'])
+          'filters' => $validated['filters'],
+          'columns' => $validated['columns'],
+          'params' => $validated['params'],
+          'actions' => $validated['actions']
         ]);
     }
 
