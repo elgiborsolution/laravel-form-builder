@@ -2,6 +2,7 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataTableBuilder;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\Concerns\NormalizesJsonPayload;
 use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
@@ -10,6 +11,7 @@ use Illuminate\Support\Facades\Validator;
 
 class DataTableBuilderController extends Controller
 {
+  use AppliesSearchFilter;
   use NormalizesJsonPayload;
 
   /**
@@ -21,7 +23,7 @@ class DataTableBuilderController extends Controller
   */
   public function index(Request $request)
   {
-    $dataTableBuilder = DataTableBuilder::get()->toArray();
+    $dataTableBuilder = DataTableBuilder::query()->orderBy('id')->get()->toArray();
     foreach ($dataTableBuilder as $key => $value) {
 
       $dataTableBuilder[$key]['filters'] = $this->normalizeJsonPayload($value['filters'], 'data_table_builders.filters');
@@ -38,7 +40,7 @@ class DataTableBuilderController extends Controller
         //if the tenant has table
         if(DatabaseConnection::schema()->hasTable('data_table_builders')){
 
-            $dataTableBuilderInTenant = DatabaseConnection::table('data_table_builders')->get();
+            $dataTableBuilderInTenant = DatabaseConnection::table('data_table_builders')->orderBy('id')->get();
             $dataTableBuilderInTenantMap = [];
             foreach ($dataTableBuilderInTenant as $key => $value) { 
               $dataArray = (array) $value;
@@ -63,6 +65,8 @@ class DataTableBuilderController extends Controller
         }
         
     }
+
+    $dataTableBuilder = $this->filterSearchRows($dataTableBuilder, $request, ['code', 'name', 'description'], 'data_table_builders');
 
         return response()->json(['data' => $dataTableBuilder], 200);
   }

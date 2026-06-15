@@ -5,6 +5,7 @@ use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\CustomQueryService;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Http\Request;
@@ -18,6 +19,8 @@ use Illuminate\Validation\Rule;
 
 class DataSourceController extends Controller
 {
+  use AppliesSearchFilter;
+
   public function __construct(
     protected DataQueryService $dataQueryService,
     protected CustomQueryService $customQueryService,
@@ -38,7 +41,12 @@ class DataSourceController extends Controller
   public function index(Request $request)
   {
     $connection = DatabaseConnection::configuredName();
-    $data = DataSource::on($connection)->orderBy('id');
+    $data = $this->applySearchFilter(
+        DataSource::on($connection)->orderBy('id'),
+        $request,
+        ['code', 'name', 'description', 'table_name', 'custom_query'],
+        'data_sources'
+    );
 
     if(!empty($request->page)){
       $paginator = $data->paginate(10);
@@ -63,7 +71,12 @@ class DataSourceController extends Controller
     $ids = $this->normalizeSelectedIds($request->input('ids', []));
     $columns = $this->exportableColumns();
 
-    $query = DataSource::query()->orderBy('id');
+    $query = $this->applySearchFilter(
+        DataSource::query()->orderBy('id'),
+        $request,
+        ['code', 'name', 'description', 'table_name', 'custom_query'],
+        'data_sources'
+    );
 
     if (! empty($ids)) {
       $query->whereIn('id', $ids);

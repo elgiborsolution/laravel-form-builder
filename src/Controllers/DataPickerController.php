@@ -2,6 +2,7 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataPicker;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\Concerns\NormalizesJsonPayload;
 use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
@@ -10,6 +11,7 @@ use Illuminate\Support\Facades\Validator;
 
 class DataPickerController extends Controller
 {
+  use AppliesSearchFilter;
   use NormalizesJsonPayload;
 
   /**
@@ -22,7 +24,7 @@ class DataPickerController extends Controller
   public function index(Request $request)
   {
     $headers = $request->header('x-tenant');
-    $dataPicker = DataPicker::get()->toArray();
+    $dataPicker = DataPicker::query()->orderBy('id')->get()->toArray();
     foreach ($dataPicker as $key => $value) {
 
       $dataPicker[$key]['filters'] = $this->normalizeJsonPayload($value['filters'], 'data_pickers.filters');
@@ -36,7 +38,7 @@ class DataPickerController extends Controller
         tenancy()->initialize($headers);
         //if the tenant has table
         if(DatabaseConnection::schema()->hasTable('data_pickers')){
-          $dataPickerInTenant = DatabaseConnection::table('data_pickers')->get();
+          $dataPickerInTenant = DatabaseConnection::table('data_pickers')->orderBy('id')->get();
           $dataPickerInTenantMap = [];
           foreach ($dataPickerInTenant as $key => $value) { 
             $dataArray = (array) $value;
@@ -61,6 +63,8 @@ class DataPickerController extends Controller
         }//end if tenant has table
         
     }
+
+    $dataPicker = $this->filterSearchRows($dataPicker, $request, ['code', 'name', 'description'], 'data_pickers');
 
         return response()->json(['data' => $dataPicker], 200);
   }

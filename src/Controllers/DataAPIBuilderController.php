@@ -5,6 +5,7 @@ use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Models\ApiHook;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
@@ -19,6 +20,8 @@ use Illuminate\Support\Str;
 
 class DataAPIBuilderController extends Controller
 {
+    use AppliesSearchFilter;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DynamicVariableParser $runtimeVariableParser
@@ -34,13 +37,13 @@ class DataAPIBuilderController extends Controller
 
       public function index(Request $request)
       {
+        $search = trim((string) $request->query('search', ''));
 
-        $dataApiBuilder = Cache::remember($this->cacheKey('list-api-configs'), 60, function (){
-                return  ApiConfig::on(DatabaseConnection::configuredName())
-                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
-                    ->get()
-                    ->toArray();
-        });
+        $dataApiBuilder = $search !== ''
+            ? $this->loadApiConfigs($request)
+            : Cache::remember($this->cacheKey('list-api-configs'), 60, function () use ($request) {
+                return $this->loadApiConfigs($request);
+            });
 
           return response()->json(['data' => $dataApiBuilder], 200);
       }
@@ -1664,6 +1667,24 @@ class DataAPIBuilderController extends Controller
       protected function cacheKey(string $key): string
       {
             return DatabaseConnection::cachePrefix($key);
+      }
+
+      /**
+       * Load API builder configs with optional search filtering.
+       *
+       * @param Request $request
+       * @return array<int, array<string, mixed>>
+       */
+      protected function loadApiConfigs(Request $request): array
+      {
+            return $this->applySearchFilter(
+                ApiConfig::on(DatabaseConnection::configuredName())
+                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
+                    ->orderBy('id'),
+                $request,
+                ['route_name', 'endpoint', 'description', 'method'],
+                'api_configs'
+            )->get()->toArray();
       }
 
       protected function buildRouteName(?string $endpoint, ?string $method): string
