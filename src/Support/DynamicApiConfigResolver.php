@@ -12,19 +12,47 @@ class DynamicApiConfigResolver
     {
         $method = strtoupper($method);
         $dynamicPath = $this->normalizeEndpoint($dynamicPath);
+        $default = ['config' => null, 'id' => null, 'endpoint' => null, 'action' => null];
 
         if ($dynamicPath === '') {
-            return ['config' => null, 'id' => null, 'endpoint' => null];
+            return $default;
+        }
+
+        $segments = explode('/', $dynamicPath);
+
+        if (count($segments) >= 3 && strtolower((string) end($segments)) === 'restore') {
+            array_pop($segments);
+            $id = array_pop($segments);
+            $endpoint = implode('/', $segments);
+            $config = $this->findByEndpointAndMethod($endpoint, 'POST');
+
+            if ($config !== null) {
+                return [
+                    'config' => $config,
+                    'id' => $id,
+                    'endpoint' => $endpoint,
+                    'action' => 'restore',
+                ];
+            }
         }
 
         $config = $this->findByEndpointAndMethod($dynamicPath, $method);
         if ($config !== null) {
-            return ['config' => $config, 'id' => null, 'endpoint' => $dynamicPath];
+            return [
+                'config' => $config,
+                'id' => null,
+                'endpoint' => $dynamicPath,
+                'action' => null,
+            ];
         }
 
-        $segments = explode('/', $dynamicPath);
         if (count($segments) < 2) {
-            return ['config' => null, 'id' => null, 'endpoint' => $dynamicPath];
+            return [
+                'config' => null,
+                'id' => null,
+                'endpoint' => $dynamicPath,
+                'action' => null,
+            ];
         }
 
         $id = array_pop($segments);
@@ -35,6 +63,7 @@ class DynamicApiConfigResolver
             'config' => $config,
             'id' => $config !== null ? $id : null,
             'endpoint' => $endpoint,
+            'action' => null,
         ];
     }
 

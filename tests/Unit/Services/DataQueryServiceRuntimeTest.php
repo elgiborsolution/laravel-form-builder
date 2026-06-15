@@ -3,6 +3,8 @@
 namespace ESolution\DataSources\Tests\Unit\Services;
 
 use ESolution\DataSources\Contracts\DatabaseDriver;
+use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Models\ApiTable;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
@@ -70,6 +72,30 @@ class DataQueryServiceRuntimeTest extends TestCase
 
         $this->assertSame('invoices', $definition['table_name']);
         $this->assertSame(['id', 'name'], $definition['columns']);
+    }
+
+    public function test_it_propagates_soft_delete_flag_for_api_builder_parent_tables(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $apiConfig = new ApiConfig();
+        $parentTable = new ApiTable([
+            'table_name' => 'products',
+            'primary_key' => 'id',
+            'use_soft_delete' => true,
+        ]);
+        $apiConfig->setRelation('parentTable', $parentTable);
+        $apiConfig->setRelation('childTables', new Collection([]));
+        $apiConfig->params = [];
+
+        $service->executeForApiConfig(new Request(), $apiConfig, 'api_config_soft_delete');
+
+        $this->assertTrue($service->capturedDefinition['use_soft_delete']);
+        $this->assertSame('products', $service->capturedDefinition['table_name']);
     }
 
     public function test_it_formats_select_columns_for_mysql_and_preserves_raw_expressions(): void

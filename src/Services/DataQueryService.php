@@ -96,6 +96,7 @@ class DataQueryService
                 'table_name' => $parentTable?->table_name ?? '',
                 'columns' => $this->columnsFromApiConfig($apiConfig),
                 'debug_index_table' => $parentTable?->table_name ?? '',
+                'use_soft_delete' => (bool) ($parentTable?->use_soft_delete ?? false),
             ];
 
             return $this->execute($request, $definition);

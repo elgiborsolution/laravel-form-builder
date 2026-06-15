@@ -822,19 +822,25 @@ class DataAPIBuilderController extends Controller
 
     protected function syncApiConfigRelations(ApiConfig $config, array $payload): void
     {
-        $config->loadMissing('parentTable');
+        $config->loadMissing('parentTable', 'childTables');
         $parentTable = $config->parentTable;
 
         if (array_key_exists('parent_table', $payload)) {
             if (is_array($payload['parent_table']) && ! empty($payload['parent_table'])) {
+                $parentTableName = (string) ($payload['parent_table']['table_name'] ?? '');
+                $parentSoftDelete = array_key_exists('use_soft_delete', $payload['parent_table'])
+                    ? (bool) $payload['parent_table']['use_soft_delete']
+                    : ($parentTable?->use_soft_delete ?? $this->tableHasDeletedAt($parentTableName));
+
                 $parentTable = $config->parentTable()->updateOrCreate(
                     ['api_config_id' => $config->id],
                     [
                         'parent_id' => 0,
-                        'table_name' => $payload['parent_table']['table_name'] ?? '',
+                        'table_name' => $parentTableName,
                         'primary_key' => $payload['parent_table']['primary_key'] ?? 'id',
                         'foreign_key' => $payload['parent_table']['foreign_key'] ?? null,
                         'data_params' => $payload['parent_table']['data_params'] ?? [],
+                        'use_soft_delete' => $parentSoftDelete,
                     ]
                 );
             } elseif ($config->parentTable) {
@@ -844,6 +850,7 @@ class DataAPIBuilderController extends Controller
         }
 
         if (array_key_exists('child_tables', $payload)) {
+            $existingChildren = $config->childTables;
             $config->childTables()->delete();
 
             if (is_array($payload['child_tables']) && $payload['child_tables'] !== []) {
@@ -855,11 +862,20 @@ class DataAPIBuilderController extends Controller
                         continue;
                     }
 
+                    $childTableName = (string) ($childTable['table_name'] ?? '');
+                    $existingChild = $existingChildren
+                        ? $existingChildren->firstWhere('table_name', $childTableName)
+                        : null;
+                    $childSoftDelete = array_key_exists('use_soft_delete', $childTable)
+                        ? (bool) $childTable['use_soft_delete']
+                        : ($existingChild?->use_soft_delete ?? $this->tableHasDeletedAt($childTableName));
+
                     $children[] = new ApiTable([
                         'parent_id' => $parentId,
-                        'table_name' => $childTable['table_name'] ?? '',
+                        'table_name' => $childTableName,
                         'foreign_key' => $childTable['foreign_key'] ?? null,
                         'data_params' => $childTable['data_params'] ?? [],
+                        'use_soft_delete' => $childSoftDelete,
                     ]);
                 }
 
@@ -976,7 +992,28 @@ class DataAPIBuilderController extends Controller
             'primary_key' => $table->primary_key,
             'foreign_key' => $table->foreign_key,
             'data_params' => $table->data_params,
+            'use_soft_delete' => (bool) $table->use_soft_delete,
         ];
+    }
+
+    /**
+     * Check whether a table exposes a deleted_at column.
+     */
+    protected function tableHasDeletedAt(string $tableName): bool
+    {
+        $tableName = trim($tableName);
+
+        if ($tableName === '') {
+            return false;
+        }
+
+        try {
+            $columns = DatabaseConnection::schema()->getColumnListing($tableName);
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        return in_array('deleted_at', $columns, true);
     }
 
     /**
@@ -1150,7 +1187,9 @@ class DataAPIBuilderController extends Controller
       'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
       'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
       'parent_table' => 'required|array',
+      'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
+      'child_tables.*.use_soft_delete' => 'nullable|boolean',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
@@ -1197,6 +1236,9 @@ class DataAPIBuilderController extends Controller
                 'table_name' => $validated['parent_table']['table_name'],
                 'primary_key' => $validated['parent_table']['primary_key']??'id',
                 'data_params' => ($validated['parent_table']['data_params']??[]),
+                'use_soft_delete' => array_key_exists('use_soft_delete', $validated['parent_table'])
+                    ? (bool) $validated['parent_table']['use_soft_delete']
+                    : $this->tableHasDeletedAt($validated['parent_table']['table_name']),
             ]);
 
             $dataApiBuilder->parentTable()->save($parentTable);
@@ -1208,6 +1250,9 @@ class DataAPIBuilderController extends Controller
                               'table_name' => $value['table_name'],
                               'foreign_key' => $value['foreign_key'],
                               'data_params' => ($value['data_params']??[]),
+                              'use_soft_delete' => array_key_exists('use_soft_delete', $value)
+                                  ? (bool) $value['use_soft_delete']
+                                  : $this->tableHasDeletedAt($value['table_name']),
                           ]);
 
               $dataChildTable[] = $dataChild;
@@ -1337,6 +1382,7 @@ class DataAPIBuilderController extends Controller
     if (empty($dataApiBuilder)) {
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
     }
+    $dataApiBuilder->loadMissing('parentTable', 'childTables');
 
     $originalEndpoint = $dataApiBuilder->endpoint;
     $originalMethod = $dataApiBuilder->method;
@@ -1358,7 +1404,9 @@ class DataAPIBuilderController extends Controller
       'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
       'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
       'parent_table' => 'required|array',
+      'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
+      'child_tables.*.use_soft_delete' => 'nullable|boolean',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
@@ -1400,17 +1448,24 @@ class DataAPIBuilderController extends Controller
                 'table_name' => $validated['parent_table']['table_name'],
                 'primary_key' => $validated['parent_table']['primary_key']??'id',
                 'data_params' => ($validated['parent_table']['data_params']??[]),
+                'use_soft_delete' => array_key_exists('use_soft_delete', $validated['parent_table'])
+                    ? (bool) $validated['parent_table']['use_soft_delete']
+                    : ($dataApiBuilder->parentTable?->use_soft_delete ?? $this->tableHasDeletedAt($validated['parent_table']['table_name'])),
             ];
 
             $dataApiBuilder->parentTable()->update($parentTable);
 
             $dataChildTable = [];
+            $existingChildren = $dataApiBuilder->childTables;
             foreach ($validated['child_tables']??[] as $key => $value) {
               $dataChild = new ApiTable([
                               'parent_id' => $dataApiBuilder->parentTable->id,
                               'table_name' => $value['table_name'],
                               'foreign_key' => $value['foreign_key'],
                               'data_params' => ($value['data_params']??[]),
+                              'use_soft_delete' => array_key_exists('use_soft_delete', $value)
+                                  ? (bool) $value['use_soft_delete']
+                                  : (($existingChildren ? $existingChildren->firstWhere('table_name', $value['table_name'])?->use_soft_delete : null) ?? $this->tableHasDeletedAt($value['table_name'])),
                           ]);
 
               $dataChildTable[] = $dataChild;
@@ -1522,7 +1577,9 @@ class DataAPIBuilderController extends Controller
       'method' => ['nullable', 'string', 'in:POST,PUT,DELETE'],
       'params' => ['required', 'array'],
       'parent_table' => 'required|array',
+      'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
+      'child_tables.*.use_soft_delete' => 'nullable|boolean',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',

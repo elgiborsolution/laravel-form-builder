@@ -176,7 +176,7 @@ class ApiControllerRuntimeRequestTest extends TestCase
                 return $destination($request);
             }
 
-            protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
+            protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id, ?string $action = null): JsonResponse
             {
                 return new JsonResponse(['message' => 'ok'], 200);
             }
@@ -368,7 +368,7 @@ class ApiControllerRuntimeRequestTest extends TestCase
                 return $destination($request);
             }
 
-            protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
+            protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id, ?string $action = null): JsonResponse
             {
                 $request->attributes->set('datasources.after_hit.action', 'create');
                 $request->attributes->set('datasources.after_hit.result', [
