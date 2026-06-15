@@ -16,6 +16,7 @@ use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 
 class DataQueryService
@@ -179,6 +180,17 @@ class DataQueryService
                 $queryCount .= $softDeleteClause;
                 $query .= $softDeleteClause;
             }
+
+            Log::debug('DataSource query build', [
+                'identifier' => $definition['identifier'] ?? null,
+                'original_sql_count' => $queryCount,
+                'original_sql' => $query,
+                'route_params' => $request->route() ? $request->route()->parameters() : [],
+                'request_params' => $request->all(),
+                'detected_placeholders' => $this->extractCustomParameterNames($query),
+                'bindings' => [],
+            ]);
+
             $appliedFilters = [];
 
             foreach ($definition['parameters'] as $parameter) {
@@ -234,6 +246,13 @@ class DataQueryService
             if (!empty($result['error'])) {
                 return response()->json(['error' => $result['error'], 'message' => $result['error']], 400);
             }
+
+            Log::debug('DataSource query final', [
+                'identifier' => $definition['identifier'] ?? null,
+                'final_sql_count' => $queryCount,
+                'final_sql' => $query,
+                'bindings' => [],
+            ]);
 
             return response()->json($this->applyResponseType($result, (string) ($definition['response_type'] ?? 'array')));
         } catch (InvalidRuntimeVariableException $e) {
@@ -362,15 +381,23 @@ class DataQueryService
             '/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/',
             function (array $matches) use ($request): string {
                 $key = $matches[1];
-                $value = $request->route($key);
+                $value = $request->input($key);
 
                 if ($value === null || $value === '') {
-                    $value = $request->input($key);
+                    $value = $request->route($key);
                 }
 
                 if ($value === null || $value === '') {
                     throw new \InvalidArgumentException("Missing route parameter: {$key}");
                 }
+
+                Log::debug('DataSource route placeholder resolved', [
+                    'field' => $key,
+                    'value' => $value,
+                    'source' => $request->input($key) !== null && $request->input($key) !== ''
+                        ? 'request_input'
+                        : 'route_parameter',
+                ]);
 
                 return $this->quoteSqlValue($value);
             },
@@ -390,6 +417,12 @@ class DataQueryService
     {
         $definitions = $this->normalizeCustomParameters($customParameters);
         $usedParameters = $this->extractCustomParameterNames($query);
+
+        Log::debug('DataSource custom placeholder scan', [
+            'query' => $query,
+            'detected_placeholders' => $usedParameters,
+            'custom_parameters' => array_keys($definitions),
+        ]);
 
         foreach ($usedParameters as $name) {
             if (! array_key_exists($name, $definitions)) {
@@ -419,6 +452,11 @@ class DataQueryService
 
                 $value = $this->parseRuntimeValue($value);
                 $value = $this->formatCustomParameterValue($definition['type'] ?? 'string', $value);
+
+                Log::debug('DataSource custom placeholder resolved', [
+                    'field' => $name,
+                    'value' => $value,
+                ]);
 
                 return $this->quoteSqlValue($value);
             },
@@ -457,6 +495,25 @@ class DataQueryService
         }
 
         preg_match_all('/(?<!:):([A-Za-z_][A-Za-z0-9_]*)\b/', $query, $matches);
+
+        $names = $matches[1] ?? [];
+
+        return array_values(array_unique(array_filter($names, static fn ($name) => is_string($name) && trim($name) !== '')));
+    }
+
+    /**
+     * Extract route-style placeholders from a SQL string.
+     *
+     * @param string $query
+     * @return array<int, string>
+     */
+    protected function extractRoutePlaceholders(string $query): array
+    {
+        if ($query === '') {
+            return [];
+        }
+
+        preg_match_all('/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/', $query, $matches);
 
         $names = $matches[1] ?? [];
 

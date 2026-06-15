@@ -74,6 +74,42 @@ class DataQueryServiceRuntimeTest extends TestCase
         $this->assertSame(['id', 'name'], $definition['columns']);
     }
 
+    public function test_it_prefers_merged_request_input_over_route_parameter_for_id_placeholder(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/product/1', 'GET', [
+            'id' => 1,
+        ]);
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'id' ? 'product' : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['id' => 'product'];
+                }
+            };
+        });
+
+        $result = $service->exposeApplyRouteParameterPlaceholders(
+            'SELECT id, name, code FROM es_products WHERE id = {id}',
+            $request
+        );
+
+        $this->assertSame(
+            "SELECT id, name, code FROM es_products WHERE id = 1",
+            $result
+        );
+    }
+
     public function test_it_propagates_soft_delete_flag_for_api_builder_parent_tables(): void
     {
         $service = new CapturingDataQueryService(
@@ -404,6 +440,11 @@ class CapturingDataQueryService extends DataQueryService
     public function exposeBuildFilterClause(string $field, string $operator, mixed $value): string
     {
         return $this->buildFilterClause($field, $operator, $value);
+    }
+
+    public function exposeApplyRouteParameterPlaceholders(string $query, Request $request): string
+    {
+        return $this->applyRouteParameterPlaceholders($query, $request);
     }
 
     protected function quoteSqlValue(mixed $value): string
