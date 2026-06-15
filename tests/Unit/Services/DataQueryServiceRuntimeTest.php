@@ -110,6 +110,44 @@ class DataQueryServiceRuntimeTest extends TestCase
         );
     }
 
+    public function test_it_wraps_object_response_data_when_record_exists(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $response = $service->exposeApplyResponseType([
+            (object) [
+                'id' => 189,
+                'name' => 'barang test',
+                'code' => 'bar002',
+            ],
+        ], 'object');
+
+        $this->assertSame(
+            '{"data":{"id":189,"name":"barang test","code":"bar002"}}',
+            json_encode($response)
+        );
+    }
+
+    public function test_it_returns_empty_object_data_and_message_when_object_response_is_missing(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $response = $service->exposeApplyResponseType([], 'object');
+
+        $this->assertSame(
+            '{"data":{},"message":"Data not found"}',
+            json_encode($response)
+        );
+    }
+
     public function test_it_propagates_soft_delete_flag_for_api_builder_parent_tables(): void
     {
         $service = new CapturingDataQueryService(
@@ -445,6 +483,11 @@ class CapturingDataQueryService extends DataQueryService
     public function exposeApplyRouteParameterPlaceholders(string $query, Request $request): string
     {
         return $this->applyRouteParameterPlaceholders($query, $request);
+    }
+
+    public function exposeApplyResponseType(mixed $result, string $responseType): mixed
+    {
+        return $this->applyResponseType($result, $responseType);
     }
 
     protected function quoteSqlValue(mixed $value): string

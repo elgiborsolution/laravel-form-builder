@@ -440,7 +440,7 @@ class DataQueryService
                     throw new \InvalidArgumentException("Custom parameter \"{$name}\" is not defined.");
                 }
 
-                $value = $request->query($name);
+                $value = $this->resolveRequestValue($request, $name);
 
                 if (($value === null || $value === '') && array_key_exists('default', $definition)) {
                     $value = $definition['default'];
@@ -473,13 +473,33 @@ class DataQueryService
      */
     protected function requestHasCustomParameter(Request $request, string $name): bool
     {
-        $value = $request->query($name);
-
-        if ($value === null || $value === '') {
-            $value = $request->input($name);
-        }
+        $value = $this->resolveRequestValue($request, $name);
 
         return $value !== null && $value !== '';
+    }
+
+    /**
+     * Resolve a request value with route parameters taking precedence.
+     *
+     * @param Request $request
+     * @param string $name
+     * @return mixed
+     */
+    protected function resolveRequestValue(Request $request, string $name): mixed
+    {
+        $value = $request->route($name);
+
+        if ($value !== null && $value !== '') {
+            return $value;
+        }
+
+        $value = $request->input($name);
+
+        if ($value !== null && $value !== '') {
+            return $value;
+        }
+
+        return $request->query($name);
     }
 
     /**
@@ -845,17 +865,14 @@ class DataQueryService
      */
     protected function resolveFilterValue(Request $request, string $field, mixed $default = null): mixed
     {
-        $value = $request->query($field);
-
-        if ($value === null) {
-            $value = $request->input($field);
-        }
+        $value = $this->resolveRequestValue($request, $field);
 
         if ($value !== null && $value !== '') {
             return $value;
         }
 
         $rawFilter = $this->findFilterDefinition($request, $field);
+
         if (is_array($rawFilter)) {
             if (array_key_exists('value', $rawFilter) && $rawFilter['value'] !== null && $rawFilter['value'] !== '') {
                 return $rawFilter['value'];
@@ -1055,20 +1072,33 @@ class DataQueryService
         }
 
         if (! is_array($data)) {
-            return (object) [];
+            return [
+                'data' => (object) [],
+                'message' => 'Data not found',
+            ];
+        }
+
+        if ($data === [] || count($data) === 0) {
+            return [
+                'data' => (object) [],
+                'message' => 'Data not found',
+            ];
         }
 
         $first = $data[0] ?? null;
 
         if (is_array($first)) {
-            return $first;
+            return ['data' => $first];
         }
 
         if (is_object($first)) {
-            return $first;
+            return ['data' => $first];
         }
 
-        return (object) [];
+        return [
+            'data' => (object) [],
+            'message' => 'Data not found',
+        ];
     }
 
     protected function columnsFromApiConfig(ApiConfig $apiConfig): array
