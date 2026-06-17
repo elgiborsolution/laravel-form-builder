@@ -247,7 +247,7 @@ class ApiController extends Controller
         return response()->json(['data' => []], 200);
   }
 
-  protected function tableHasDeletedAtColumn(string $tableName): bool
+  protected function tableHasDeletedAtColumn(string $tableName, ?string $connectionName = null): bool
   {
         $tableName = trim($tableName);
 
@@ -256,7 +256,7 @@ class ApiController extends Controller
         }
 
         try {
-            $columns = DatabaseConnection::schema()->getColumnListing($tableName);
+            $columns = DatabaseConnection::schema($connectionName)->getColumnListing($tableName);
         } catch (\Throwable $e) {
             return false;
         }
@@ -264,7 +264,7 @@ class ApiController extends Controller
         return in_array('deleted_at', $columns, true);
   }
 
-  protected function usesSoftDeleteForTable(?array $table, ?string $tableName = null): bool
+  protected function usesSoftDeleteForTable(?array $table, ?string $tableName = null, ?string $connectionName = null): bool
   {
         if (!is_array($table)) {
             return false;
@@ -276,7 +276,7 @@ class ApiController extends Controller
 
         $resolvedTableName = $tableName ?? (string) ($table['table_name'] ?? '');
 
-        return $this->tableHasDeletedAtColumn($resolvedTableName);
+        return $this->tableHasDeletedAtColumn($resolvedTableName, $connectionName);
   }
 
   protected function deleteTableRecord($connection, string $tableName, string $primaryKey, mixed $id, bool $useSoftDelete): void
@@ -289,6 +289,22 @@ class ApiController extends Controller
         }
 
         $query->delete();
+  }
+
+  protected function logDeleteMode(string $context, ApiConfig $apiConfig, string $tableName, bool $useSoftDelete, string $primaryKey, mixed $id): void
+  {
+        \Log::info('API Builder delete mode', [
+            'context' => $context,
+            'api_config_id' => $apiConfig->id,
+            'table_name' => $tableName,
+            'primary_key' => $primaryKey,
+            'record_id' => $id,
+            'use_soft_delete' => $useSoftDelete,
+            'delete_mode' => $useSoftDelete ? 'soft_delete' : 'hard_delete',
+            'executed_query' => $useSoftDelete
+                ? "UPDATE {$tableName} SET deleted_at = CURRENT_TIMESTAMP WHERE {$primaryKey} = ?"
+                : "DELETE FROM {$tableName} WHERE {$primaryKey} = ?",
+        ]);
   }
 
   protected function restoreTableRecord($connection, string $tableName, string $primaryKey, mixed $id): void
@@ -804,6 +820,7 @@ class ApiController extends Controller
         }
 
         $connection = $this->executionConnectionResolver->connection($request);
+        $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
@@ -863,7 +880,7 @@ class ApiController extends Controller
             }
 
             foreach ($insertDataChild as $key => $value) {
-              $childUsesSoftDelete = $this->usesSoftDeleteForTable($value, $value['table'] ?? null);
+              $childUsesSoftDelete = $this->usesSoftDeleteForTable($value, $value['table'] ?? null, $connectionName);
               $childQuery = $connection->table($value['table'])->where($value['foreign_key'], $id);
 
               if ($childUsesSoftDelete) {
@@ -946,6 +963,7 @@ class ApiController extends Controller
         $primarykey = $apiConfigs->parentTable->primary_key;
 
         $connection = $this->executionConnectionResolver->connection($request);
+        $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
@@ -973,15 +991,18 @@ class ApiController extends Controller
                     'use_soft_delete' => $apiConfigs->parentTable?->use_soft_delete ?? false,
                     'table_name' => $parentTable,
                 ],
-                $cleanParentTable
+                $cleanParentTable,
+                $connectionName
             );
 
+            $this->logDeleteMode('parent', $apiConfigs, $cleanParentTable, $parentUsesSoftDelete, $primarykey, $id);
             $this->deleteTableRecord($connection, $cleanParentTable, $primarykey, $id, $parentUsesSoftDelete);
 
             foreach ($childTables as $key => $table) {
                 $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
-                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild);
+                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
 
+                $this->logDeleteMode('child', $apiConfigs, $tableChild, $childUsesSoftDelete, (string) ($table['foreign_key'] ?? ''), $id);
                 $this->deleteTableRecord($connection, $tableChild, $table['foreign_key'], $id, $childUsesSoftDelete);
 
             }
@@ -1151,6 +1172,7 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
         $primarykey = $apiConfigs->parentTable->primary_key;
 
         $connection = $this->executionConnectionResolver->connection($request);
+        $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
@@ -1169,7 +1191,8 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
                     'use_soft_delete' => $apiConfigs->parentTable?->use_soft_delete ?? false,
                     'table_name' => $parentTable,
                 ],
-                $cleanParentTable
+                $cleanParentTable,
+                $connectionName
             );
 
             if ($parentUsesSoftDelete) {
@@ -1178,7 +1201,7 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
 
             foreach ($childTables as $table) {
                 $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
-                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild);
+                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
 
                 if ($childUsesSoftDelete) {
                     $this->restoreTableRecord($connection, $tableChild, $table['foreign_key'], $id);
