@@ -183,10 +183,14 @@ class DataQueryService
 
             Log::debug('DataSource query build', [
                 'identifier' => $definition['identifier'] ?? null,
+                'dataSourceCode' => $request->attributes->get('datasources.data_source_code'),
+                'routePattern' => $request->attributes->get('datasources.route_pattern'),
+                'detectedParameters' => $request->attributes->get('datasources.detected_parameters', []),
                 'original_sql_count' => $queryCount,
                 'original_sql' => $query,
                 'route_params' => $request->route() ? $request->route()->parameters() : [],
                 'request_params' => $request->all(),
+                'request_all' => $request->all(),
                 'detected_placeholders' => $this->extractCustomParameterNames($query),
                 'bindings' => [],
             ]);
@@ -249,6 +253,9 @@ class DataQueryService
 
             Log::debug('DataSource query final', [
                 'identifier' => $definition['identifier'] ?? null,
+                'dataSourceCode' => $request->attributes->get('datasources.data_source_code'),
+                'routePattern' => $request->attributes->get('datasources.route_pattern'),
+                'detectedParameters' => $request->attributes->get('datasources.detected_parameters', []),
                 'final_sql_count' => $queryCount,
                 'final_sql' => $query,
                 'bindings' => [],
@@ -377,8 +384,14 @@ class DataQueryService
      */
     protected function applyRouteParameterPlaceholders(string $query, Request $request): string
     {
+        $pattern = '/\{([a-zA-Z0-9_]+)\}/';
+
+        if (preg_match($pattern, $query) !== 1) {
+            return $query;
+        }
+
         return preg_replace_callback(
-            '/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/',
+            $pattern,
             function (array $matches) use ($request): string {
                 $key = $matches[1];
                 $value = $request->input($key);
@@ -487,13 +500,19 @@ class DataQueryService
      */
     protected function resolveRequestValue(Request $request, string $name): mixed
     {
-        $value = $request->route($name);
+        $value = $request->input($name);
 
         if ($value !== null && $value !== '') {
             return $value;
         }
 
-        $value = $request->input($name);
+        $allowedRouteParameters = $request->attributes->get('datasources.route_parameter_names', []);
+
+        if (! is_array($allowedRouteParameters) || ! in_array($name, $allowedRouteParameters, true)) {
+            return $request->query($name);
+        }
+
+        $value = $request->route($name);
 
         if ($value !== null && $value !== '') {
             return $value;

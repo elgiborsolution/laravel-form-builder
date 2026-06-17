@@ -110,6 +110,126 @@ class DataQueryServiceRuntimeTest extends TestCase
         );
     }
 
+    public function test_it_only_replaces_braced_route_placeholders(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/api/data-source/product/123', 'GET', [
+            'product_id' => 123,
+        ]);
+
+        $sql = "SELECT 'd-invoice' AS route_name, id FROM products WHERE id = {product_id}";
+
+        $result = $service->exposeApplyRouteParameterPlaceholders($sql, $request);
+
+        $this->assertSame(
+            "SELECT 'd-invoice' AS route_name, id FROM products WHERE id = '123'",
+            $result
+        );
+    }
+
+    public function test_it_ignores_route_parameters_when_they_are_not_whitelisted(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/api/data-source/d-invoice', 'GET');
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'id' ? 'd-invoice' : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['id' => 'd-invoice'];
+                }
+            };
+        });
+
+        $this->assertNull($service->exposeResolveRequestValue($request, 'id'));
+    }
+
+    public function test_it_allows_route_parameters_when_they_are_explicitly_whitelisted(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/api/data-source/product/123', 'GET');
+        $request->attributes->set('datasources.route_parameter_names', ['product_id']);
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'product_id' ? 123 : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['product_id' => 123];
+                }
+            };
+        });
+
+        $this->assertSame(123, $service->exposeResolveRequestValue($request, 'product_id'));
+    }
+
+    public function test_it_does_not_apply_a_route_value_as_a_filter_for_plain_datasource_urls(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            true
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->use_soft_delete = 1;
+        $dataSource->table_name = 'es_direct_invoice';
+        $dataSource->columns = ['id', 'customer_name', 'reff_no', 'grand_total'];
+        $dataSource->setRelation('parameters', new Collection([
+            (object) [
+                'param_name' => 'id',
+                'param_type' => 'string',
+                'is_required' => 0,
+                'param_default_value' => null,
+                'operator' => '=',
+            ],
+        ]));
+
+        $request = Request::create('/api/data-source/d-invoice', 'GET');
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'id' ? 'd-invoice' : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['id' => 'd-invoice'];
+                }
+            };
+        });
+
+        $service->executeForDataSource($request, $dataSource, 'datasource_q_plain');
+
+        $this->assertStringContainsString('FROM es_direct_invoice WHERE 1=1 AND deleted_at IS NULL', $service->capturedQuery);
+        $this->assertStringNotContainsString("AND id = 'd-invoice'", $service->capturedQuery);
+    }
+
     public function test_it_wraps_object_response_data_when_record_exists(): void
     {
         $service = new CapturingDataQueryService(
@@ -488,6 +608,11 @@ class CapturingDataQueryService extends DataQueryService
     public function exposeApplyResponseType(mixed $result, string $responseType): mixed
     {
         return $this->applyResponseType($result, $responseType);
+    }
+
+    public function exposeResolveRequestValue(Request $request, string $name): mixed
+    {
+        return $this->resolveRequestValue($request, $name);
     }
 
     protected function quoteSqlValue(mixed $value): string

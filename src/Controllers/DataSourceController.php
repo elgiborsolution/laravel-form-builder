@@ -21,6 +21,8 @@ class DataSourceController extends Controller
 {
   use AppliesSearchFilter;
 
+  private const ROUTE_PARAMETER_SEGMENT_PATTERN = '/^\{([a-zA-Z0-9_]+)\}$/';
+
   public function __construct(
     protected DataQueryService $dataQueryService,
     protected CustomQueryService $customQueryService,
@@ -1202,6 +1204,19 @@ class DataSourceController extends Controller
 
       [$dataSource, $routeParameters, $cacheKeySuffix] = $dataSourceMatch;
 
+      $routeParameterNames = array_keys($routeParameters);
+      $request->attributes->set('datasources.data_source_code', (string) $id);
+      $request->attributes->set('datasources.route_pattern', (string) $dataSource->name);
+      $request->attributes->set('datasources.detected_parameters', $routeParameterNames);
+      $request->attributes->set('datasources.route_parameter_names', $routeParameterNames);
+
+      Log::debug('DataSource route resolution', [
+        'dataSourceCode' => (string) $id,
+        'routePattern' => (string) $dataSource->name,
+        'detectedParameters' => $routeParameters,
+        'request_all' => $request->all(),
+      ]);
+
       if ($routeParameters !== []) {
         $request->merge($routeParameters);
       }
@@ -1251,7 +1266,9 @@ class DataSourceController extends Controller
       return [false, []];
     }
 
-    if (strpos($template, '{') === false) {
+    $routeParameters = $this->extractRouteTemplateParameters($template);
+
+    if ($routeParameters === []) {
       return [$template === $path, []];
     }
 
@@ -1271,7 +1288,7 @@ class DataSourceController extends Controller
         return [false, []];
       }
 
-      if (preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment, $matches) === 1) {
+      if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment, $matches) === 1) {
         $parameters[$matches[1]] = $pathSegment;
         continue;
       }
@@ -1284,6 +1301,26 @@ class DataSourceController extends Controller
     return [true, $parameters];
   }
 
+  protected function extractRouteTemplateParameters(string $template): array
+  {
+    $template = trim($template, '/');
+
+    if ($template === '') {
+      return [];
+    }
+
+    $segments = explode('/', $template);
+    $parameters = [];
+
+    foreach ($segments as $segment) {
+      if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment, $matches) === 1) {
+        $parameters[] = $matches[1];
+      }
+    }
+
+    return array_values(array_unique($parameters));
+  }
+
   protected function validateRouteTemplate(string $template): ?string
   {
     $template = trim($template, '/');
@@ -1293,6 +1330,19 @@ class DataSourceController extends Controller
     }
 
     $segments = explode('/', $template);
+    $routeParameters = $this->extractRouteTemplateParameters($template);
+
+    if ($routeParameters === []) {
+      if (str_contains($template, '{') || str_contains($template, '}')) {
+        return 'The name field must contain balanced route parameters like {id}.';
+      }
+
+      return null;
+    }
+
+    if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segments[0] ?? '') === 1) {
+      return 'Route URL must contain a fixed path prefix before route parameters.';
+    }
 
     foreach ($segments as $segment) {
       if ($segment === '') {
@@ -1300,7 +1350,7 @@ class DataSourceController extends Controller
       }
 
       if (str_contains($segment, '{') || str_contains($segment, '}')) {
-        if (! preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment)) {
+        if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment) !== 1) {
           return 'The name field must contain balanced route parameters like {id}.';
         }
       }
