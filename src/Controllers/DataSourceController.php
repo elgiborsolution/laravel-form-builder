@@ -5,6 +5,7 @@ use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\CustomQueryService;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Http\Request;
@@ -18,6 +19,10 @@ use Illuminate\Validation\Rule;
 
 class DataSourceController extends Controller
 {
+  use AppliesSearchFilter;
+
+  private const ROUTE_PARAMETER_SEGMENT_PATTERN = '/^\{([a-zA-Z0-9_]+)\}$/';
+
   public function __construct(
     protected DataQueryService $dataQueryService,
     protected CustomQueryService $customQueryService,
@@ -38,7 +43,12 @@ class DataSourceController extends Controller
   public function index(Request $request)
   {
     $connection = DatabaseConnection::configuredName();
-    $data = DataSource::on($connection)->orderBy('id');
+    $data = $this->applySearchFilter(
+        DataSource::on($connection)->orderBy('id'),
+        $request,
+        ['code', 'name', 'description', 'table_name', 'custom_query'],
+        'data_sources'
+    );
 
     if(!empty($request->page)){
       $paginator = $data->paginate(10);
@@ -63,7 +73,12 @@ class DataSourceController extends Controller
     $ids = $this->normalizeSelectedIds($request->input('ids', []));
     $columns = $this->exportableColumns();
 
-    $query = DataSource::query()->orderBy('id');
+    $query = $this->applySearchFilter(
+        DataSource::query()->orderBy('id'),
+        $request,
+        ['code', 'name', 'description', 'table_name', 'custom_query'],
+        'data_sources'
+    );
 
     if (! empty($ids)) {
       $query->whereIn('id', $ids);
@@ -312,6 +327,7 @@ class DataSourceController extends Controller
   {
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
+      'use_soft_delete' => filter_var($request->input('use_soft_delete'), FILTER_VALIDATE_BOOLEAN),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
       'response_type' => $this->normalizeResponseType($request->input('response_type', 'array')),
@@ -320,6 +336,7 @@ class DataSourceController extends Controller
 
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
+      'use_soft_delete' => ['nullable', 'boolean'],
       'name' => [
         'required',
         'string',
@@ -418,10 +435,16 @@ class DataSourceController extends Controller
       }
     }
 
+    $validated['use_soft_delete'] = (bool) ($validated['use_soft_delete'] ?? false);
+    if ((bool) $validated['use_custom_query']) {
+      $validated['use_soft_delete'] = false;
+    }
+
     $dataSource = DataSource::create([
       'name' => $validated['name'],
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
+      'use_soft_delete' => $validated['use_soft_delete'],
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
@@ -454,6 +477,7 @@ class DataSourceController extends Controller
     $payload['filter_parameters'] = $payload['parameters'] ?? [];
     $payload['response_type'] = $this->normalizeResponseType($payload['response_type'] ?? 'array');
     $payload['custom_parameters'] = $this->normalizeCustomParametersInput($payload['custom_parameters'] ?? []);
+    $payload['use_soft_delete'] = (bool) ($payload['use_soft_delete'] ?? false);
 
     return response()->json($payload);
   }
@@ -473,6 +497,9 @@ class DataSourceController extends Controller
     }
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
+      'use_soft_delete' => $request->has('use_soft_delete')
+        ? filter_var($request->input('use_soft_delete'), FILTER_VALIDATE_BOOLEAN)
+        : ($dataSource->use_soft_delete ?? false),
       'columns' => $this->normalizeColumnsInput($request->input('columns')),
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
       'response_type' => $this->normalizeResponseType($request->input('response_type', $dataSource->response_type ?? 'array')),
@@ -482,6 +509,7 @@ class DataSourceController extends Controller
     $validated = $request->validate([
       'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
+      'use_soft_delete' => ['nullable', 'boolean'],
       'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
       'table_name' => [
         'nullable',
@@ -569,11 +597,17 @@ class DataSourceController extends Controller
       }
     }
 
+    $validated['use_soft_delete'] = (bool) ($validated['use_soft_delete'] ?? $dataSource->use_soft_delete ?? false);
+    if ((bool) $validated['use_custom_query']) {
+      $validated['use_soft_delete'] = false;
+    }
+
 
     $dataSource->update([
       'name' => $validated['name'],
       'table_name' => $validated['table_name']??'',
       'use_custom_query' => $validated['use_custom_query'],
+      'use_soft_delete' => $validated['use_soft_delete'],
       'columns' => $validated['columns'],
       'custom_query' => $validated['custom_query'] ?? null,
       'middlewares' => $validated['middlewares'] ?? null,
@@ -1136,8 +1170,14 @@ class DataSourceController extends Controller
       try {
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
         $columnList = $this->databaseMetadataProvider->listColumns((string) $table, $connectionName);
+        $hasDeletedAt = $this->tableHasColumn((string) $table, 'deleted_at', $connectionName, $columnList);
 
-        return response()->json(['data' => $columnList]);
+        return response()->json([
+          'data' => $columnList,
+          'meta' => [
+            'has_deleted_at' => $hasDeletedAt,
+          ],
+        ]);
       } catch (\Exception $e) {
         return response()->json(['error' => 'Table not found'], 404);
       }
@@ -1163,6 +1203,19 @@ class DataSourceController extends Controller
       }
 
       [$dataSource, $routeParameters, $cacheKeySuffix] = $dataSourceMatch;
+
+      $routeParameterNames = array_keys($routeParameters);
+      $request->attributes->set('datasources.data_source_code', (string) $id);
+      $request->attributes->set('datasources.route_pattern', (string) $dataSource->name);
+      $request->attributes->set('datasources.detected_parameters', $routeParameterNames);
+      $request->attributes->set('datasources.route_parameter_names', $routeParameterNames);
+
+      Log::debug('DataSource route resolution', [
+        'dataSourceCode' => (string) $id,
+        'routePattern' => (string) $dataSource->name,
+        'detectedParameters' => $routeParameters,
+        'request_all' => $request->all(),
+      ]);
 
       if ($routeParameters !== []) {
         $request->merge($routeParameters);
@@ -1213,7 +1266,9 @@ class DataSourceController extends Controller
       return [false, []];
     }
 
-    if (strpos($template, '{') === false) {
+    $routeParameters = $this->extractRouteTemplateParameters($template);
+
+    if ($routeParameters === []) {
       return [$template === $path, []];
     }
 
@@ -1233,7 +1288,7 @@ class DataSourceController extends Controller
         return [false, []];
       }
 
-      if (preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment, $matches) === 1) {
+      if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment, $matches) === 1) {
         $parameters[$matches[1]] = $pathSegment;
         continue;
       }
@@ -1246,6 +1301,26 @@ class DataSourceController extends Controller
     return [true, $parameters];
   }
 
+  protected function extractRouteTemplateParameters(string $template): array
+  {
+    $template = trim($template, '/');
+
+    if ($template === '') {
+      return [];
+    }
+
+    $segments = explode('/', $template);
+    $parameters = [];
+
+    foreach ($segments as $segment) {
+      if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment, $matches) === 1) {
+        $parameters[] = $matches[1];
+      }
+    }
+
+    return array_values(array_unique($parameters));
+  }
+
   protected function validateRouteTemplate(string $template): ?string
   {
     $template = trim($template, '/');
@@ -1255,6 +1330,19 @@ class DataSourceController extends Controller
     }
 
     $segments = explode('/', $template);
+    $routeParameters = $this->extractRouteTemplateParameters($template);
+
+    if ($routeParameters === []) {
+      if (str_contains($template, '{') || str_contains($template, '}')) {
+        return 'The name field must contain balanced route parameters like {id}.';
+      }
+
+      return null;
+    }
+
+    if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segments[0] ?? '') === 1) {
+      return 'Route URL must contain a fixed path prefix before route parameters.';
+    }
 
     foreach ($segments as $segment) {
       if ($segment === '') {
@@ -1262,7 +1350,7 @@ class DataSourceController extends Controller
       }
 
       if (str_contains($segment, '{') || str_contains($segment, '}')) {
-        if (! preg_match('/^\{([A-Za-z_][A-Za-z0-9_]*)\}$/', $segment)) {
+        if (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment) !== 1) {
           return 'The name field must contain balanced route parameters like {id}.';
         }
       }
@@ -1276,6 +1364,32 @@ class DataSourceController extends Controller
     $normalized = strtolower(trim((string) $value));
 
     return in_array($normalized, ['array', 'object'], true) ? $normalized : 'array';
+  }
+
+  /**
+   * Determine whether a table contains a given column.
+   *
+   * @param array<int, array<string, mixed>>|null $columns
+   */
+  protected function tableHasColumn(string $tableName, string $columnName, ?string $connectionName = null, ?array $columns = null): bool
+  {
+    try {
+      $columns ??= $this->databaseMetadataProvider->listColumns($tableName, $connectionName);
+    } catch (\Throwable $e) {
+      return false;
+    }
+
+    foreach ($columns as $column) {
+      if (! is_array($column)) {
+        continue;
+      }
+
+      if (strtolower((string) ($column['name'] ?? '')) === strtolower($columnName)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   protected function sanitizeCacheKeySuffix(string $value): string

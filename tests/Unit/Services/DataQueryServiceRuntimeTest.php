@@ -3,6 +3,8 @@
 namespace ESolution\DataSources\Tests\Unit\Services;
 
 use ESolution\DataSources\Contracts\DatabaseDriver;
+use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Models\ApiTable;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
@@ -70,6 +72,224 @@ class DataQueryServiceRuntimeTest extends TestCase
 
         $this->assertSame('invoices', $definition['table_name']);
         $this->assertSame(['id', 'name'], $definition['columns']);
+    }
+
+    public function test_it_prefers_merged_request_input_over_route_parameter_for_id_placeholder(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/product/1', 'GET', [
+            'id' => 1,
+        ]);
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'id' ? 'product' : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['id' => 'product'];
+                }
+            };
+        });
+
+        $result = $service->exposeApplyRouteParameterPlaceholders(
+            'SELECT id, name, code FROM es_products WHERE id = {id}',
+            $request
+        );
+
+        $this->assertSame(
+            "SELECT id, name, code FROM es_products WHERE id = 1",
+            $result
+        );
+    }
+
+    public function test_it_only_replaces_braced_route_placeholders(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/api/data-source/product/123', 'GET', [
+            'product_id' => 123,
+        ]);
+
+        $sql = "SELECT 'd-invoice' AS route_name, id FROM products WHERE id = {product_id}";
+
+        $result = $service->exposeApplyRouteParameterPlaceholders($sql, $request);
+
+        $this->assertSame(
+            "SELECT 'd-invoice' AS route_name, id FROM products WHERE id = '123'",
+            $result
+        );
+    }
+
+    public function test_it_ignores_route_parameters_when_they_are_not_whitelisted(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/api/data-source/d-invoice', 'GET');
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'id' ? 'd-invoice' : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['id' => 'd-invoice'];
+                }
+            };
+        });
+
+        $this->assertNull($service->exposeResolveRequestValue($request, 'id'));
+    }
+
+    public function test_it_allows_route_parameters_when_they_are_explicitly_whitelisted(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $request = Request::create('/api/data-source/product/123', 'GET');
+        $request->attributes->set('datasources.route_parameter_names', ['product_id']);
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'product_id' ? 123 : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['product_id' => 123];
+                }
+            };
+        });
+
+        $this->assertSame(123, $service->exposeResolveRequestValue($request, 'product_id'));
+    }
+
+    public function test_it_does_not_apply_a_route_value_as_a_filter_for_plain_datasource_urls(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            true
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->use_soft_delete = 1;
+        $dataSource->table_name = 'es_direct_invoice';
+        $dataSource->columns = ['id', 'customer_name', 'reff_no', 'grand_total'];
+        $dataSource->setRelation('parameters', new Collection([
+            (object) [
+                'param_name' => 'id',
+                'param_type' => 'string',
+                'is_required' => 0,
+                'param_default_value' => null,
+                'operator' => '=',
+            ],
+        ]));
+
+        $request = Request::create('/api/data-source/d-invoice', 'GET');
+        $request->setRouteResolver(static function () {
+            return new class {
+                public function parameter(string $key): mixed
+                {
+                    return $key === 'id' ? 'd-invoice' : null;
+                }
+
+                public function parameters(): array
+                {
+                    return ['id' => 'd-invoice'];
+                }
+            };
+        });
+
+        $service->executeForDataSource($request, $dataSource, 'datasource_q_plain');
+
+        $this->assertStringContainsString('FROM es_direct_invoice WHERE 1=1 AND deleted_at IS NULL', $service->capturedQuery);
+        $this->assertStringNotContainsString("AND id = 'd-invoice'", $service->capturedQuery);
+    }
+
+    public function test_it_wraps_object_response_data_when_record_exists(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $response = $service->exposeApplyResponseType([
+            (object) [
+                'id' => 189,
+                'name' => 'barang test',
+                'code' => 'bar002',
+            ],
+        ], 'object');
+
+        $this->assertSame(
+            '{"data":{"id":189,"name":"barang test","code":"bar002"}}',
+            json_encode($response)
+        );
+    }
+
+    public function test_it_returns_empty_object_data_and_message_when_object_response_is_missing(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $response = $service->exposeApplyResponseType([], 'object');
+
+        $this->assertSame(
+            '{"data":{},"message":"Data not found"}',
+            json_encode($response)
+        );
+    }
+
+    public function test_it_propagates_soft_delete_flag_for_api_builder_parent_tables(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
+        );
+
+        $apiConfig = new ApiConfig();
+        $parentTable = new ApiTable([
+            'table_name' => 'products',
+            'primary_key' => 'id',
+            'use_soft_delete' => true,
+        ]);
+        $apiConfig->setRelation('parentTable', $parentTable);
+        $apiConfig->setRelation('childTables', new Collection([]));
+        $apiConfig->params = [];
+
+        $service->executeForApiConfig(new Request(), $apiConfig, 'api_config_soft_delete');
+
+        $this->assertTrue($service->capturedDefinition['use_soft_delete']);
+        $this->assertSame('products', $service->capturedDefinition['table_name']);
     }
 
     public function test_it_formats_select_columns_for_mysql_and_preserves_raw_expressions(): void
@@ -151,6 +371,50 @@ class DataQueryServiceRuntimeTest extends TestCase
             'SELECT * FROM (SELECT id FROM products) AS tableCustom WHERE 1=1',
             $selectQuery
         );
+    }
+
+    public function test_it_appends_soft_delete_filter_for_select_table_when_deleted_at_exists(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            true
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->use_soft_delete = 1;
+        $dataSource->table_name = 'products';
+        $dataSource->columns = ['id', 'name'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $service->executeForDataSource(new Request(), $dataSource, 'datasource_q_soft_delete_enabled');
+
+        $this->assertStringContainsString('WHERE 1=1 AND deleted_at IS NULL', $service->capturedQuery);
+        $this->assertStringContainsString('WHERE 1=1 AND deleted_at IS NULL', $service->capturedQueryCount);
+    }
+
+    public function test_it_skips_soft_delete_filter_when_deleted_at_is_missing(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            false
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->use_soft_delete = 1;
+        $dataSource->table_name = 'products';
+        $dataSource->columns = ['id', 'name'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $service->executeForDataSource(new Request(), $dataSource, 'datasource_q_soft_delete_disabled');
+
+        $this->assertStringNotContainsString('deleted_at IS NULL', $service->capturedQuery);
+        $this->assertStringNotContainsString('deleted_at IS NULL', $service->capturedQueryCount);
     }
 
     public function test_it_maps_ilike_operator_to_driver_specific_sql(): void
@@ -336,6 +600,21 @@ class CapturingDataQueryService extends DataQueryService
         return $this->buildFilterClause($field, $operator, $value);
     }
 
+    public function exposeApplyRouteParameterPlaceholders(string $query, Request $request): string
+    {
+        return $this->applyRouteParameterPlaceholders($query, $request);
+    }
+
+    public function exposeApplyResponseType(mixed $result, string $responseType): mixed
+    {
+        return $this->applyResponseType($result, $responseType);
+    }
+
+    public function exposeResolveRequestValue(Request $request, string $name): mixed
+    {
+        return $this->resolveRequestValue($request, $name);
+    }
+
     protected function quoteSqlValue(mixed $value): string
     {
         if ($value === null) {
@@ -351,6 +630,34 @@ class CapturingDataQueryService extends DataQueryService
         }
 
         return "'" . str_replace("'", "''", (string) $value) . "'";
+    }
+}
+
+class SoftDeleteCapturingDataQueryService extends DataQueryService
+{
+    public string $capturedQuery = '';
+    public string $capturedQueryCount = '';
+
+    public function __construct(
+        DynamicVariableParser $runtimeVariableParser,
+        ExecutionConnectionResolver $executionConnectionResolver,
+        ?DatabaseDriverResolver $databaseDriverResolver = null,
+        private readonly bool $tableHasDeletedAt = true
+    ) {
+        parent::__construct($runtimeVariableParser, $executionConnectionResolver, $databaseDriverResolver);
+    }
+
+    protected function runQueryDirectly(mixed $queryCount, mixed $query, Request $request, array $definition): array|Collection|\Illuminate\Pagination\LengthAwarePaginator
+    {
+        $this->capturedQuery = (string) $query;
+        $this->capturedQueryCount = (string) $queryCount;
+
+        return ['data' => []];
+    }
+
+    protected function tableHasColumn(string $tableName, string $columnName): bool
+    {
+        return $this->tableHasDeletedAt && strtolower($columnName) === 'deleted_at';
     }
 }
 

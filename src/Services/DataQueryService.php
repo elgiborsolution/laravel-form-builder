@@ -6,6 +6,7 @@ use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use ESolution\DataSources\Support\FilterOperatorResolver;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
@@ -15,6 +16,7 @@ use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 
 class DataQueryService
@@ -49,10 +51,11 @@ class DataQueryService
                         'type' => $param->param_type,
                         'required' => (bool) $param->is_required,
                         'default' => $this->parseRuntimeValue($param->param_default_value),
-                        'operator' => $param->operator ?? '=',
+                        'operator' => $param->operator ?? FilterOperatorResolver::resolve((string) $param->param_type),
                     ];
                 })->all(),
                 'use_custom_query' => (bool) $dataSource->use_custom_query,
+                'use_soft_delete' => (bool) $dataSource->use_soft_delete,
                 'custom_query' => $this->parseRuntimeValue($dataSource->custom_query),
                 'table_name' => $this->parseRuntimeValue($dataSource->table_name),
                 'columns' => $this->normalizeColumns($dataSource->columns),
@@ -94,6 +97,7 @@ class DataQueryService
                 'table_name' => $parentTable?->table_name ?? '',
                 'columns' => $this->columnsFromApiConfig($apiConfig),
                 'debug_index_table' => $parentTable?->table_name ?? '',
+                'use_soft_delete' => (bool) ($parentTable?->use_soft_delete ?? false),
             ];
 
             return $this->execute($request, $definition);
@@ -168,7 +172,29 @@ class DataQueryService
                 return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
             }
 
+            $softDeleteClause = $this->resolveSoftDeleteClause($definition);
+
             [$queryCount, $query] = $this->buildBaseQueries($definition);
+
+            if ($softDeleteClause !== '') {
+                $queryCount .= $softDeleteClause;
+                $query .= $softDeleteClause;
+            }
+
+            Log::debug('DataSource query build', [
+                'identifier' => $definition['identifier'] ?? null,
+                'dataSourceCode' => $request->attributes->get('datasources.data_source_code'),
+                'routePattern' => $request->attributes->get('datasources.route_pattern'),
+                'detectedParameters' => $request->attributes->get('datasources.detected_parameters', []),
+                'original_sql_count' => $queryCount,
+                'original_sql' => $query,
+                'route_params' => $request->route() ? $request->route()->parameters() : [],
+                'request_params' => $request->all(),
+                'request_all' => $request->all(),
+                'detected_placeholders' => $this->extractCustomParameterNames($query),
+                'bindings' => [],
+            ]);
+
             $appliedFilters = [];
 
             foreach ($definition['parameters'] as $parameter) {
@@ -225,6 +251,16 @@ class DataQueryService
                 return response()->json(['error' => $result['error'], 'message' => $result['error']], 400);
             }
 
+            Log::debug('DataSource query final', [
+                'identifier' => $definition['identifier'] ?? null,
+                'dataSourceCode' => $request->attributes->get('datasources.data_source_code'),
+                'routePattern' => $request->attributes->get('datasources.route_pattern'),
+                'detectedParameters' => $request->attributes->get('datasources.detected_parameters', []),
+                'final_sql_count' => $queryCount,
+                'final_sql' => $query,
+                'bindings' => [],
+            ]);
+
             return response()->json($this->applyResponseType($result, (string) ($definition['response_type'] ?? 'array')));
         } catch (InvalidRuntimeVariableException $e) {
             return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
@@ -252,6 +288,48 @@ class DataQueryService
             "SELECT count(*) as aggregate FROM {$definition['table_name']} WHERE 1=1",
             "SELECT {$columns} FROM {$definition['table_name']} WHERE 1=1",
         ];
+    }
+
+    /**
+     * Build the soft delete clause when the selected table supports deleted_at filtering.
+     */
+    protected function resolveSoftDeleteClause(array $definition): string
+    {
+        if (empty($definition['use_soft_delete']) || ! empty($definition['custom_query'])) {
+            return '';
+        }
+
+        $tableName = trim((string) ($definition['table_name'] ?? ''));
+
+        if ($tableName === '' || ! $this->tableHasColumn($tableName, 'deleted_at')) {
+            return '';
+        }
+
+        return ' AND deleted_at IS NULL';
+    }
+
+    /**
+     * Determine whether a table includes a specific column.
+     */
+    protected function tableHasColumn(string $tableName, string $columnName): bool
+    {
+        try {
+            $columns = $this->databaseMetadataProvider->listColumns($tableName, $this->executionConnectionName);
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        foreach ($columns as $column) {
+            if (! is_array($column)) {
+                continue;
+            }
+
+            if (strtolower((string) ($column['name'] ?? '')) === strtolower($columnName)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -306,19 +384,33 @@ class DataQueryService
      */
     protected function applyRouteParameterPlaceholders(string $query, Request $request): string
     {
+        $pattern = '/\{([a-zA-Z0-9_]+)\}/';
+
+        if (preg_match($pattern, $query) !== 1) {
+            return $query;
+        }
+
         return preg_replace_callback(
-            '/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/',
+            $pattern,
             function (array $matches) use ($request): string {
                 $key = $matches[1];
-                $value = $request->route($key);
+                $value = $request->input($key);
 
                 if ($value === null || $value === '') {
-                    $value = $request->input($key);
+                    $value = $request->route($key);
                 }
 
                 if ($value === null || $value === '') {
                     throw new \InvalidArgumentException("Missing route parameter: {$key}");
                 }
+
+                Log::debug('DataSource route placeholder resolved', [
+                    'field' => $key,
+                    'value' => $value,
+                    'source' => $request->input($key) !== null && $request->input($key) !== ''
+                        ? 'request_input'
+                        : 'route_parameter',
+                ]);
 
                 return $this->quoteSqlValue($value);
             },
@@ -339,6 +431,12 @@ class DataQueryService
         $definitions = $this->normalizeCustomParameters($customParameters);
         $usedParameters = $this->extractCustomParameterNames($query);
 
+        Log::debug('DataSource custom placeholder scan', [
+            'query' => $query,
+            'detected_placeholders' => $usedParameters,
+            'custom_parameters' => array_keys($definitions),
+        ]);
+
         foreach ($usedParameters as $name) {
             if (! array_key_exists($name, $definitions)) {
                 throw new \InvalidArgumentException("Custom parameter \"{$name}\" is not defined.");
@@ -355,7 +453,7 @@ class DataQueryService
                     throw new \InvalidArgumentException("Custom parameter \"{$name}\" is not defined.");
                 }
 
-                $value = $request->query($name);
+                $value = $this->resolveRequestValue($request, $name);
 
                 if (($value === null || $value === '') && array_key_exists('default', $definition)) {
                     $value = $definition['default'];
@@ -367,6 +465,11 @@ class DataQueryService
 
                 $value = $this->parseRuntimeValue($value);
                 $value = $this->formatCustomParameterValue($definition['type'] ?? 'string', $value);
+
+                Log::debug('DataSource custom placeholder resolved', [
+                    'field' => $name,
+                    'value' => $value,
+                ]);
 
                 return $this->quoteSqlValue($value);
             },
@@ -383,13 +486,39 @@ class DataQueryService
      */
     protected function requestHasCustomParameter(Request $request, string $name): bool
     {
-        $value = $request->query($name);
-
-        if ($value === null || $value === '') {
-            $value = $request->input($name);
-        }
+        $value = $this->resolveRequestValue($request, $name);
 
         return $value !== null && $value !== '';
+    }
+
+    /**
+     * Resolve a request value with route parameters taking precedence.
+     *
+     * @param Request $request
+     * @param string $name
+     * @return mixed
+     */
+    protected function resolveRequestValue(Request $request, string $name): mixed
+    {
+        $value = $request->input($name);
+
+        if ($value !== null && $value !== '') {
+            return $value;
+        }
+
+        $allowedRouteParameters = $request->attributes->get('datasources.route_parameter_names', []);
+
+        if (! is_array($allowedRouteParameters) || ! in_array($name, $allowedRouteParameters, true)) {
+            return $request->query($name);
+        }
+
+        $value = $request->route($name);
+
+        if ($value !== null && $value !== '') {
+            return $value;
+        }
+
+        return $request->query($name);
     }
 
     /**
@@ -405,6 +534,25 @@ class DataQueryService
         }
 
         preg_match_all('/(?<!:):([A-Za-z_][A-Za-z0-9_]*)\b/', $query, $matches);
+
+        $names = $matches[1] ?? [];
+
+        return array_values(array_unique(array_filter($names, static fn ($name) => is_string($name) && trim($name) !== '')));
+    }
+
+    /**
+     * Extract route-style placeholders from a SQL string.
+     *
+     * @param string $query
+     * @return array<int, string>
+     */
+    protected function extractRoutePlaceholders(string $query): array
+    {
+        if ($query === '') {
+            return [];
+        }
+
+        preg_match_all('/(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})/', $query, $matches);
 
         $names = $matches[1] ?? [];
 
@@ -654,15 +802,15 @@ class DataQueryService
     protected function validateDetail(Request $request): ?JsonResponse
     {
         foreach ($this->incomingFilters($request) as $key => $value) {
+            $resolvedOperator = $this->resolveIncomingFilterOperator($value);
             $normalizedFilter = [
                 'field' => $value['field'] ?? $value['param_name'] ?? $value['name'] ?? null,
-                'operator' => $value['operator'] ?? $value['param_operation'] ?? null,
+                'operator' => $resolvedOperator,
                 'value' => $value['value'] ?? $value['param_value'] ?? null,
             ];
 
             $validator = Validator::make($normalizedFilter, [
                 'field' => 'required',
-                'operator' => 'required',
                 'value' => 'required',
             ]);
 
@@ -673,16 +821,31 @@ class DataQueryService
                 ], 400);
             }
 
-            $operator = strtoupper((string) $normalizedFilter['operator']);
-            if (! in_array($operator, self::ALLOWED_FILTER_OPERATORS, true)) {
+            if (! in_array($normalizedFilter['operator'], self::ALLOWED_FILTER_OPERATORS, true)) {
                 return response()->json([
-                    'error' => "Invalid filter operator: {$operator}",
-                    'message' => "Invalid filter operator: {$operator}",
+                    'error' => "Invalid filter operator: {$normalizedFilter['operator']}",
+                    'message' => "Invalid filter operator: {$normalizedFilter['operator']}",
                 ], 400);
             }
         }
 
         return null;
+    }
+
+    /**
+     * Resolve an operator from the incoming filter payload.
+     *
+     * Legacy payloads that still send `param_operation` are supported, but
+     * type-based resolution is preferred for new configurations.
+     *
+     * @param array<string, mixed> $filter
+     * @return string
+     */
+    protected function resolveIncomingFilterOperator(array $filter): string
+    {
+        $type = trim((string) ($filter['type'] ?? $filter['param_type'] ?? ''));
+
+        return $type !== '' ? FilterOperatorResolver::resolve($type) : '=';
     }
 
     /**
@@ -721,17 +884,14 @@ class DataQueryService
      */
     protected function resolveFilterValue(Request $request, string $field, mixed $default = null): mixed
     {
-        $value = $request->query($field);
-
-        if ($value === null) {
-            $value = $request->input($field);
-        }
+        $value = $this->resolveRequestValue($request, $field);
 
         if ($value !== null && $value !== '') {
             return $value;
         }
 
         $rawFilter = $this->findFilterDefinition($request, $field);
+
         if (is_array($rawFilter)) {
             if (array_key_exists('value', $rawFilter) && $rawFilter['value'] !== null && $rawFilter['value'] !== '') {
                 return $rawFilter['value'];
@@ -931,20 +1091,33 @@ class DataQueryService
         }
 
         if (! is_array($data)) {
-            return (object) [];
+            return [
+                'data' => (object) [],
+                'message' => 'Data not found',
+            ];
+        }
+
+        if ($data === [] || count($data) === 0) {
+            return [
+                'data' => (object) [],
+                'message' => 'Data not found',
+            ];
         }
 
         $first = $data[0] ?? null;
 
         if (is_array($first)) {
-            return $first;
+            return ['data' => $first];
         }
 
         if (is_object($first)) {
-            return $first;
+            return ['data' => $first];
         }
 
-        return (object) [];
+        return [
+            'data' => (object) [],
+            'message' => 'Data not found',
+        ];
     }
 
     protected function columnsFromApiConfig(ApiConfig $apiConfig): array

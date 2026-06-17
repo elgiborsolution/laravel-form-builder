@@ -5,6 +5,7 @@ use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Models\ApiHook;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
@@ -15,10 +16,13 @@ use Illuminate\Support\Facades\Validator;
 use ESolution\DataSources\Models\ApiTable;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
 use Illuminate\Support\Str;
 
 class DataAPIBuilderController extends Controller
 {
+    use AppliesSearchFilter;
+
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DynamicVariableParser $runtimeVariableParser
@@ -34,13 +38,13 @@ class DataAPIBuilderController extends Controller
 
       public function index(Request $request)
       {
+        $search = trim((string) $request->query('search', ''));
 
-        $dataApiBuilder = Cache::remember($this->cacheKey('list-api-configs'), 60, function (){
-                return  ApiConfig::on(DatabaseConnection::configuredName())
-                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
-                    ->get()
-                    ->toArray();
-        });
+        $dataApiBuilder = $search !== ''
+            ? $this->loadApiConfigs($request)
+            : Cache::remember($this->cacheKey('list-api-configs'), 60, function () use ($request) {
+                return $this->loadApiConfigs($request);
+            });
 
           return response()->json(['data' => $dataApiBuilder], 200);
       }
@@ -819,19 +823,25 @@ class DataAPIBuilderController extends Controller
 
     protected function syncApiConfigRelations(ApiConfig $config, array $payload): void
     {
-        $config->loadMissing('parentTable');
+        $config->loadMissing('parentTable', 'childTables');
         $parentTable = $config->parentTable;
 
         if (array_key_exists('parent_table', $payload)) {
             if (is_array($payload['parent_table']) && ! empty($payload['parent_table'])) {
+                $parentTableName = $this->extractParentTableName($payload, 'syncApiConfigRelations');
+                $parentSoftDelete = array_key_exists('use_soft_delete', $payload['parent_table'])
+                    ? (bool) $payload['parent_table']['use_soft_delete']
+                    : ($parentTable?->use_soft_delete ?? $this->tableHasDeletedAt($parentTableName));
+
                 $parentTable = $config->parentTable()->updateOrCreate(
                     ['api_config_id' => $config->id],
                     [
                         'parent_id' => 0,
-                        'table_name' => $payload['parent_table']['table_name'] ?? '',
+                        'table_name' => $parentTableName,
                         'primary_key' => $payload['parent_table']['primary_key'] ?? 'id',
                         'foreign_key' => $payload['parent_table']['foreign_key'] ?? null,
                         'data_params' => $payload['parent_table']['data_params'] ?? [],
+                        'use_soft_delete' => $parentSoftDelete,
                     ]
                 );
             } elseif ($config->parentTable) {
@@ -841,6 +851,7 @@ class DataAPIBuilderController extends Controller
         }
 
         if (array_key_exists('child_tables', $payload)) {
+            $existingChildren = $config->childTables;
             $config->childTables()->delete();
 
             if (is_array($payload['child_tables']) && $payload['child_tables'] !== []) {
@@ -849,14 +860,29 @@ class DataAPIBuilderController extends Controller
 
                 foreach ($payload['child_tables'] as $childTable) {
                     if (! is_array($childTable)) {
+                        $this->logTableNameAccess('syncApiConfigRelations.child_tables.invalid_row', $childTable);
                         continue;
                     }
 
+                    $childTableName = $this->extractChildTableName($childTable, 'syncApiConfigRelations', allowBlankPlaceholder: true);
+
+                    if ($childTableName === null) {
+                        continue;
+                    }
+
+                    $existingChild = $existingChildren
+                        ? $existingChildren->firstWhere('table_name', $childTableName)
+                        : null;
+                    $childSoftDelete = array_key_exists('use_soft_delete', $childTable)
+                        ? (bool) $childTable['use_soft_delete']
+                        : ($existingChild?->use_soft_delete ?? $this->tableHasDeletedAt($childTableName));
+
                     $children[] = new ApiTable([
                         'parent_id' => $parentId,
-                        'table_name' => $childTable['table_name'] ?? '',
+                        'table_name' => $childTableName,
                         'foreign_key' => $childTable['foreign_key'] ?? null,
                         'data_params' => $childTable['data_params'] ?? [],
+                        'use_soft_delete' => $childSoftDelete,
                     ]);
                 }
 
@@ -973,7 +999,135 @@ class DataAPIBuilderController extends Controller
             'primary_key' => $table->primary_key,
             'foreign_key' => $table->foreign_key,
             'data_params' => $table->data_params,
+            'use_soft_delete' => (bool) $table->use_soft_delete,
         ];
+    }
+
+    /**
+     * Check whether a table exposes a deleted_at column.
+     */
+    protected function tableHasDeletedAt(string $tableName): bool
+    {
+        $tableName = trim($tableName);
+
+        if ($tableName === '') {
+            return false;
+        }
+
+        try {
+            $columns = DatabaseConnection::schema()->getColumnListing($tableName);
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        return in_array('deleted_at', $columns, true);
+    }
+
+    protected function logTableNameAccess(string $context, mixed $container, array $meta = []): void
+    {
+        $payload = [
+            'context' => $context,
+            'container_type' => get_debug_type($container),
+            'keys' => is_array($container) ? array_values(array_map('strval', array_keys($container))) : [],
+            'has_table_name' => is_array($container) && array_key_exists('table_name', $container),
+        ];
+
+        \Log::debug('API Builder table_name access', array_merge($payload, $meta));
+
+        if (! $payload['has_table_name']) {
+            \Log::warning('API Builder missing table_name before access', array_merge($payload, $meta));
+        }
+    }
+
+    protected function extractParentTableName(array $payload, string $context): string
+    {
+        $parentTable = $payload['parent_table'] ?? null;
+
+        if (! is_array($parentTable)) {
+            $this->logTableNameAccess($context . '.parent_table.invalid_container', $parentTable);
+
+            throw ValidationException::withMessages([
+                'parent_table' => 'The parent_table field must be an array.',
+            ]);
+        }
+
+        $this->logTableNameAccess($context . '.parent_table', $parentTable);
+
+        $tableName = trim((string) ($parentTable['table_name'] ?? ''));
+
+        if ($tableName === '') {
+            throw ValidationException::withMessages([
+                'parent_table.table_name' => 'The parent table_name field is required.',
+            ]);
+        }
+
+        return $tableName;
+    }
+
+    protected function extractChildTableName(
+        array $childTable,
+        string $context,
+        int|string|null $index = null,
+        bool $allowBlankPlaceholder = false
+    ): ?string {
+        $this->logTableNameAccess($context . '.child_table', $childTable, ['index' => $index]);
+
+        $tableName = trim((string) ($childTable['table_name'] ?? ''));
+
+        if ($tableName !== '') {
+            return $tableName;
+        }
+
+        if ($allowBlankPlaceholder && $this->isEmptyChildTableRow($childTable)) {
+            \Log::info('API Builder skipped empty child table row', [
+                'context' => $context,
+                'index' => $index,
+                'keys' => array_values(array_map('strval', array_keys($childTable))),
+            ]);
+
+            return null;
+        }
+
+        throw ValidationException::withMessages([
+            'child_tables' . ($index !== null ? '.' . $index : '') . '.table_name' => 'The child table_name field is required.',
+        ]);
+    }
+
+    protected function isEmptyChildTableRow(array $childTable): bool
+    {
+        $tableName = trim((string) ($childTable['table_name'] ?? ''));
+        $foreignKey = trim((string) ($childTable['foreign_key'] ?? ''));
+        $dataParams = $childTable['data_params'] ?? null;
+        $useSoftDelete = $childTable['use_soft_delete'] ?? null;
+
+        return $tableName === ''
+            && $foreignKey === ''
+            && ($dataParams === null || $dataParams === [] || $dataParams === '')
+            && ($useSoftDelete === null || $useSoftDelete === '' || $useSoftDelete === false);
+    }
+
+    protected function logApiConfigPayload(string $context, array $payload): void
+    {
+        \Log::info('API Builder payload audit', [
+            'context' => $context,
+            'payload_keys' => array_values(array_map('strval', array_keys($payload))),
+            'payload' => $payload,
+            'parent_table' => $payload['parent_table'] ?? null,
+            'child_tables' => $payload['child_tables'] ?? null,
+        ]);
+    }
+
+    protected function buildNestedApiConfigPayload(array $validated, Request $request): array
+    {
+        $payload = $validated;
+        $payload['parent_table'] = is_array($request->input('parent_table'))
+            ? $request->input('parent_table')
+            : [];
+        $payload['child_tables'] = is_array($request->input('child_tables'))
+            ? $request->input('child_tables')
+            : [];
+
+        return $payload;
     }
 
     /**
@@ -1116,6 +1270,8 @@ class DataAPIBuilderController extends Controller
     
   public function store(Request $request)
   {
+     $this->logApiConfigPayload('store.incoming_request', $request->all());
+
      $request->merge([
         'method' => strtoupper((string) $request->input('method')),
         'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
@@ -1147,7 +1303,16 @@ class DataAPIBuilderController extends Controller
       'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
       'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
       'parent_table' => 'required|array',
+      'parent_table.table_name' => 'required|string',
+      'parent_table.primary_key' => 'nullable|string',
+      'parent_table.foreign_key' => 'nullable|string',
+      'parent_table.data_params' => 'nullable|array',
+      'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
+      'child_tables.*.table_name' => 'nullable|string',
+      'child_tables.*.foreign_key' => 'nullable|string',
+      'child_tables.*.data_params' => 'nullable|array',
+      'child_tables.*.use_soft_delete' => 'nullable|boolean',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
@@ -1159,6 +1324,10 @@ class DataAPIBuilderController extends Controller
       'generate_before_execute_hook' => 'nullable|boolean',
       'before_execute_hook_path' => 'nullable|string',
     ]);
+
+    $this->logApiConfigPayload('store.validated_payload', $validated);
+    $payload = $this->buildNestedApiConfigPayload($validated, $request);
+    $this->logApiConfigPayload('store.parsed_payload', $payload);
 
 
     $invalid = $this->validateDetail($request);
@@ -1189,31 +1358,7 @@ class DataAPIBuilderController extends Controller
               ),
             ]);
 
-            $parentTable = new ApiTable([
-                'parent_id' => 0,
-                'table_name' => $validated['parent_table']['table_name'],
-                'primary_key' => $validated['parent_table']['primary_key']??'id',
-                'data_params' => ($validated['parent_table']['data_params']??[]),
-            ]);
-
-            $dataApiBuilder->parentTable()->save($parentTable);
-
-            $dataChildTable = [];
-            foreach ($validated['child_tables']??[] as $key => $value) {
-              $dataChild = new ApiTable([
-                              'parent_id' => $dataApiBuilder->parentTable->id,
-                              'table_name' => $value['table_name'],
-                              'foreign_key' => $value['foreign_key'],
-                              'data_params' => ($value['data_params']??[]),
-                          ]);
-
-              $dataChildTable[] = $dataChild;
-            }
-          // dd($validated['child_tables']);
-            if(count($dataChildTable) > 0){
-              $dataApiBuilder->childTables()->saveMany($dataChildTable);
-
-            }
+            $this->syncApiConfigRelations($dataApiBuilder, $payload);
 
             $listenerName = $this->getListenerName($validated['route_name'], 1);
             $generateListener = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
@@ -1315,6 +1460,8 @@ class DataAPIBuilderController extends Controller
     
   public function update(Request $request, $id)
   {
+     $this->logApiConfigPayload('update.incoming_request', $request->all());
+
      $request->merge([
         'method' => strtoupper((string) $request->input('method')),
         'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
@@ -1334,6 +1481,7 @@ class DataAPIBuilderController extends Controller
     if (empty($dataApiBuilder)) {
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
     }
+    $dataApiBuilder->loadMissing('parentTable', 'childTables');
 
     $originalEndpoint = $dataApiBuilder->endpoint;
     $originalMethod = $dataApiBuilder->method;
@@ -1355,7 +1503,16 @@ class DataAPIBuilderController extends Controller
       'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
       'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
       'parent_table' => 'required|array',
+      'parent_table.table_name' => 'required|string',
+      'parent_table.primary_key' => 'nullable|string',
+      'parent_table.foreign_key' => 'nullable|string',
+      'parent_table.data_params' => 'nullable|array',
+      'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
+      'child_tables.*.table_name' => 'nullable|string',
+      'child_tables.*.foreign_key' => 'nullable|string',
+      'child_tables.*.data_params' => 'nullable|array',
+      'child_tables.*.use_soft_delete' => 'nullable|boolean',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
@@ -1366,6 +1523,10 @@ class DataAPIBuilderController extends Controller
       'generate_before_execute_hook' => 'nullable|boolean',
       'before_execute_hook_path' => 'nullable|string',
     ]);
+
+    $this->logApiConfigPayload('update.validated_payload', $validated);
+    $payload = $this->buildNestedApiConfigPayload($validated, $request);
+    $this->logApiConfigPayload('update.parsed_payload', $payload);
 
     $invalid = $this->validateDetail($request);
 
@@ -1392,33 +1553,7 @@ class DataAPIBuilderController extends Controller
               'middlewares' => $this->normalizeMiddlewares($validated['middlewares'] ?? null),
             ]);
 
-            $parentTable = [
-                'parent_id' => 0,
-                'table_name' => $validated['parent_table']['table_name'],
-                'primary_key' => $validated['parent_table']['primary_key']??'id',
-                'data_params' => ($validated['parent_table']['data_params']??[]),
-            ];
-
-            $dataApiBuilder->parentTable()->update($parentTable);
-
-            $dataChildTable = [];
-            foreach ($validated['child_tables']??[] as $key => $value) {
-              $dataChild = new ApiTable([
-                              'parent_id' => $dataApiBuilder->parentTable->id,
-                              'table_name' => $value['table_name'],
-                              'foreign_key' => $value['foreign_key'],
-                              'data_params' => ($value['data_params']??[]),
-                          ]);
-
-              $dataChildTable[] = $dataChild;
-            }
-          
-            $dataApiBuilder->childTables()->delete();
-            
-            if(count($dataChildTable) > 0){
-              $dataApiBuilder->childTables()->saveMany($dataChildTable);
-
-            }
+            $this->syncApiConfigRelations($dataApiBuilder, $payload);
             
             $listenerName = $this->getListenerName($validated['route_name'], 1);
             $generateListener = $this->normalizeGenerateListener($validated['generate_listener'] ?? null);
@@ -1519,7 +1654,16 @@ class DataAPIBuilderController extends Controller
       'method' => ['nullable', 'string', 'in:POST,PUT,DELETE'],
       'params' => ['required', 'array'],
       'parent_table' => 'required|array',
+      'parent_table.table_name' => 'required|string',
+      'parent_table.primary_key' => 'nullable|string',
+      'parent_table.foreign_key' => 'nullable|string',
+      'parent_table.data_params' => 'nullable|array',
+      'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
+      'child_tables.*.table_name' => 'nullable|string',
+      'child_tables.*.foreign_key' => 'nullable|string',
+      'child_tables.*.data_params' => 'nullable|array',
+      'child_tables.*.use_soft_delete' => 'nullable|boolean',
       'enabled' => 'nullable|boolean',
       'description' => 'nullable|string',
       'middlewares' => 'nullable|array',
@@ -1664,6 +1808,24 @@ class DataAPIBuilderController extends Controller
       protected function cacheKey(string $key): string
       {
             return DatabaseConnection::cachePrefix($key);
+      }
+
+      /**
+       * Load API builder configs with optional search filtering.
+       *
+       * @param Request $request
+       * @return array<int, array<string, mixed>>
+       */
+      protected function loadApiConfigs(Request $request): array
+      {
+            return $this->applySearchFilter(
+                ApiConfig::on(DatabaseConnection::configuredName())
+                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
+                    ->orderBy('id'),
+                $request,
+                ['route_name', 'endpoint', 'description', 'method'],
+                'api_configs'
+            )->get()->toArray();
       }
 
       protected function buildRouteName(?string $endpoint, ?string $method): string

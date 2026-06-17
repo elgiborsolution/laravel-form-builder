@@ -2,6 +2,8 @@
 namespace ESolution\DataSources\Controllers;
 
 use ESolution\DataSources\Models\DataPicker;
+use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
+use ESolution\DataSources\Support\Concerns\NormalizesJsonPayload;
 use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
 use App\Http\Controllers\Controller;
@@ -9,6 +11,8 @@ use Illuminate\Support\Facades\Validator;
 
 class DataPickerController extends Controller
 {
+  use AppliesSearchFilter;
+  use NormalizesJsonPayload;
 
   /**
   * Display list data picker configuration
@@ -20,12 +24,12 @@ class DataPickerController extends Controller
   public function index(Request $request)
   {
     $headers = $request->header('x-tenant');
-    $dataPicker = DataPicker::get()->toArray();
+    $dataPicker = DataPicker::query()->orderBy('id')->get()->toArray();
     foreach ($dataPicker as $key => $value) {
-      
-      $dataPicker[$key]['filters'] = json_decode($value['filters']);
-      $dataPicker[$key]['columns'] = json_decode($value['columns']);
-      $dataPicker[$key]['params'] = json_decode($value['params']);
+
+      $dataPicker[$key]['filters'] = $this->normalizeJsonPayload($value['filters'], 'data_pickers.filters');
+      $dataPicker[$key]['columns'] = $this->normalizeJsonPayload($value['columns'], 'data_pickers.columns');
+      $dataPicker[$key]['params'] = $this->normalizeJsonPayload($value['params'], 'data_pickers.params');
       $dataPicker[$key]['is_central'] = true;
     }
 
@@ -34,13 +38,13 @@ class DataPickerController extends Controller
         tenancy()->initialize($headers);
         //if the tenant has table
         if(DatabaseConnection::schema()->hasTable('data_pickers')){
-          $dataPickerInTenant = DatabaseConnection::table('data_pickers')->get();
+          $dataPickerInTenant = DatabaseConnection::table('data_pickers')->orderBy('id')->get();
           $dataPickerInTenantMap = [];
           foreach ($dataPickerInTenant as $key => $value) { 
-            $dataArray = json_decode(json_encode($value, true), true);
-            $dataArray['filters'] = json_decode($dataArray['filters']);
-            $dataArray['columns'] = json_decode($dataArray['columns']);
-            $dataArray['params'] = json_decode($dataArray['params']);
+            $dataArray = (array) $value;
+            $dataArray['filters'] = $this->normalizeJsonPayload($dataArray['filters'] ?? null, 'tenant.data_pickers.filters');
+            $dataArray['columns'] = $this->normalizeJsonPayload($dataArray['columns'] ?? null, 'tenant.data_pickers.columns');
+            $dataArray['params'] = $this->normalizeJsonPayload($dataArray['params'] ?? null, 'tenant.data_pickers.params');
             $dataArray['is_central'] = false;
 
             $dataPickerInTenantMap[$value->code] = $dataArray;
@@ -60,6 +64,8 @@ class DataPickerController extends Controller
         
     }
 
+    $dataPicker = $this->filterSearchRows($dataPicker, $request, ['code', 'name', 'description'], 'data_pickers');
+
         return response()->json(['data' => $dataPicker], 200);
   }
 
@@ -75,12 +81,11 @@ class DataPickerController extends Controller
   {
 
       $validateFilter = [
-        'type' => ["required" , "string", "in:text,number,date,checkbox,dropdown,radio"],
+        'type' => ["required" , "string", "in:text,textarea,email,number,currency,date,datetime,select,radio,checkbox,switch,data-picker,dropdown"],
         'label' => 'required|string',
         'name' => 'required|string',
-        'operator' => ["required" , "string", "in:=,!=,>,<,>=,<=,like,LIKE,not like,NOT LIKE"],
         'value' => 'nullable',
-        'options' => 'nullable|array'
+      'options' => 'nullable|array'
       ];
       foreach ($request->filters as $key => $value) {
 
@@ -122,6 +127,25 @@ class DataPickerController extends Controller
       return null;
   }
 
+  /**
+   * Remove legacy operator data before persisting a builder payload.
+   *
+   * @param array<int, mixed> $filters
+   * @return array<int, mixed>
+   */
+  protected function normalizeFiltersForSave(array $filters): array
+  {
+      return array_map(static function (mixed $filter): mixed {
+          if (! is_array($filter)) {
+              return $filter;
+          }
+
+          unset($filter['operator']);
+
+          return $filter;
+      }, $filters);
+  }
+
 
   /**
   * Create new data picker configuration
@@ -150,9 +174,9 @@ class DataPickerController extends Controller
     $dataPicker = DataPicker::create([
       'code' => $validated['code'],
       'name' => $validated['name'],
-      'filters' => json_encode($validated['filters']),
-      'columns' => json_encode($validated['columns']),
-      'params' => json_encode($validated['params']),
+      'filters' => $this->normalizeFiltersForSave($validated['filters']),
+      'columns' => $validated['columns'],
+      'params' => $validated['params'],
     ]);
 
 
@@ -182,9 +206,9 @@ class DataPickerController extends Controller
         if(!empty($dataPickerInTenant)) $dataPicker = $dataPickerInTenant;
     }
 
-    $dataPicker->filters = json_decode($dataPicker->filters);
-    $dataPicker->columns = json_decode($dataPicker->columns);
-    $dataPicker->params = json_decode($dataPicker->params);
+    $dataPicker->filters = $this->normalizeJsonPayload($dataPicker->filters ?? null, 'data_pickers.show.filters');
+    $dataPicker->columns = $this->normalizeJsonPayload($dataPicker->columns ?? null, 'data_pickers.show.columns');
+    $dataPicker->params = $this->normalizeJsonPayload($dataPicker->params ?? null, 'data_pickers.show.params');
 
     return response()->json(["status" => 200, 'data'=>$dataPicker], 200);
   }
@@ -227,7 +251,7 @@ class DataPickerController extends Controller
                                  [ 'code' => $validated['code'] ],
                                  [
                                    'name' => $validated['name'],
-                                   'filters' => json_encode($validated['filters']),
+                                   'filters' => json_encode($this->normalizeFiltersForSave($validated['filters'])),
                                    'columns' => json_encode($validated['columns']),
                                    'params' => json_encode($validated['params'])
                                  ]
@@ -238,9 +262,9 @@ class DataPickerController extends Controller
         $dataPicker->update([
           'code' => $validated['code'],
           'name' => $validated['name'],
-          'filters' => json_encode($validated['filters']),
-          'columns' => json_encode($validated['columns']),
-          'params' => json_encode($validated['params']),
+          'filters' => $this->normalizeFiltersForSave($validated['filters']),
+          'columns' => $validated['columns'],
+          'params' => $validated['params'],
         ]);
     }
 

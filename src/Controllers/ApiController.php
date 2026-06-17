@@ -75,6 +75,7 @@ class ApiController extends Controller
             /** @var ApiConfig|null $apiConfigs */
             $apiConfigs = $resolvedRoute['config'];
             $id = $resolvedRoute['id'];
+            $action = $resolvedRoute['action'] ?? null;
 
             if (empty($apiConfigs)) {
                 return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
@@ -83,8 +84,8 @@ class ApiController extends Controller
             return $this->runDynamicMiddlewarePipeline(
                 $request,
                 $apiConfigs,
-                function (Request $request) use ($apiConfigs, $id) {
-                    $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id);
+                function (Request $request) use ($apiConfigs, $id, $action) {
+                    $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id, $action);
                     $this->dispatchAfterHitApiEvent($apiConfigs, $request, $response, $id);
 
                     return $response;
@@ -200,9 +201,17 @@ class ApiController extends Controller
       return null;
   }
 
-  protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id): JsonResponse
+  protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id, ?string $action = null): JsonResponse
   {
         if($apiConfigs->method == 'POST'){
+            if ($action === 'restore') {
+                if (empty($id)) {
+                    return response()->json(['status' => 400, 'error'=> 'primary_key is required', 'message'=>'primary_key is required'], 400);
+                }
+
+                return $this->restore($request, $apiConfigs, $id);
+            }
+
             return $this->store($request, $apiConfigs);
         }
 
@@ -236,6 +245,73 @@ class ApiController extends Controller
         }
 
         return response()->json(['data' => []], 200);
+  }
+
+  protected function tableHasDeletedAtColumn(string $tableName, ?string $connectionName = null): bool
+  {
+        $tableName = trim($tableName);
+
+        if ($tableName === '') {
+            return false;
+        }
+
+        try {
+            $columns = DatabaseConnection::schema($connectionName)->getColumnListing($tableName);
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        return in_array('deleted_at', $columns, true);
+  }
+
+  protected function usesSoftDeleteForTable(?array $table, ?string $tableName = null, ?string $connectionName = null): bool
+  {
+        if (!is_array($table)) {
+            return false;
+        }
+
+        if (!array_key_exists('use_soft_delete', $table) || $table['use_soft_delete'] !== true) {
+            return false;
+        }
+
+        $resolvedTableName = $tableName ?? (string) ($table['table_name'] ?? '');
+
+        return $this->tableHasDeletedAtColumn($resolvedTableName, $connectionName);
+  }
+
+  protected function deleteTableRecord($connection, string $tableName, string $primaryKey, mixed $id, bool $useSoftDelete): void
+  {
+        $query = $connection->table($tableName)->where($primaryKey, $id);
+
+        if ($useSoftDelete) {
+            $query->update(['deleted_at' => now()]);
+            return;
+        }
+
+        $query->delete();
+  }
+
+  protected function logDeleteMode(string $context, ApiConfig $apiConfig, string $tableName, bool $useSoftDelete, string $primaryKey, mixed $id): void
+  {
+        \Log::info('API Builder delete mode', [
+            'context' => $context,
+            'api_config_id' => $apiConfig->id,
+            'table_name' => $tableName,
+            'primary_key' => $primaryKey,
+            'record_id' => $id,
+            'use_soft_delete' => $useSoftDelete,
+            'delete_mode' => $useSoftDelete ? 'soft_delete' : 'hard_delete',
+            'executed_query' => $useSoftDelete
+                ? "UPDATE {$tableName} SET deleted_at = CURRENT_TIMESTAMP WHERE {$primaryKey} = ?"
+                : "DELETE FROM {$tableName} WHERE {$primaryKey} = ?",
+        ]);
+  }
+
+  protected function restoreTableRecord($connection, string $tableName, string $primaryKey, mixed $id): void
+  {
+        $connection->table($tableName)
+            ->where($primaryKey, $id)
+            ->update(['deleted_at' => null]);
   }
 
   /**
@@ -649,6 +725,7 @@ class ApiController extends Controller
                       'table' => preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']),
                       'table_values' => $childData,
                       'insert_type' => $insert_type,
+                      'use_soft_delete' => (bool) ($table['use_soft_delete'] ?? false),
                   ];
               }
           }
@@ -743,6 +820,7 @@ class ApiController extends Controller
         }
 
         $connection = $this->executionConnectionResolver->connection($request);
+        $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
@@ -795,13 +873,22 @@ class ApiController extends Controller
                         'foreign_key' => $table['foreign_key'],
                         'table_values' => $childData,
                         'insert_type' => $insert_type,
+                        'use_soft_delete' => (bool) ($table['use_soft_delete'] ?? false),
                    ];
                 }
 
             }
 
             foreach ($insertDataChild as $key => $value) {
-              $connection->table($value['table'])->where($value['foreign_key'], $id)->delete();
+              $childUsesSoftDelete = $this->usesSoftDeleteForTable($value, $value['table'] ?? null, $connectionName);
+              $childQuery = $connection->table($value['table'])->where($value['foreign_key'], $id);
+
+              if ($childUsesSoftDelete) {
+                  $childQuery->update(['deleted_at' => now()]);
+              } else {
+                  $childQuery->delete();
+              }
+
               $connection->table($value['table'])->insert($value['table_values']);
             }
 
@@ -876,6 +963,7 @@ class ApiController extends Controller
         $primarykey = $apiConfigs->parentTable->primary_key;
 
         $connection = $this->executionConnectionResolver->connection($request);
+        $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
 
@@ -898,13 +986,24 @@ class ApiController extends Controller
                 'deleted' => true,
             ]);
 
-            $connection->table($cleanParentTable)
-                ->where($primarykey, $id)
-                ->delete();
+            $parentUsesSoftDelete = $this->usesSoftDeleteForTable(
+                [
+                    'use_soft_delete' => $apiConfigs->parentTable?->use_soft_delete ?? false,
+                    'table_name' => $parentTable,
+                ],
+                $cleanParentTable,
+                $connectionName
+            );
+
+            $this->logDeleteMode('parent', $apiConfigs, $cleanParentTable, $parentUsesSoftDelete, $primarykey, $id);
+            $this->deleteTableRecord($connection, $cleanParentTable, $primarykey, $id, $parentUsesSoftDelete);
 
             foreach ($childTables as $key => $table) {
                 $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
-                $connection->table($tableChild)->where($table['foreign_key'], $id)->delete();
+                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
+
+                $this->logDeleteMode('child', $apiConfigs, $tableChild, $childUsesSoftDelete, (string) ($table['foreign_key'] ?? ''), $id);
+                $this->deleteTableRecord($connection, $tableChild, $table['foreign_key'], $id, $childUsesSoftDelete);
 
             }
 
@@ -1042,6 +1141,97 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
 
     return implode('|', array_values(array_filter($rules, static fn ($rule) => is_string($rule) && trim($rule) !== '')));
 }
+
+  public function restore(Request $request, $apiConfigs, $id)
+  {
+        if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
+            return $runtimeError;
+        }
+
+        $validationConnectionName = $this->executionConnectionResolver->resolve($request);
+        $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
+
+        if(count($checkValidateRule['parentValidate']) > 0){
+          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
+        }
+
+        if(count($checkValidateRule['childValidate']) > 0){
+            foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
+                foreach ($request[$key]??[] as $keyParam => $valueParam) {
+                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule, $validationConnectionName);
+                    if ($validator->fails()) {
+                        return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
+                    }
+                }
+            }
+        }
+
+        $this->runBeforeExecuteHooks($request, $apiConfigs);
+
+        $parentTable = $apiConfigs->parentTable->table_name;
+        $primarykey = $apiConfigs->parentTable->primary_key;
+
+        $connection = $this->executionConnectionResolver->connection($request);
+        $connectionName = $this->executionConnectionResolver->resolve($request);
+        $prefix = $connection->getTablePrefix();
+        $childTables = $apiConfigs->childTables->toArray();
+
+        try {
+            $connection->beginTransaction();
+            $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+
+            $beforeData = $this->normalizeAfterHitRecord(
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->first()
+            );
+
+            $parentUsesSoftDelete = $this->usesSoftDeleteForTable(
+                [
+                    'use_soft_delete' => $apiConfigs->parentTable?->use_soft_delete ?? false,
+                    'table_name' => $parentTable,
+                ],
+                $cleanParentTable,
+                $connectionName
+            );
+
+            if ($parentUsesSoftDelete) {
+                $this->restoreTableRecord($connection, $cleanParentTable, $primarykey, $id);
+            }
+
+            foreach ($childTables as $table) {
+                $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
+                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
+
+                if ($childUsesSoftDelete) {
+                    $this->restoreTableRecord($connection, $tableChild, $table['foreign_key'], $id);
+                }
+            }
+
+            $restoredRecord = $this->normalizeAfterHitRecord(
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->first()
+            );
+
+            $request->attributes->set('datasources.after_hit.action', 'restore');
+            $request->attributes->set('datasources.after_hit.before_data', $beforeData);
+            $request->attributes->set('datasources.after_hit.result', $restoredRecord);
+
+            $connection->commit();
+            return response()->json(["status" => 200, 'message' => 'Data has been successfully restored', 'data' => []], 201);
+        } catch (ApiHookException $e) {
+            $connection->rollBack();
+            return response()->json(
+                $e->toResponsePayload(),
+                $e->getStatusCode()
+            );
+        } catch (\Exception $e) {
+            $connection->rollBack();
+            \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
+            return response()->json(["status" => 422, "data" => [], "error" => $e->getMessage()], 422);
+        }
+  }
 
 /**
  * Validate payload using the package datasource connection.
