@@ -58,7 +58,7 @@ class ApiController extends Controller
   * @return \Illuminate\Http\JsonResponse
   */
     public function handleRequest(Request $request, string $dynamicPath): JsonResponse
-  {
+    {
         $headers = $request->header('x-tenant');
 
         if (!empty($headers)) {
@@ -70,6 +70,10 @@ class ApiController extends Controller
         $this->runtimeValidationConnectionName = $this->executionConnectionResolver->resolve($request);
 
         try {
+            if ($formBuilderResponse = $this->handleFormBuilderFallback($request, $dynamicPath)) {
+                return $formBuilderResponse;
+            }
+
             return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
             $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
             /** @var ApiConfig|null $apiConfigs */
@@ -100,6 +104,54 @@ class ApiController extends Controller
         } finally {
             $this->runtimeValidationConnectionName = $previousValidationConnection;
         }
+  }
+
+  protected function handleFormBuilderFallback(Request $request, string $dynamicPath): ?JsonResponse
+  {
+      $path = trim($dynamicPath, '/');
+
+      if ($path === '' || ! str_starts_with($path, 'form-builder')) {
+          return null;
+      }
+
+      $segments = array_values(array_filter(explode('/', $path), static fn ($segment) => $segment !== ''));
+      $controller = app(FormBuilderController::class);
+      $method = strtoupper($request->method());
+
+      if ($segments === ['form-builder']) {
+          return match ($method) {
+              'GET' => $controller->index($request),
+              'POST' => $controller->store($request),
+              default => null,
+          };
+      }
+
+      if (($segments[0] ?? null) !== 'form-builder') {
+          return null;
+      }
+
+      if (($segments[1] ?? null) === 'id' && isset($segments[2])) {
+          return $method === 'GET'
+              ? $controller->showById($request, $segments[2])
+              : null;
+      }
+
+      if (count($segments) === 2) {
+          return match ($method) {
+              'GET' => $controller->showByCode($request, $segments[1]),
+              'PUT' => $controller->update($request, $segments[1]),
+              'DELETE' => $controller->destroy($request, $segments[1]),
+              default => null,
+          };
+      }
+
+      if (count($segments) === 3 && ($segments[2] ?? null) === 'status') {
+          return $method === 'PATCH'
+              ? $controller->updateStatus($request, $segments[1])
+              : null;
+      }
+
+      return null;
   }
 
   protected function applyRuntimeVariables(Request $request): void

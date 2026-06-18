@@ -7,6 +7,7 @@ use ESolution\DataSources\Controllers\DataAPIBuilderController;
 use ESolution\DataSources\Controllers\DataPickerController;
 use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Controllers\DataTableBuilderController;
+use ESolution\DataSources\Controllers\FormBuilderController;
 use ESolution\DataSources\Controllers\RuntimeVariableController;
 use ESolution\DataSources\Events\AfterRunnerApiBuiderEvent;
 use ESolution\DataSources\Contracts\RuntimeVariableRegistryInterface;
@@ -114,6 +115,27 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-api-builder.defaults');
                 Route::get('runtime-variables', [RuntimeVariableController::class, 'index'])
                     ->name('management.runtime-variables.index');
+                Route::prefix('form-builder')
+                    ->as('management.form-builder.')
+                    ->group(function (): void {
+                        Route::get('/', [FormBuilderController::class, 'index'])->name('index');
+                        Route::post('/', [FormBuilderController::class, 'store'])->name('store');
+                        Route::get('id/{id}', [FormBuilderController::class, 'showById'])
+                            ->whereNumber('id')
+                            ->name('show-by-id');
+                        Route::get('{code}', [FormBuilderController::class, 'showByCode'])
+                            ->where('code', '[A-Za-z0-9._-]+')
+                            ->name('show-by-code');
+                        Route::put('{id}', [FormBuilderController::class, 'update'])
+                            ->whereNumber('id')
+                            ->name('update');
+                        Route::patch('{id}/status', [FormBuilderController::class, 'updateStatus'])
+                            ->whereNumber('id')
+                            ->name('status');
+                        Route::delete('{id}', [FormBuilderController::class, 'destroy'])
+                            ->whereNumber('id')
+                            ->name('destroy');
+                    });
 
                 Route::apiResource('data-source', DataSourceController::class)
                     ->names($this->resourceRouteNames('management.data-source'));
