@@ -54,6 +54,7 @@ return [
                 'data-picker',
                 'table-builder',
                 'api-config',
+                'form-builder',
             ],
         ],
 
