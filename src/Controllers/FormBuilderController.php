@@ -10,6 +10,7 @@ use ESolution\DataSources\Resources\FormBuilderResource;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
 
 class FormBuilderController extends Controller
@@ -78,11 +79,14 @@ class FormBuilderController extends Controller
         }
 
         $formBuilder = FormBuilder::create($payload)->fresh();
+        if ($formBuilder instanceof FormBuilder) {
+            $this->cacheFormBuilderDetail($formBuilder);
+        }
 
         return response()->json([
             'status' => 201,
             'message' => 'Form created successfully',
-            'data' => $formBuilder?->toArray() ?? [],
+            'data' => $formBuilder instanceof FormBuilder ? FormBuilderResource::detail($formBuilder) : [],
         ], 201);
     }
 
@@ -105,18 +109,26 @@ class FormBuilderController extends Controller
 
     public function showByCode(Request $request, string $code): JsonResponse
     {
-        $formBuilder = FormBuilder::query()->where('code', $code)->first();
+        $cacheKey = $this->formBuilderCacheKey($code);
+        $payload = Cache::get($cacheKey);
 
-        if ($formBuilder === null) {
-            return response()->json([
-                'status' => 404,
-                'message' => 'Form builder not found',
-            ], 404);
+        if (! is_array($payload)) {
+            $formBuilder = FormBuilder::query()->where('code', $code)->first();
+
+            if ($formBuilder === null) {
+                return response()->json([
+                    'status' => 404,
+                    'message' => 'Form builder not found',
+                ], 404);
+            }
+
+            $payload = FormBuilderResource::detail($formBuilder);
+            Cache::forever($cacheKey, $payload);
         }
 
         return response()->json([
             'status' => 200,
-            'data' => FormBuilderResource::detail($formBuilder),
+            'data' => $payload,
         ]);
     }
 
@@ -140,14 +152,20 @@ class FormBuilderController extends Controller
             return $payload;
         }
 
+        $originalCode = $formBuilder->code;
         $formBuilder->fill($payload);
         $formBuilder->save();
         $formBuilder = $formBuilder->fresh();
 
+        $this->forgetFormBuilderCache($originalCode);
+        if ($formBuilder instanceof FormBuilder) {
+            $this->cacheFormBuilderDetail($formBuilder);
+        }
+
         return response()->json([
             'status' => 200,
             'message' => 'Form updated successfully',
-            'data' => $formBuilder?->toArray() ?? [],
+            'data' => $formBuilder instanceof FormBuilder ? FormBuilderResource::detail($formBuilder) : [],
         ]);
     }
 
@@ -162,6 +180,7 @@ class FormBuilderController extends Controller
             ], 404);
         }
 
+        $this->forgetFormBuilderCache($formBuilder->code);
         $formBuilder->delete();
 
         return response()->json([
@@ -194,11 +213,16 @@ class FormBuilderController extends Controller
         $formBuilder->update([
             'enabled' => (bool) $payload['enabled'],
         ]);
+        $freshFormBuilder = $formBuilder->fresh();
+        if ($freshFormBuilder instanceof FormBuilder) {
+            $this->forgetFormBuilderCache($freshFormBuilder->code);
+            $this->cacheFormBuilderDetail($freshFormBuilder);
+        }
 
         return response()->json([
             'status' => 200,
             'message' => 'Status updated successfully',
-            'data' => $formBuilder->fresh()?->toArray() ?? [],
+            'data' => $freshFormBuilder instanceof FormBuilder ? FormBuilderResource::detail($freshFormBuilder) : [],
         ]);
     }
 
@@ -236,5 +260,35 @@ class FormBuilderController extends Controller
         $direction = strtolower(trim((string) $value));
 
         return in_array($direction, ['asc', 'desc'], true) ? $direction : 'desc';
+    }
+
+    protected function formBuilderCacheKey(string $code): string
+    {
+        return 'form_builder:' . trim($code);
+    }
+
+    protected function cacheFormBuilderDetail(FormBuilder $formBuilder): void
+    {
+        $code = trim((string) $formBuilder->code);
+
+        if ($code === '') {
+            return;
+        }
+
+        Cache::forever(
+            $this->formBuilderCacheKey($code),
+            FormBuilderResource::detail($formBuilder)
+        );
+    }
+
+    protected function forgetFormBuilderCache(?string $code): void
+    {
+        $normalizedCode = trim((string) $code);
+
+        if ($normalizedCode === '') {
+            return;
+        }
+
+        Cache::forget($this->formBuilderCacheKey($normalizedCode));
     }
 }
