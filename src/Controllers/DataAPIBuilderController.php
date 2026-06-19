@@ -1138,39 +1138,15 @@ class DataAPIBuilderController extends Controller
      */
     public function validateDetail($request, bool $forceDataMappings = false)
     {
+        $params = is_array($request->params ?? null) ? $request->params : [];
 
-        $validateParam = [
-            'name' => 'required|string',
-            'type' => ["required" , "string", "in:string,object,array,integer,date,boolean,numeric,url"],
-            'required' => 'nullable|boolean',
-            'unique' => 'nullable|boolean',
-            'default' => ['nullable'],
-            'params' =>  ['nullable', 'required_if:type,object,array', "array"]
-          ];
+        foreach ($params as $key => $value) {
+            $validationError = $this->validateApiBuilderParamNode($value, [(string) $key]);
 
-          foreach ($request->params as $key => $value) {
-
-              $validator = Validator::make($value, $validateParam);
-
-              if ($validator->fails()) {
-                  return response()->json(['error'=>$validator->errors(), 'message'=>'Invalid payload params at row '.strval(intval($key)+1)], 400);
-              }
-
-              if (in_array($value['type'], ['array', 'object'])){
-                foreach ($value['params'] as $key2 => $value2) {
-                    $validatorChild = Validator::make($value2, $validateParam);
-                    if ($validatorChild->fails()) {
-                        return response()->json(['error'=>$validatorChild->errors(), 'message'=>'Invalid payload params at row '.strval(intval($key)+1).'->'.strval(intval($key2)+1)], 400);
-                    }
-
-                    if (in_array($value2['type'], ['array', 'object'])){
-
-                       return response()->json(['error'=>'You cannot use both object and array as a type in an array parameter', 'message'=>'You cannot use both object and array as a type in an array parameter, at '.strval(intval($key)+1).'->'.strval(intval($key2)+1)], 400);
-                    }
-                }
-             
-              }
-          }
+            if ($validationError !== null) {
+                return $validationError;
+            }
+        }
 
           
           $validateParentTable = [
@@ -1216,6 +1192,110 @@ class DataAPIBuilderController extends Controller
 
           return null;
       }
+
+    protected function validateApiBuilderParamNode(mixed $param, array $pathSegments = []): ?\Illuminate\Http\JsonResponse
+    {
+        if (! is_array($param)) {
+            return response()->json([
+                'error' => ['params' => ['Each parameter must be a JSON object.']],
+                'message' => 'Invalid payload params at row ' . $this->formatParamPath($pathSegments),
+            ], 400);
+        }
+
+        $validator = Validator::make($param, [
+            'name' => ['required', 'string'],
+            'type' => ['required', 'string', Rule::in($this->allowedApiBuilderParamTypes())],
+            'required' => ['nullable', 'boolean'],
+            'unique' => ['nullable', 'boolean'],
+            'default' => ['nullable'],
+            'params' => ['nullable', 'array'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'error' => $validator->errors(),
+                'message' => 'Invalid payload params at row ' . $this->formatParamPath($pathSegments),
+            ], 400);
+        }
+
+        $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+        $children = is_array($param['params'] ?? null) ? $param['params'] : [];
+
+        if ($this->isPrimitiveArrayParamType($type) && $children !== []) {
+            return response()->json([
+                'error' => [
+                    'params' => ['Primitive array parameters cannot contain nested params.'],
+                ],
+                'message' => 'Invalid payload params at row ' . $this->formatParamPath($pathSegments),
+            ], 400);
+        }
+
+        if ($this->isContainerApiBuilderParamType($type)) {
+            foreach ($children as $childIndex => $child) {
+                $validationError = $this->validateApiBuilderParamNode(
+                    $child,
+                    array_merge($pathSegments, [(string) $childIndex])
+                );
+
+                if ($validationError !== null) {
+                    return $validationError;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    protected function allowedApiBuilderParamTypes(): array
+    {
+        return [
+            'string',
+            'integer',
+            'date',
+            'boolean',
+            'numeric',
+            'object',
+            'array',
+            'array object',
+            'array string',
+            'array integer',
+            'url',
+        ];
+    }
+
+    protected function normalizeApiBuilderParamType(mixed $type): string
+    {
+        $normalized = strtolower(trim((string) $type));
+
+        return match ($normalized) {
+            'array-object' => 'array object',
+            'array-string' => 'array string',
+            'array-integer' => 'array integer',
+            default => $normalized,
+        };
+    }
+
+    protected function isContainerApiBuilderParamType(string $type): bool
+    {
+        return in_array($this->normalizeApiBuilderParamType($type), ['object', 'array', 'array object'], true);
+    }
+
+    protected function isPrimitiveArrayParamType(string $type): bool
+    {
+        return in_array($this->normalizeApiBuilderParamType($type), ['array string', 'array integer'], true);
+    }
+
+    protected function formatParamPath(array $pathSegments): string
+    {
+        if ($pathSegments === []) {
+            return '1';
+        }
+
+        return implode('->', array_map(
+            static fn (string $segment): string => strval(intval($segment) + 1),
+            $pathSegments
+        ));
+    }
 
     /**
      * Validate runtime variable expressions used anywhere in the API Builder payload.

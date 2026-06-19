@@ -682,44 +682,15 @@ class ApiController extends Controller
       $connection = $this->executionConnectionResolver->connection($request);
       // Validate input data based on API configurations
       $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-      $checkValidateRule = $this->validateRule($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
+      $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name);
 
-      // Validate parent-level parameters
-      if (count($checkValidateRule['parentValidate']) > 0) {
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
-      }
-
-      // Validate child-level parameters
-      if (count($checkValidateRule['childValidate']) > 0) {
-          foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
-              foreach ($request[$key] ?? [] as $keyParam => $valueParam) {
-                  // Perform validation on each child record
-                  $validator = $this->makeDatasourceValidator($valueParam, $valueValidateRule, $validationConnectionName);
-                  if ($validator->fails()) {
-                      return response()->json([
-                          'error' => $validator->errors(),
-                          'message' => 'Invalid payload ' . $key . ' at row ' . strval(intval($keyParam) + 1)
-                      ], 400);
-                  }
-              }
-          }
+      if ($validationRules !== []) {
+          $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
       }
 
       $this->runBeforeExecuteHooks($request, $apiConfigs);
 
-      // Retrieve tables that contain array parameters
-      $tableMutipleValue = $this->getTablesWithArrayParams($apiConfigs->toArray());
-      $multipleInsertTable = array_keys($tableMutipleValue);
       $parentTable = $apiConfigs->parentTable->table_name;
-
-      // Ensure that parent table does not have multiple records
-      if (in_array($parentTable, $multipleInsertTable) && count($multipleInsertTable) > 1) {
-          return response()->json([
-              'status' => 400,
-              'error' => 'Invalid Api Builder',
-              'message' => 'The input data for the parent table cannot be plural (cannot use an array parameter).'
-          ], 400);
-      }
 
       $prefix = $connection->getTablePrefix();
       $childTables = $apiConfigs->childTables->toArray();
@@ -731,65 +702,48 @@ class ApiController extends Controller
           $connection->beginTransaction();
           $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
-          // Prepare parent table data for insertion
-          $parentData = [];
-          foreach ($apiConfigs->parentTable->data_params as $column => $paramPath) {
-              $parentData[$column] = $this->resolveDataParamValue($paramPath, $request);
+          $parentRows = $this->buildMappedTableRows(
+              is_array($apiConfigs->parentTable->data_params ?? null) ? $apiConfigs->parentTable->data_params : [],
+              $request,
+              $masterParam1Level
+          );
+
+          if ($parentRows === []) {
+              $parentRows = [[]];
           }
 
-          // Insert data into the parent table and get the generated ID
-          $id = $connection->table($cleanParentTable)->insertGetId($parentData);
-
-          $insertDataChild = [];
-
-          // Process child table insertions
-          foreach ($childTables as $key => $table) {
-              $childData = [];
-              $insert_type = 'singular';
-
-              // Handle plural insertions (arrays of child records)
-              if (in_array($table['table_name'], $multipleInsertTable)) {
-                  $insert_type = 'plural';
-                  $dataFilled = $this->generateDynamicCombinations($request->all(), $tableMutipleValue[$table['table_name']], $table['data_params']);
-
-                  foreach ($dataFilled as $key => $value) {
-                      // Set foreign key reference to parent ID
-                      $dataFilled[$key][$table['foreign_key']] = $id;
-                      foreach ($table['data_params'] as $keyMap => $valueMap) {
-                          if (!in_array((explode('.', $valueMap)[0]), $tableMutipleValue[$table['table_name']])) {
-                              $dataFilled[$key][$keyMap] = $this->resolveDataParamValue($valueMap, $request);
-                          }
-                      }
-                  }
-                  $childData = $dataFilled;
-
-              } else {
-                  // Handle singular insertions (single child record)
-                  $childData[$table['foreign_key']] = $id;
-                  foreach ($table['data_params'] as $key => $value) {
-                      $childData[$key] = $this->resolveDataParamValue($value, $request);
-                  }
-              }
-
-              // Prepare child table data for insertion
-              if (count($childData) > 0) {
-                  $insertDataChild[] = [
-                      'table' => preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']),
-                      'table_values' => $childData,
-                      'insert_type' => $insert_type,
-                      'use_soft_delete' => (bool) ($table['use_soft_delete'] ?? false),
-                  ];
-              }
+          $parentIds = $this->insertTableRows($connection, $cleanParentTable, $parentRows);
+          if ($parentIds === []) {
+              throw new \RuntimeException('Unable to insert parent table data.');
           }
 
-          // Insert all child table data into the database
-          foreach ($insertDataChild as $key => $value) {
-              $connection->table($value['table'])->insert($value['table_values']);
+          foreach ($childTables as $table) {
+              $cleanChildTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
+              $childRows = $this->buildMappedTableRows(
+                  is_array($table['data_params'] ?? null) ? $table['data_params'] : [],
+                  $request,
+                  $masterParam1Level
+              );
+
+              if ($childRows === []) {
+                  continue;
+              }
+
+              foreach ($parentIds as $parentId) {
+                  $rowsToInsert = [];
+
+                  foreach ($childRows as $childRow) {
+                      $childRow[$table['foreign_key']] = $parentId;
+                      $rowsToInsert[] = $childRow;
+                  }
+
+                  $this->insertTableRows($connection, $cleanChildTable, $rowsToInsert);
+              }
           }
 
           $finalRecord = $this->normalizeAfterHitRecord(
               $connection->table($cleanParentTable)
-                  ->where($apiConfigs->parentTable->primary_key, $id)
+                  ->where($apiConfigs->parentTable->primary_key, $parentIds[0])
                   ->first()
           );
 
@@ -839,37 +793,16 @@ class ApiController extends Controller
         }
 
         $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-        $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
+        $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name, $id);
 
-        if(count($checkValidateRule['parentValidate']) > 0){
-          
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
-        }
-
-        if(count($checkValidateRule['childValidate']) > 0){
-          
-            foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
-
-                foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule, $validationConnectionName);
-                    if ($validator->fails()) {
-                        return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
-                    }
-                }
-
-            }
-
+        if ($validationRules !== []) {
+            $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
         }
 
         $this->runBeforeExecuteHooks($request, $apiConfigs);
 
-        $tableMutipleValue = $this->getTablesWithArrayParams($apiConfigs->toArray());
-        $multipleInsertTable = array_keys($tableMutipleValue);
         $parentTable = $apiConfigs->parentTable->table_name;
         $primarykey = $apiConfigs->parentTable->primary_key;
-        if(in_array($parentTable, $multipleInsertTable) && count($multipleInsertTable) > 1){
-            return response()->json(['status' => 400, 'error' => 'Invalid Api Builder', 'message' => 'The input data for the parent table cannot be plural (cannot use an array parameter).'], 400);
-        }
 
         $connection = $this->executionConnectionResolver->connection($request);
         $connectionName = $this->executionConnectionResolver->resolve($request);
@@ -882,71 +815,68 @@ class ApiController extends Controller
             $connection->beginTransaction();
             $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
-            // insert parent table
-            $parentData  = [];
-            foreach ($apiConfigs->parentTable->data_params as $column => $paramPath) {
-                $parentData[$column] = $this->resolveDataParamValue($paramPath, $request);
+            $parentRows = $this->buildMappedTableRows(
+                is_array($apiConfigs->parentTable->data_params ?? null) ? $apiConfigs->parentTable->data_params : [],
+                $request,
+                $masterParam1Level
+            );
+
+            if ($parentRows === []) {
+                $parentRows = [[]];
             }
 
-            $connection->table($cleanParentTable)
-                ->where($primarykey, $id)
-                ->update($parentData);
-
-            $insertDataChild = [];
-            // Insert ke child tables berdasarkan mapping
-            foreach ($childTables as $key => $table) {
-                $childData = [];
-                $insert_type = 'singular';
-                if(in_array($table['table_name'], $multipleInsertTable)){
-                  $insert_type = 'plural';
-                  $dataFilled = $this->generateDynamicCombinations($request->all(), $tableMutipleValue[$table['table_name']], $table['data_params']);
-                  foreach ($dataFilled as $key => $value) {
-                      $dataFilled[$key][$table['foreign_key']] = $id;
-                      foreach ($table['data_params'] as $keyMap => $valueMap) {
-                        if(!in_array((explode('.', $valueMap)[0]), $tableMutipleValue[$table['table_name']])){
-                          $dataFilled[$key][$keyMap] = $this->resolveDataParamValue($valueMap, $request);
-                        } 
-                      }
-                  }
-                  $childData = $dataFilled;
-
-                }else{
-                  $childData[$table['foreign_key']] = $id;
-                  foreach ($table['data_params'] as $key => $value) {
-                    $childData[$key] = $this->resolveDataParamValue($value, $request);
-                  }
-
-                }
-
-                if(count($childData) > 0){
-
-                   $insertDataChild[] = [
-                        'table' => preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']),
-                        'foreign_key' => $table['foreign_key'],
-                        'table_values' => $childData,
-                        'insert_type' => $insert_type,
-                        'use_soft_delete' => (bool) ($table['use_soft_delete'] ?? false),
-                   ];
-                }
-
+            if (count($parentRows) === 1) {
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->update($parentRows[0]);
+                $parentIds = [$id];
+            } else {
+                $connection->table($cleanParentTable)
+                    ->where($primarykey, $id)
+                    ->delete();
+                $parentIds = $this->insertTableRows($connection, $cleanParentTable, $parentRows);
             }
 
-            foreach ($insertDataChild as $key => $value) {
-              $childUsesSoftDelete = $this->usesSoftDeleteForTable($value, $value['table'] ?? null, $connectionName);
-              $childQuery = $connection->table($value['table'])->where($value['foreign_key'], $id);
+            if ($parentIds === []) {
+                throw new \RuntimeException('Unable to persist parent table data.');
+            }
 
-              if ($childUsesSoftDelete) {
-                  $childQuery->update(['deleted_at' => now()]);
-              } else {
-                  $childQuery->delete();
-              }
+            foreach ($childTables as $table) {
+                $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
+                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
 
-              $connection->table($value['table'])->insert($value['table_values']);
+                $childQuery = $connection->table($tableChild)->where($table['foreign_key'], $id);
+                if ($childUsesSoftDelete) {
+                    $childQuery->update(['deleted_at' => now()]);
+                } else {
+                    $childQuery->delete();
+                }
+
+                $childRows = $this->buildMappedTableRows(
+                    is_array($table['data_params'] ?? null) ? $table['data_params'] : [],
+                    $request,
+                    $masterParam1Level
+                );
+
+                if ($childRows === []) {
+                    continue;
+                }
+
+                foreach ($parentIds as $parentId) {
+                    $rowsToInsert = [];
+
+                    foreach ($childRows as $childRow) {
+                        $childRow[$table['foreign_key']] = $parentId;
+                        $rowsToInsert[] = $childRow;
+                    }
+
+                    $this->insertTableRows($connection, $tableChild, $rowsToInsert);
+                }
             }
 
             $finalRecord = $this->normalizeAfterHitRecord(
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $id)
+                    ->where($primarykey, $parentIds[0])
                     ->first()
             );
 
@@ -987,26 +917,10 @@ class ApiController extends Controller
         }
 
         $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-        $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
+        $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name, $id);
 
-        if(count($checkValidateRule['parentValidate']) > 0){
-          
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
-        }
-
-        if(count($checkValidateRule['childValidate']) > 0){
-          
-            foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
-
-                foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule, $validationConnectionName);
-                    if ($validator->fails()) {
-                        return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
-                    }
-                }
-
-            }
-
+        if ($validationRules !== []) {
+            $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
         }
 
         $this->runBeforeExecuteHooks($request, $apiConfigs);
@@ -1093,62 +1007,13 @@ class ApiController extends Controller
  */
 public function validateRule($params=[], $tableParent = '', $primaryKey = 0)
   {
+      $params = is_array($params) ? $params : [];
+      $validationRules = $this->buildValidationRulesFromParams($params, $tableParent, $primaryKey);
 
-      $validateRule = []; // Stores validation rules for direct parameters
-      $paramArray = []; // Stores parameters that are of type 'array'
-      $paramObject = []; // Stores parameters that are of type 'object
-      // Iterate through each parameter to categorize them
-      foreach ($params as $key => $value) {
-          if (empty($value['type']) || empty($value['name'])) continue;
-
-          // Separate array and object parameters
-          if ($value['type'] == 'array') {
-              $paramArray[] = $value;
-          } else if ($value['type'] == 'object') {
-              $value['type'] = 'array'; // Convert 'object' to 'array' for uniform processing
-              $paramObject[] = $value;
-          }
-
-          // Generate validation rules for non-array/object parameters
-          $validateRow = $this->findValidateRule($value, $tableParent, $primaryKey);
-          $validateRule[$value['name']] = $validateRow;
-      }
-
-      // Process object-type parameters by handling nested properties
-      foreach ($paramObject as $key => $value) {
-          foreach ($value['params'] ?? [] as $keyParams => $valueParams) {
-              if (empty($valueParams['type']) || empty($valueParams['name']) || in_array($valueParams['type'], ['array', 'object'])) continue;
-
-              // Generate validation rules for object properties
-              $validateRow = $this->findValidateRule($valueParams, $tableParent, $primaryKey);
-              $validateRule[$value['name'] . '.' . $valueParams['name']] = $validateRow;
-          }
-      }
-
-      $childValidateRule = []; // Stores validation rules for child elements in arrays
-      $paramIsArray = []; // Stores names of parameters that are arrays
-
-      // Process array-type parameters
-      foreach ($paramArray as $key => $value) {
-          $paramIsArray[] = $value['name'];
-          $currentValidate = [];
-
-          foreach ($value['params'] ?? [] as $keyParams => $valueParams) {
-              if (empty($valueParams['type']) || empty($valueParams['name']) || in_array($valueParams['type'], ['array', 'object'])) continue;
-
-              // Generate validation rules for array elements
-              $validateRow = $this->findValidateRule($valueParams, $tableParent, $primaryKey);
-              $currentValidate[$valueParams['name']] = $validateRow;
-          }
-
-          $childValidateRule[$value['name']] = $currentValidate;
-      }
-
-      // Return structured validation rules
       return [
-          'parentValidate' => $validateRule,
-          'childValidate' => $childValidateRule,
-          'paramIsArray' => $paramIsArray
+          'parentValidate' => $validationRules,
+          'childValidate' => [],
+          'paramIsArray' => $this->collectArrayParamNames($params),
       ];
   }
 
@@ -1194,6 +1059,113 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
     return implode('|', array_values(array_filter($rules, static fn ($rule) => is_string($rule) && trim($rule) !== '')));
 }
 
+protected function buildValidationRulesFromParams(array $params, string $tableParent = '', mixed $primaryKey = 0, string $pathPrefix = ''): array
+{
+    $rules = [];
+
+    foreach ($params as $param) {
+        if (! is_array($param) || empty($param['name']) || empty($param['type'])) {
+            continue;
+        }
+
+        $paramName = trim((string) $param['name']);
+
+        if ($paramName === '') {
+            continue;
+        }
+
+        $path = $pathPrefix !== '' ? $pathPrefix . '.' . $paramName : $paramName;
+        $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+
+        if ($this->isContainerApiBuilderParamType($type)) {
+            $rules[$path] = $this->buildContainerValidationRule($param, $tableParent, $primaryKey);
+
+            $childPrefix = $type === 'object' ? $path : $path . '.*';
+            $childParams = is_array($param['params'] ?? null) ? $param['params'] : [];
+
+            if ($childParams !== []) {
+                $rules = array_merge(
+                    $rules,
+                    $this->buildValidationRulesFromParams($childParams, $tableParent, $primaryKey, $childPrefix)
+                );
+            }
+
+            continue;
+        }
+
+        if ($this->isPrimitiveArrayApiBuilderParamType($type)) {
+            $rules[$path] = $this->buildPrimitiveArrayValidationRule($param);
+            $rules[$path . '.*'] = $this->buildPrimitiveArrayItemValidationRule($param, $tableParent, $primaryKey);
+            continue;
+        }
+
+        $rules[$path] = $this->findValidateRule($param, $tableParent, $primaryKey);
+    }
+
+    return $rules;
+}
+
+protected function buildContainerValidationRule(array $param, string $tableParent, mixed $primaryKey): string
+{
+    $baseParam = $param;
+    $baseParam['type'] = 'array';
+
+    return $this->findValidateRule($baseParam, $tableParent, $primaryKey);
+}
+
+protected function buildPrimitiveArrayValidationRule(array $param): string
+{
+    $required = ! empty($param['required']);
+    $rules = $required ? ['required', 'array'] : ['nullable', 'array'];
+
+    return implode('|', $rules);
+}
+
+protected function buildPrimitiveArrayItemValidationRule(array $param, string $tableParent, mixed $primaryKey): string
+{
+    $itemParam = $param;
+    $itemParam['type'] = $this->primitiveArrayItemType($param['type'] ?? null);
+    $itemParam['required'] = true;
+
+    return $this->findValidateRule($itemParam, $tableParent, $primaryKey);
+}
+
+protected function primitiveArrayItemType(mixed $type): string
+{
+    return match ($this->normalizeApiBuilderParamType($type)) {
+        'array integer' => 'integer',
+        default => 'string',
+    };
+}
+
+protected function collectArrayParamNames(array $params, array &$names = [], string $pathPrefix = ''): array
+{
+    foreach ($params as $param) {
+        if (! is_array($param) || empty($param['name']) || empty($param['type'])) {
+            continue;
+        }
+
+        $paramName = trim((string) $param['name']);
+        if ($paramName === '') {
+            continue;
+        }
+
+        $path = $pathPrefix !== '' ? $pathPrefix . '.' . $paramName : $paramName;
+        $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+
+        if ($this->isArrayContainerApiBuilderParamType($type)) {
+            $names[] = $path;
+        }
+
+        if ($this->isContainerApiBuilderParamType($type) && is_array($param['params'] ?? null)) {
+            $childPrefix = $type === 'object' ? $path : $path . '.*';
+            $this->collectArrayParamNames($param['params'], $names, $childPrefix);
+        }
+    }
+
+    return array_values(array_unique($names));
+}
+
   public function restore(Request $request, $apiConfigs, $id)
   {
         if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
@@ -1201,21 +1173,10 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
         }
 
         $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-        $checkValidateRule = $this->validateRule($apiConfigs->params??[], $apiConfigs->parentTable->table_name, $id);
+        $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name, $id);
 
-        if(count($checkValidateRule['parentValidate']) > 0){
-          $validated = $this->validateWithDatasourceConnection($request->all(), $checkValidateRule['parentValidate'], $validationConnectionName);
-        }
-
-        if(count($checkValidateRule['childValidate']) > 0){
-            foreach ($checkValidateRule['childValidate'] as $key => $valueValidateRule) {
-                foreach ($request[$key]??[] as $keyParam => $valueParam) {
-                    $validator = $this->makeDatasourceValidator($valueParam,  $valueValidateRule, $validationConnectionName);
-                    if ($validator->fails()) {
-                        return response()->json(['error' => $validator->errors(), 'message' => 'Invalid payload '.$key.' at row ' . strval(intval($keyParam) + 1)], 400);
-                    }
-                }
-            }
+        if ($validationRules !== []) {
+            $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
         }
 
         $this->runBeforeExecuteHooks($request, $apiConfigs);
@@ -1418,23 +1379,52 @@ protected function fallbackValidationConnectionName(): string
  */
 protected function mapValidationTypeRule(mixed $type): ?string
 {
-    $normalized = strtolower(trim((string) $type));
+    $normalized = $this->normalizeApiBuilderParamType($type);
 
     return match ($normalized) {
         'string', 'integer', 'numeric', 'boolean', 'array', 'email', 'date',
         'uuid', 'json', 'url', 'ip', 'ipv4', 'ipv6', 'file', 'image',
         'alpha', 'alpha_num', 'alpha_dash' => $normalized,
         'float', 'double' => 'numeric',
-        'object' => 'array',
+        'object', 'array object' => 'array',
+        'array string' => 'array',
+        'array integer' => 'array',
         default => $normalized !== '' ? $normalized : null,
     };
 }
 
+protected function normalizeApiBuilderParamType(mixed $type): string
+{
+    $normalized = strtolower(trim((string) $type));
+
+    return match ($normalized) {
+        'array-object' => 'array object',
+        'array-string' => 'array string',
+        'array-integer' => 'array integer',
+        default => $normalized,
+    };
+}
+
+protected function isContainerApiBuilderParamType(string $type): bool
+{
+    return in_array($this->normalizeApiBuilderParamType($type), ['object', 'array', 'array object'], true);
+}
+
+protected function isPrimitiveArrayApiBuilderParamType(string $type): bool
+{
+    return in_array($this->normalizeApiBuilderParamType($type), ['array string', 'array integer'], true);
+}
+
+protected function isArrayContainerApiBuilderParamType(string $type): bool
+{
+    return in_array($this->normalizeApiBuilderParamType($type), ['array', 'array object'], true);
+}
+
 /**
- * Retrieve a list of tables that contain parameters of type "array".
+ * Retrieve a list of tables that contain LOOP_INSERT mappings.
  *
  * @param array $config Configuration array containing parent and child tables with their parameters.
- * @return array An associative array where keys are table names, and values are arrays of "array"-type parameter names.
+ * @return array An associative array where keys are table names, and values are arrays of mapped source names.
  */
   public function getTablesWithArrayParams($config) {
       $tables = [];
@@ -1442,9 +1432,11 @@ protected function mapValidationTypeRule(mixed $type): ?string
       // Check the parent table for "array" type parameters
       if (!empty($config['parent_table']) && !empty($config['parent_table']['data_params'])) {
           foreach ($config['parent_table']['data_params'] as $column => $param) {
-              // If the parameter is an array type, store it under the parent table
-              if ($this->isArrayType($param, $config['params'])) {
-                  $tables[$config['parent_table']['table_name']][] = explode('.', $param)[0];
+              $mapping = $this->normalizeDataParamMapping($param, is_string($column) ? $column : null);
+
+              // Only parameters explicitly marked for loop insert should create plural rows
+              if (($mapping['array_handling'] ?? 'RAW_VALUE') === 'LOOP_INSERT' && $this->isArrayType($mapping['value'], $config['params'])) {
+                  $tables[$config['parent_table']['table_name']][] = explode('.', (string) $mapping['value'])[0];
               }
           }
       }
@@ -1454,9 +1446,11 @@ protected function mapValidationTypeRule(mixed $type): ?string
           foreach ($config['child_tables'] as $childTable) {
               if (!empty($childTable['data_params'])) {
                   foreach ($childTable['data_params'] as $column => $param) {
-                      // If the parameter is an array type, store it under the child table
-                      if ($this->isArrayType($param, $config['params'])) {
-                          $tables[$childTable['table_name']][] = explode('.', $param)[0];
+                      $mapping = $this->normalizeDataParamMapping($param, is_string($column) ? $column : null);
+
+                      // Only parameters explicitly marked for loop insert should create plural rows
+                      if (($mapping['array_handling'] ?? 'RAW_VALUE') === 'LOOP_INSERT' && $this->isArrayType($mapping['value'], $config['params'])) {
+                          $tables[$childTable['table_name']][] = explode('.', (string) $mapping['value'])[0];
                       }
                   }
               }
@@ -1480,9 +1474,17 @@ protected function mapValidationTypeRule(mixed $type): ?string
    * @return bool Returns true if the parameter is of type "array", otherwise false.
    */
   public function isArrayType($param, $params) {
+      if (is_array($param)) {
+          $param = $param['value'] ?? $param['path'] ?? $param['column'] ?? '';
+      }
+
       foreach ($params as $p) {
           // Extract the base name of the parameter and check if it exists in the params list as an "array" type
-          if ($p['name'] === explode('.', $param)[0] && $p['type'] === 'array') {
+          if (! is_array($p) || empty($p['name']) || empty($p['type'])) {
+              continue;
+          }
+
+          if ($p['name'] === explode('.', $param)[0] && $this->isArrayContainerApiBuilderParamType($this->normalizeApiBuilderParamType($p['type']))) {
               return true;
           }
       }
@@ -1546,7 +1548,163 @@ protected function mapValidationTypeRule(mixed $type): ?string
           return $request->input($normalized);
       }
 
+      $nestedValue = data_get($request->all(), $normalized, '__ESOLUTION_DATA_BUILDER_MISSING__');
+
+      if ($nestedValue !== '__ESOLUTION_DATA_BUILDER_MISSING__') {
+          return $nestedValue;
+      }
+
       return $value;
+  }
+
+  /**
+   * Resolve a mapped data parameter into a database-safe value.
+   *
+   * Arrays and objects are serialized to JSON for RAW_VALUE mappings so query
+   * builder inserts always receive scalar values. LOOP_INSERT handling is
+   * performed by the table row builder.
+   *
+   * @param mixed $value
+   * @param Request $request
+   * @param array<string, array{type?: string, required?: bool}> $flattenedParams
+   * @return mixed
+   */
+  protected function resolveMappedDataParamValue(mixed $value, Request $request, array $flattenedParams): mixed
+  {
+      if ($this->isDataParamMappingDescriptor($value)) {
+          $mapping = $this->normalizeDataParamMapping($value);
+          $resolved = $this->resolveDataParamValue($mapping['value'] ?? null, $request);
+
+          return $this->serializeDatabaseValue($resolved);
+      }
+
+      $resolved = $this->resolveDataParamValue($value, $request);
+
+      return $this->serializeDatabaseValue($resolved);
+  }
+
+  protected function isDataParamMappingDescriptor(mixed $value): bool
+  {
+      return is_array($value) && (
+          array_key_exists('value', $value)
+          || array_key_exists('path', $value)
+          || array_key_exists('array_handling', $value)
+          || array_key_exists('arrayHandling', $value)
+      );
+  }
+
+  protected function normalizeArrayHandlingMode(mixed $value): string
+  {
+      $normalized = strtoupper(trim((string) ($value ?? 'RAW_VALUE')));
+
+      return $normalized === 'LOOP_INSERT' ? 'LOOP_INSERT' : 'RAW_VALUE';
+  }
+
+  protected function normalizeDataParamMapping(mixed $mapping, ?string $column = null): array
+  {
+      if (! is_array($mapping)) {
+          return [
+              'column' => $column,
+              'value' => is_string($mapping) ? trim($mapping) : $mapping,
+              'array_handling' => 'RAW_VALUE',
+          ];
+      }
+
+      $value = $mapping['value'] ?? $mapping['path'] ?? $mapping['column'] ?? null;
+      if (is_string($value)) {
+          $value = trim($value);
+      }
+
+      return [
+          'column' => $column ?? ($mapping['column'] ?? null),
+          'value' => $value,
+          'array_handling' => $this->normalizeArrayHandlingMode(
+              $mapping['array_handling'] ?? $mapping['arrayHandling'] ?? null
+          ),
+      ];
+  }
+
+  protected function serializeDatabaseValue(mixed $value): mixed
+  {
+      if (is_array($value) || is_object($value)) {
+          $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+          return $encoded === false ? '[]' : $encoded;
+      }
+
+      return $value;
+  }
+
+  protected function buildMappedTableRows(array $dataParams, Request $request, array $flattenedParams): array
+  {
+      if ($dataParams === []) {
+          return [[]];
+      }
+
+      $staticRow = [];
+      $loopColumns = [];
+
+      foreach ($dataParams as $column => $mapping) {
+          $normalized = $this->normalizeDataParamMapping($mapping, is_string($column) ? $column : null);
+          $sourceValue = $normalized['value'] ?? null;
+          $resolvedValue = $this->resolveDataParamValue($sourceValue, $request);
+
+          if (
+              ($normalized['array_handling'] ?? 'RAW_VALUE') === 'LOOP_INSERT'
+              && is_array($resolvedValue)
+          ) {
+              $loopColumns[(string) $column] = array_values($resolvedValue);
+              continue;
+          }
+
+          $staticRow[(string) $column] = $this->serializeDatabaseValue($resolvedValue);
+      }
+
+      if ($loopColumns === []) {
+          return [$staticRow];
+      }
+
+      $rows = [[]];
+
+      foreach ($loopColumns as $column => $values) {
+          $nextRows = [];
+
+          foreach ($rows as $row) {
+              foreach ($values as $value) {
+                  $nextRows[] = array_merge($row, [
+                      $column => $this->serializeDatabaseValue($value),
+                  ]);
+              }
+          }
+
+          $rows = $nextRows;
+      }
+
+      if ($rows === []) {
+          return [];
+      }
+
+      foreach ($rows as &$row) {
+          $row = array_merge($staticRow, $row);
+      }
+      unset($row);
+
+      return $rows;
+  }
+
+  protected function insertTableRows($connection, string $tableName, array $rows): array
+  {
+      $insertedIds = [];
+
+      foreach ($rows as $row) {
+          if ($row === []) {
+              continue;
+          }
+
+          $insertedIds[] = $connection->table($tableName)->insertGetId($row);
+      }
+
+      return $insertedIds;
   }
 
     /**

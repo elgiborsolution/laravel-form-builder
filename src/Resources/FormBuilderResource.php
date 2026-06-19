@@ -6,35 +6,17 @@ use ESolution\DataSources\Models\FormBuilder;
 class FormBuilderResource
 {
     /**
-     * Transform a model into the summary payload used by the list endpoint.
-     *
-     * @param FormBuilder $formBuilder
-     * @return array<string, mixed>
-     */
-    public static function summary(FormBuilder $formBuilder): array
-    {
-        return [
-            'id' => $formBuilder->id,
-            'code' => $formBuilder->code,
-            'name' => $formBuilder->name,
-            'enabled' => (bool) $formBuilder->enabled,
-        ];
-    }
-
-    /**
-     * Transform a model into the detail payload used by the ID endpoint.
+     * Transform a model into the API payload used by list and detail endpoints.
      *
      * @param FormBuilder $formBuilder
      * @return array<string, mixed>
      */
     public static function detail(FormBuilder $formBuilder): array
     {
-        return [
-            'id' => $formBuilder->id,
-            'code' => $formBuilder->code,
-            'name' => $formBuilder->name,
-            'schema' => $formBuilder->schema ?? (object) [],
-        ];
+        $payload = $formBuilder->toArray();
+        $payload['schema'] = self::normalizeSchemaValue($payload['schema'] ?? $formBuilder->schema ?? []);
+
+        return $payload;
     }
 
     /**
@@ -45,7 +27,7 @@ class FormBuilderResource
      */
     public static function schema(FormBuilder $formBuilder): array|object
     {
-        return $formBuilder->schema ?? (object) [];
+        return self::normalizeSchemaValue($formBuilder->schema ?? []);
     }
 
     /**
@@ -60,11 +42,41 @@ class FormBuilderResource
 
         foreach ($items as $item) {
             if ($item instanceof FormBuilder) {
-                $rows[] = self::summary($item);
+                $rows[] = self::detail($item);
             }
         }
 
         return $rows;
     }
-}
 
+    /**
+     * Normalize schema payloads so JSON strings are returned as arrays/objects.
+     *
+     * @param mixed $schema
+     * @return array|object
+     */
+    protected static function normalizeSchemaValue(mixed $schema): array|object
+    {
+        if (is_array($schema) || is_object($schema)) {
+            return $schema;
+        }
+
+        if (! is_string($schema)) {
+            return [];
+        }
+
+        $trimmed = trim($schema);
+
+        if ($trimmed === '') {
+            return [];
+        }
+
+        $decoded = json_decode($trimmed, true);
+
+        if (json_last_error() === JSON_ERROR_NONE) {
+            return $decoded ?? [];
+        }
+
+        return $schema;
+    }
+}
