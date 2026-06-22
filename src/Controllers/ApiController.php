@@ -29,6 +29,7 @@ class ApiController extends Controller
     protected bool $datasourceValidationConnectionActive = false;
 
     protected ?AfterHitApiDispatcher $afterHitApiDispatcher = null;
+    protected ?DataSourceController $dataSourceController = null;
 
     /**
      * Keep track of the connection that should be used for runtime validation
@@ -44,9 +45,11 @@ class ApiController extends Controller
         protected DynamicVariableParser $runtimeVariableParser,
         protected MiddlewareConnectionResolver $middlewareConnectionResolver,
         protected ExecutionConnectionResolver $executionConnectionResolver,
-        ?AfterHitApiDispatcher $afterHitApiDispatcher = null
+        ?AfterHitApiDispatcher $afterHitApiDispatcher = null,
+        ?DataSourceController $dataSourceController = null
     ) {
         $this->afterHitApiDispatcher = $afterHitApiDispatcher;
+        $this->dataSourceController = $dataSourceController;
     }
 
   /**
@@ -82,6 +85,14 @@ class ApiController extends Controller
             $action = $resolvedRoute['action'] ?? null;
 
             if (empty($apiConfigs)) {
+                if ($request->isMethod('GET')) {
+                    $dataSourceResponse = $this->handleDataSourceFallback($request, $dynamicPath);
+
+                    if ($dataSourceResponse !== null) {
+                        return $dataSourceResponse;
+                    }
+                }
+
                 return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
             }
 
@@ -104,6 +115,28 @@ class ApiController extends Controller
         } finally {
             $this->runtimeValidationConnectionName = $previousValidationConnection;
         }
+  }
+
+  protected function handleDataSourceFallback(Request $request, string $dynamicPath): ?JsonResponse
+  {
+      $controller = $this->dataSourceController();
+
+      return $controller?->executeRuntimeRequest($request, $dynamicPath);
+  }
+
+  protected function dataSourceController(): ?DataSourceController
+  {
+      if ($this->dataSourceController instanceof DataSourceController) {
+          return $this->dataSourceController;
+      }
+
+      try {
+          $this->dataSourceController = app(DataSourceController::class);
+      } catch (\Throwable $e) {
+          return null;
+      }
+
+      return $this->dataSourceController;
   }
 
   protected function handleFormBuilderFallback(Request $request, string $dynamicPath): ?JsonResponse

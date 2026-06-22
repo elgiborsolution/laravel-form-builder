@@ -6,6 +6,8 @@ use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Services\CustomQueryService;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Pipeline\Pipeline;
 use PHPUnit\Framework\TestCase;
 
@@ -48,6 +50,21 @@ class DataSourceControllerRouteTemplateTest extends TestCase
         $this->assertNull($controller->exposeValidateRouteTemplate('customer/{customer_id}/detail/{detail_id}'));
     }
 
+    public function test_it_resolves_the_canonical_runtime_path_without_the_legacy_prefix(): void
+    {
+        $controller = new TestableDataSourceControllerRuntime(
+            $this->createMock(DataQueryService::class),
+            $this->createMock(CustomQueryService::class),
+            $this->createMock(Pipeline::class),
+            $this->createMock(DatabaseMetadataProvider::class)
+        );
+
+        $response = $controller->executeRuntimeRequest(Request::create('/api/product/123', 'GET'), 'product/123');
+
+        $this->assertNotNull($response);
+        $this->assertSame(['product', '123'], $controller->capturedExecuteQueryArgs);
+    }
+
     private function makeController(): TestableDataSourceController
     {
         return new TestableDataSourceController(
@@ -74,5 +91,26 @@ class TestableDataSourceController extends DataSourceController
     public function exposeExtractRouteTemplateParameters(string $template): array
     {
         return $this->extractRouteTemplateParameters($template);
+    }
+}
+
+class TestableDataSourceControllerRuntime extends DataSourceController
+{
+    public ?array $capturedExecuteQueryArgs = null;
+
+    public function executeQuery(Request $request, $id, ?string $routePath = null)
+    {
+        $this->capturedExecuteQueryArgs = [(string) $id, $routePath];
+
+        return new JsonResponse(['data' => []], 200);
+    }
+
+    protected function resolveDataSourceForExecution(string $identifier, ?string $routePath = null): ?array
+    {
+        return [
+            new \ESolution\DataSources\Models\DataSource(),
+            [],
+            $identifier,
+        ];
     }
 }
