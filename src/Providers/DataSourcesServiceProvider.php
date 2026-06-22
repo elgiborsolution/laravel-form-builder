@@ -116,6 +116,10 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-api-builder.defaults');
                 Route::get('upload-builder/defaults', [UploadBuilderController::class, 'defaults'])
                     ->name('management.upload-builder.defaults');
+                Route::post('upload-builder/export', [UploadBuilderController::class, 'export'])
+                    ->name('management.upload-builder.export');
+                Route::post('upload-builder/import', [UploadBuilderController::class, 'import'])
+                    ->name('management.upload-builder.import');
                 Route::patch('upload-builder/{id}/status', [UploadBuilderController::class, 'updateStatus'])
                     ->whereNumber('id')
                     ->name('management.upload-builder.status');
@@ -126,6 +130,16 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->group(function (): void {
                         Route::get('/', [FormBuilderController::class, 'index'])->name('index');
                         Route::post('/', [FormBuilderController::class, 'store'])->name('store');
+                        Route::post('export', [FormBuilderController::class, 'export'])
+                            ->name('export');
+                        Route::get('export-all', [FormBuilderController::class, 'exportAll'])
+                            ->name('export-all');
+                        Route::post('import', [FormBuilderController::class, 'import'])
+                            ->name('import');
+                        Route::get('docs', [FormBuilderController::class, 'docs'])
+                            ->name('docs');
+                        Route::get('postman', [FormBuilderController::class, 'postman'])
+                            ->name('postman');
                         Route::get('id/{id}', [FormBuilderController::class, 'showById'])
                             ->whereNumber('id')
                             ->name('show-by-id');
