@@ -118,7 +118,7 @@ class DataQueryServiceRuntimeTest extends TestCase
             new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
         );
 
-        $request = Request::create('/api/data-source/product/123', 'GET', [
+        $request = Request::create('/api/product/123', 'GET', [
             'product_id' => 123,
         ]);
 
@@ -140,7 +140,7 @@ class DataQueryServiceRuntimeTest extends TestCase
             new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
         );
 
-        $request = Request::create('/api/data-source/d-invoice', 'GET');
+        $request = Request::create('/api/d-invoice', 'GET');
         $request->setRouteResolver(static function () {
             return new class {
                 public function parameter(string $key): mixed
@@ -166,7 +166,7 @@ class DataQueryServiceRuntimeTest extends TestCase
             new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql'))
         );
 
-        $request = Request::create('/api/data-source/product/123', 'GET');
+        $request = Request::create('/api/product/123', 'GET');
         $request->attributes->set('datasources.route_parameter_names', ['product_id']);
         $request->setRouteResolver(static function () {
             return new class {
@@ -209,7 +209,7 @@ class DataQueryServiceRuntimeTest extends TestCase
             ],
         ]));
 
-        $request = Request::create('/api/data-source/d-invoice', 'GET');
+        $request = Request::create('/api/d-invoice', 'GET');
         $request->setRouteResolver(static function () {
             return new class {
                 public function parameter(string $key): mixed
@@ -508,7 +508,7 @@ SQL;
         ];
         $dataSource->setRelation('parameters', new Collection([]));
 
-        $request = Request::create('/api/data-source/products', 'GET', ['key' => 10]);
+        $request = Request::create('/api/products', 'GET', ['key' => 10]);
         $service->executeForDataSource($request, $dataSource, 'datasource_q_conditional_present');
 
         $this->assertStringContainsString('AND id = 10', $service->capturedQuery);
@@ -551,7 +551,7 @@ SQL;
         ];
         $dataSource->setRelation('parameters', new Collection([]));
 
-        $request = Request::create('/api/data-source/products', 'GET', ['customer_id' => 1]);
+        $request = Request::create('/api/products', 'GET', ['customer_id' => 1]);
         $service->executeForDataSource($request, $dataSource, 'datasource_q_conditional_multiple');
 
         $this->assertStringNotContainsString('customer_id = 1', $service->capturedQuery);

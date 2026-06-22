@@ -32,7 +32,7 @@ Create a data source for a users table:
 Query it:
 
 ```http
-GET /api/data-source/users-list/query?status=active&page=1&per_page=10
+GET /api/users-list?status=active&page=1&per_page=10
 ```
 
 ## Example 2: Custom Query Data Source
@@ -144,4 +144,3 @@ Example import request:
 ```http
 POST /api/data-api-builder/import
 ```
-

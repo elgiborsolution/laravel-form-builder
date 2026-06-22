@@ -120,4 +120,3 @@ Data API builder import also supports legacy aliases such as:
 - Export related configs together so they can be restored consistently.
 - Validate JSON before importing into production.
 - Store API config changes in version control if you maintain seed files.
-

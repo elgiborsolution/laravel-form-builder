@@ -38,9 +38,15 @@ return [
 
     'cache' => [
         'dynamic_api_ttl' => 60,
+        'dynamic_upload_ttl' => 60,
     ],
 
     'default_api_middlewares' => ['auth:api'],
+
+    'upload_storage' => [
+        'disk' => env('LARAVEL_FORM_BUILDER_UPLOAD_DISK', env('FILESYSTEM_DISK', 'local')),
+        'base_path' => env('LARAVEL_FORM_BUILDER_UPLOAD_BASE_PATH', 'uploads/general'),
+    ],
 
     'routes' => [
         'prefix' => env('DATASOURCES_ROUTE_PREFIX', 'api'),

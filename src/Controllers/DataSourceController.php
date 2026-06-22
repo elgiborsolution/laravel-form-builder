@@ -8,6 +8,7 @@ use ESolution\DataSources\Services\CustomQueryService;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -1227,6 +1228,36 @@ class DataSourceController extends Controller
     });
   }
 
+  /**
+   * Execute a datasource runtime request using the canonical shared runtime path.
+   *
+   * @param Request $request
+   * @param string $dynamicPath
+   * @return JsonResponse|null
+   */
+  public function executeRuntimeRequest(Request $request, string $dynamicPath): ?JsonResponse
+  {
+    $path = trim($dynamicPath, '/');
+
+    if ($path === '') {
+      return null;
+    }
+
+    $segments = explode('/', $path);
+    $identifier = array_shift($segments);
+    $routePath = $segments === [] ? null : implode('/', $segments);
+
+    if ($identifier === null) {
+      return null;
+    }
+
+    if ($this->resolveDataSourceForExecution((string) $identifier, $routePath) === null) {
+      return null;
+    }
+
+    return $this->executeQuery($request, (string) $identifier, $routePath);
+  }
+
   protected function resolveDataSourceForExecution(string $identifier, ?string $routePath = null): ?array
   {
     $connection = DatabaseConnection::configuredName();
@@ -1244,13 +1275,19 @@ class DataSourceController extends Controller
       return null;
     }
 
+    $cacheKeyPath = $candidatePath;
+
+    if (str_starts_with($cacheKeyPath, 'data-source/')) {
+      $cacheKeyPath = substr($cacheKeyPath, strlen('data-source/'));
+    }
+
     $dataSources = DataSource::on($connection)->with('parameters')->get();
 
     foreach ($dataSources as $dataSource) {
       [$matched, $routeParameters] = $this->matchRouteTemplate((string) $dataSource->name, $candidatePath);
 
       if ($matched) {
-        return [$dataSource, $routeParameters, $this->sanitizeCacheKeySuffix($candidatePath)];
+        return [$dataSource, $routeParameters, $this->sanitizeCacheKeySuffix($cacheKeyPath)];
       }
     }
 

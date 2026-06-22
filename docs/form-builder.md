@@ -9,6 +9,8 @@
 - [Validation](#validation)
 - [Conditional Fields](#conditional-fields)
 - [Async Select Options](#async-select-options)
+- [API Import & Export](#api-import--export)
+- [API Documentation](#api-documentation)
 - [Example Flow](#example-flow)
 - [Screenshot Placeholder](#screenshot-placeholder)
 
@@ -129,6 +131,83 @@ Mapped options:
 - label: `name`
 - value: `id`
 
+## API Import & Export
+
+Form Builder now includes environment-friendly import and export endpoints so configurations can be moved between projects without losing the decoded schema payload.
+
+### Export Selected
+
+- `POST /api/form-builder/export`
+- Body examples:
+
+```json
+{ "ids": [1, 2, 3] }
+```
+
+```json
+{ "codes": ["FORM_CUSTOMER", "FORM_PRODUCT"] }
+```
+
+The response is a JSON download with this structure:
+
+```json
+{
+  "version": 1,
+  "exported_at": "2026-06-22 10:00:00",
+  "items": [
+    {
+      "id": 1,
+      "code": "FORM_CUSTOMER",
+      "name": "Customer Form",
+      "description": "...",
+      "enabled": true,
+      "schema": [
+        {
+          "name": "customer_name",
+          "type": "string"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Export All
+
+- `GET /api/form-builder/export-all`
+- Exports every form builder record in the same JSON structure.
+
+### Import
+
+- `POST /api/form-builder/import`
+- `Content-Type: multipart/form-data`
+- Fields:
+  - `file` required JSON export file
+  - `mode` optional, `skip` or `update`
+
+Behavior:
+
+- `skip` leaves existing codes unchanged.
+- `update` overwrites existing records using the imported payload.
+- schema is validated and restored as JSON data.
+
+### Validation Rules
+
+- file is required
+- file must be JSON
+- export structure must include `version`, `exported_at`, and `items`
+- each item must include `code`, `name`, and `schema`
+- schema must be valid JSON data
+
+## API Documentation
+
+The package also exposes:
+
+- `GET /api/form-builder/docs`
+- `GET /api/form-builder/postman`
+
+`/docs` returns developer-friendly JSON documentation with request and response examples. `/postman` returns a Postman Collection v2.1 JSON that can be imported directly into Postman without edits.
+
 ## Example Flow
 
 ```text
@@ -142,4 +221,3 @@ Create builder config
 ## Screenshot Placeholder
 
 > Screenshot placeholder: dynamic form builder screen
-

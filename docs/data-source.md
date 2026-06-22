@@ -67,6 +67,13 @@ Helper endpoints:
 ```http
 GET /api/data-source/tables
 GET /api/data-source/tables/{table}/columns
+GET /api/{id}
+```
+
+Legacy alias during the transition:
+
+```http
+GET /api/data-source/{id}
 GET /api/data-source/{id}/query
 ```
 
@@ -77,7 +84,7 @@ The query endpoint can accept request params and pagination arguments.
 Example:
 
 ```http
-GET /api/data-source/users-list/query?page=1&per_page=10&status=active
+GET /api/users-list?page=1&per_page=10&status=active
 ```
 
 Behavior:
