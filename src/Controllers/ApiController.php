@@ -8,17 +8,22 @@ use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\AfterHitApiDispatcher;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
+use ESolution\DataSources\Models\UploadConfig;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Support\MiddlewareConnectionResolver;
+use ESolution\DataSources\Support\UploadConfigResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\UploadedFile;
 use Illuminate\Pipeline\Pipeline;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\DatabasePresenceVerifier;
+use Illuminate\Support\Str;
 
 class ApiController extends Controller
 {
@@ -30,6 +35,7 @@ class ApiController extends Controller
 
     protected ?AfterHitApiDispatcher $afterHitApiDispatcher = null;
     protected ?DataSourceController $dataSourceController = null;
+    protected ?UploadConfigResolver $uploadConfigResolver = null;
 
     /**
      * Keep track of the connection that should be used for runtime validation
@@ -46,8 +52,10 @@ class ApiController extends Controller
         protected MiddlewareConnectionResolver $middlewareConnectionResolver,
         protected ExecutionConnectionResolver $executionConnectionResolver,
         ?AfterHitApiDispatcher $afterHitApiDispatcher = null,
-        ?DataSourceController $dataSourceController = null
+        ?DataSourceController $dataSourceController = null,
+        ?UploadConfigResolver $uploadConfigResolver = null
     ) {
+        $this->uploadConfigResolver = $uploadConfigResolver;
         $this->afterHitApiDispatcher = $afterHitApiDispatcher;
         $this->dataSourceController = $dataSourceController;
     }
@@ -78,6 +86,10 @@ class ApiController extends Controller
             }
 
             return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
+            if (($uploadResponse = $this->handleUploadBuilderFallback($request, $dynamicPath)) !== null) {
+                return $uploadResponse;
+            }
+
             $resolvedRoute = $this->resolver->resolve($dynamicPath, $request->method());
             /** @var ApiConfig|null $apiConfigs */
             $apiConfigs = $resolvedRoute['config'];
@@ -124,6 +136,108 @@ class ApiController extends Controller
       return $controller?->executeRuntimeRequest($request, $dynamicPath);
   }
 
+  protected function handleUploadBuilderFallback(Request $request, string $dynamicPath): ?JsonResponse
+  {
+      $path = trim($dynamicPath, '/');
+
+      if ($path === '' || ! str_starts_with($path, 'upload/')) {
+          return null;
+      }
+
+      if (! $request->isMethod('POST')) {
+          return response()->json([
+              'status' => 405,
+              'error' => 'Method not allowed',
+              'message' => 'Upload Builder only accepts POST requests',
+          ], 405);
+      }
+
+      $uploadConfig = $this->uploadConfigResolver()->resolve($path);
+
+      if ($uploadConfig === null) {
+          return response()->json([
+              'status' => 404,
+              'error' => 'Upload Builder tidak ditemukan',
+              'message' => 'Upload Builder tidak ditemukan',
+          ], 404);
+      }
+
+      return $this->runDynamicUploadMiddlewarePipeline($request, $uploadConfig, function (Request $request) use ($uploadConfig) {
+          return $this->handleUploadRequest($request, $uploadConfig);
+      });
+  }
+
+  protected function handleUploadRequest(Request $request, UploadConfig $uploadConfig): JsonResponse
+  {
+      $maxFileSizeRules = $this->buildUploadMaxFileSizeRules($uploadConfig->max_file_size);
+      $allowedExtensions = $this->normalizeUploadExtensions($uploadConfig->allowed_extensions ?? []);
+
+      $rules = $uploadConfig->multiple
+          ? [
+              'files' => ['required', 'array', 'min:1'],
+              'files.*' => array_values(array_filter(array_merge(
+                  ['required', 'file'],
+                  $allowedExtensions !== [] ? ['mimes:' . implode(',', $allowedExtensions)] : [],
+                  $maxFileSizeRules,
+              ))),
+          ]
+          : [
+              'file' => array_values(array_filter(array_merge(
+                  ['required', 'file'],
+                  $allowedExtensions !== [] ? ['mimes:' . implode(',', $allowedExtensions)] : [],
+                  $maxFileSizeRules,
+              ))),
+          ];
+
+      $validator = Validator::make($request->all(), $rules);
+
+      if ($validator->fails()) {
+          return response()->json([
+              'success' => false,
+              'message' => $validator->errors()->first(),
+              'errors' => $validator->errors()->toArray(),
+          ], 422);
+      }
+
+      $storageDisk = $this->resolveUploadStorageDisk();
+      $basePath = $this->resolveUploadBasePath($uploadConfig);
+
+      if ($uploadConfig->multiple) {
+          $paths = [];
+          foreach ((array) $request->file('files', []) as $file) {
+              if (! $file instanceof UploadedFile) {
+                  continue;
+              }
+
+              $paths[] = ['path' => $this->storeUploadedFile($file, $storageDisk, $basePath)];
+          }
+
+          return response()->json([
+              'success' => true,
+              'message' => 'Upload success',
+              'data' => $paths,
+          ]);
+      }
+
+      $file = $request->file('file');
+
+      if (! $file instanceof UploadedFile) {
+          return response()->json([
+              'success' => false,
+              'message' => 'File is required',
+          ], 422);
+      }
+
+      return response()->json([
+          'success' => true,
+          'message' => 'Upload success',
+          'data' => [
+              'path' => $this->storeUploadedFile($file, $storageDisk, $basePath),
+              'disk' => $storageDisk,
+          ],
+      ]);
+  }
+
   protected function dataSourceController(): ?DataSourceController
   {
       if ($this->dataSourceController instanceof DataSourceController) {
@@ -137,6 +251,34 @@ class ApiController extends Controller
       }
 
       return $this->dataSourceController;
+  }
+
+  protected function uploadConfigResolver(): UploadConfigResolver
+  {
+      if ($this->uploadConfigResolver instanceof UploadConfigResolver) {
+          return $this->uploadConfigResolver;
+      }
+
+      return $this->uploadConfigResolver = app(UploadConfigResolver::class);
+  }
+
+  protected function runDynamicUploadMiddlewarePipeline(Request $request, UploadConfig $uploadConfig, \Closure $destination): JsonResponse
+  {
+      $middlewares = array_values(array_filter(array_merge(
+          config('datasources.routes.dynamic.middleware', []),
+          $uploadConfig->middlewares ?? []
+      )));
+
+      if ($middlewares === []) {
+          return $destination($request);
+      }
+
+      $middlewares = $this->buildDynamicMiddlewarePipes($middlewares);
+
+      return $this->pipeline
+          ->send($request)
+          ->through($middlewares)
+          ->then(fn (Request $request) => $destination($request));
   }
 
   protected function handleFormBuilderFallback(Request $request, string $dynamicPath): ?JsonResponse
@@ -268,6 +410,86 @@ class ApiController extends Controller
       }
 
       return $payload;
+  }
+
+  protected function normalizeUploadExtensions(mixed $extensions): array
+  {
+      if (! is_array($extensions)) {
+          return [];
+      }
+
+      return array_values(array_filter(array_map(static function (mixed $extension): string {
+          $extension = strtolower(trim((string) $extension));
+          return ltrim($extension, '.');
+      }, $extensions), static fn (string $extension): bool => $extension !== ''));
+  }
+
+  protected function buildUploadMaxFileSizeRules(mixed $maxFileSize): array
+  {
+      if (! is_numeric($maxFileSize) || (int) $maxFileSize <= 0) {
+          return [];
+      }
+
+      return ['max:' . (int) $maxFileSize];
+  }
+
+  protected function normalizeUploadPath(mixed $uploadPath): string
+  {
+      return $this->normalizeUploadBasePath($uploadPath);
+  }
+
+  protected function normalizeUploadBasePath(mixed $basePath): string
+  {
+      $path = trim((string) $basePath, "/ \t\n\r\0\x0B");
+
+      return $path !== '' ? $path : 'uploads/general';
+  }
+
+  protected function storeUploadedFile(UploadedFile $file, string $diskName, string $basePath): string
+  {
+      $disk = Storage::disk($diskName);
+      $disk->makeDirectory($basePath);
+
+      $extension = strtolower((string) $file->getClientOriginalExtension());
+      $uniqueName = now()->timestamp . '-' . Str::random(13);
+
+      if ($extension !== '') {
+          $uniqueName .= '.' . $extension;
+      }
+
+      $relativePath = trim($basePath, '/') . '/' . $uniqueName;
+      $disk->putFileAs($basePath, $file, $uniqueName);
+
+      return $relativePath;
+  }
+
+  protected function resolveUploadStorageDisk(): string
+  {
+      $uploadStorage = config('datasources.upload_storage', []);
+      $disk = trim((string) ($uploadStorage['disk'] ?? 'local'));
+
+      if ($disk === '') {
+          $disk = config('filesystems.default', 'local');
+      }
+
+      $disks = config('filesystems.disks', []);
+
+      return is_array($disks) && array_key_exists($disk, $disks)
+          ? $disk
+          : config('filesystems.default', 'local');
+  }
+
+  protected function resolveUploadBasePath(?UploadConfig $uploadConfig = null): string
+  {
+      $uploadPath = $uploadConfig?->upload_path;
+
+      if (is_string($uploadPath) && trim($uploadPath) !== '') {
+          return $this->normalizeUploadBasePath($uploadPath);
+      }
+
+      $uploadStorage = config('datasources.upload_storage', []);
+
+      return $this->normalizeUploadBasePath($uploadStorage['base_path'] ?? 'uploads/general');
   }
 
   protected function prepareRuntimeRequest(Request $request, array $params): ?JsonResponse
