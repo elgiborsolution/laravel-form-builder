@@ -28,6 +28,9 @@ return new class extends Migration {
             $table->foreignId('api_config_id')->references('id')->on('api_configs')->onDelete('cascade');
             $table->integer('parent_id')->default(0);
             $table->string('primary_key', 250)->nullable();
+            $table->string('key_update_delete', 250)->nullable();
+            $table->string('child_update_key', 250)->nullable();
+            $table->string('missing_child_strategy', 50)->nullable()->default('KEEP_EXISTING');
             $table->string('foreign_key', 250)->nullable();
             $table->string('table_name', 250);
             $table->json('data_params')->nullable();

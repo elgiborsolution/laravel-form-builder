@@ -49,6 +49,25 @@ Example saved config:
 }
 ```
 
+For update/delete configs, the parent table can also define a custom lookup key:
+
+```json
+{
+  "parent_table": {
+    "table_name": "customers",
+    "primary_key": "id",
+    "key_update_delete": "code"
+  }
+}
+```
+
+That produces runtime usage like:
+
+```http
+PUT /api/customers/{code}
+DELETE /api/customers/{code}
+```
+
 Runtime URL:
 
 ```http
@@ -74,6 +93,8 @@ The builder stores these fields:
 - `middlewares`
 - `parent_table`
 - `child_tables`
+
+Inside `parent_table`, `key_update_delete` controls the route parameter used for PUT, PATCH, and DELETE. When it is missing, the package falls back to `primary_key`.
 
 ### Parameter format
 

@@ -7,6 +7,7 @@ use ESolution\DataSources\Models\ApiHook;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -25,8 +26,10 @@ class DataAPIBuilderController extends Controller
 
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
-        protected DynamicVariableParser $runtimeVariableParser
+        protected DynamicVariableParser $runtimeVariableParser,
+        protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
     ) {
+        $this->databaseMetadataProvider ??= new DatabaseMetadataProvider();
     }
 
     /**
@@ -839,6 +842,7 @@ class DataAPIBuilderController extends Controller
                         'parent_id' => 0,
                         'table_name' => $parentTableName,
                         'primary_key' => $payload['parent_table']['primary_key'] ?? 'id',
+                        'key_update_delete' => $this->resolveParentLookupKey($payload['parent_table'] ?? [], $payload['parent_table']['primary_key'] ?? 'id'),
                         'foreign_key' => $payload['parent_table']['foreign_key'] ?? null,
                         'data_params' => $payload['parent_table']['data_params'] ?? [],
                         'use_soft_delete' => $parentSoftDelete,
@@ -873,14 +877,31 @@ class DataAPIBuilderController extends Controller
                     $existingChild = $existingChildren
                         ? $existingChildren->firstWhere('table_name', $childTableName)
                         : null;
+                    $resolvedPrimaryKey = $this->resolveChildPrimaryKey($childTable, $existingChild, $childTableName);
+                    $resolvedChildUpdateKey = $this->resolveChildUpdateKey($childTable, $existingChild, $resolvedPrimaryKey, $childTableName);
+                    $resolvedMissingStrategy = $this->resolveMissingChildStrategy($childTable, $existingChild);
                     $childSoftDelete = array_key_exists('use_soft_delete', $childTable)
                         ? (bool) $childTable['use_soft_delete']
                         : ($existingChild?->use_soft_delete ?? $this->tableHasDeletedAt($childTableName));
 
+                    \Log::debug('API Builder child config sync', [
+                        'table_name' => $childTableName,
+                        'received_primary_key' => $childTable['primary_key'] ?? null,
+                        'received_child_update_key' => $childTable['child_update_key'] ?? null,
+                        'received_missing_child_strategy' => $childTable['missing_child_strategy'] ?? null,
+                        'saved_primary_key' => $resolvedPrimaryKey,
+                        'saved_child_update_key' => $resolvedChildUpdateKey,
+                        'saved_missing_child_strategy' => $resolvedMissingStrategy,
+                        'foreign_key' => $childTable['foreign_key'] ?? null,
+                    ]);
+
                     $children[] = new ApiTable([
                         'parent_id' => $parentId,
                         'table_name' => $childTableName,
-                        'foreign_key' => $childTable['foreign_key'] ?? null,
+                        'primary_key' => $resolvedPrimaryKey,
+                        'child_update_key' => $resolvedChildUpdateKey,
+                        'missing_child_strategy' => $resolvedMissingStrategy,
+                        'foreign_key' => $this->resolveChildForeignKey($childTable, $existingChild),
                         'data_params' => $childTable['data_params'] ?? [],
                         'use_soft_delete' => $childSoftDelete,
                     ]);
@@ -994,13 +1015,205 @@ class DataAPIBuilderController extends Controller
 
     protected function serializeApiTable(ApiTable $table): array
     {
-        return [
+        $serialized = [
             'table_name' => $table->table_name,
             'primary_key' => $table->primary_key,
+            'key_update_delete' => $this->resolveParentLookupKey($table),
+            'child_update_key' => $this->resolveChildLookupKey($table),
+            'missing_child_strategy' => $this->normalizeMissingChildStrategy($table->missing_child_strategy ?? null),
             'foreign_key' => $table->foreign_key,
             'data_params' => $table->data_params,
             'use_soft_delete' => (bool) $table->use_soft_delete,
         ];
+
+        \Log::debug('API Builder serialize table config', [
+            'table_name' => $serialized['table_name'],
+            'primary_key' => $serialized['primary_key'],
+            'key_update_delete' => $serialized['key_update_delete'],
+            'child_update_key' => $serialized['child_update_key'],
+            'missing_child_strategy' => $serialized['missing_child_strategy'],
+            'foreign_key' => $serialized['foreign_key'],
+        ]);
+
+        return $serialized;
+    }
+
+    protected function resolveParentLookupKey(mixed $table, mixed $fallback = null): ?string
+    {
+        if (is_array($table)) {
+            $lookupKey = trim((string) ($table['key_update_delete'] ?? ''));
+
+            if ($lookupKey !== '') {
+                return $lookupKey;
+            }
+
+            $primaryKey = trim((string) ($table['primary_key'] ?? $fallback ?? ''));
+
+            return $primaryKey !== '' ? $primaryKey : null;
+        }
+
+        if ($table instanceof ApiTable) {
+            $lookupKey = trim((string) ($table->key_update_delete ?? ''));
+
+            if ($lookupKey !== '') {
+                return $lookupKey;
+            }
+
+            $primaryKey = trim((string) ($table->primary_key ?? $fallback ?? ''));
+
+            return $primaryKey !== '' ? $primaryKey : null;
+        }
+
+        return null;
+    }
+
+    protected function resolveChildLookupKey(mixed $table, mixed $fallback = null): ?string
+    {
+        if (is_array($table)) {
+            $lookupKey = trim((string) ($table['child_update_key'] ?? ''));
+
+            if ($lookupKey !== '') {
+                return $lookupKey;
+            }
+
+            $primaryKey = trim((string) ($table['primary_key'] ?? $fallback ?? ''));
+
+            if ($primaryKey !== '') {
+                return $primaryKey;
+            }
+
+            return null;
+        }
+
+        if ($table instanceof ApiTable) {
+            $lookupKey = trim((string) ($table->child_update_key ?? ''));
+
+            if ($lookupKey !== '') {
+                return $lookupKey;
+            }
+
+            $primaryKey = trim((string) ($table->primary_key ?? $fallback ?? ''));
+
+            if ($primaryKey !== '') {
+                return $primaryKey;
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    protected function resolveChildPrimaryKey(array $childTable, ?ApiTable $existingChild = null, ?string $tableName = null): string
+    {
+        $primaryKey = trim((string) ($childTable['primary_key'] ?? ''));
+
+        if ($primaryKey !== '') {
+            return $primaryKey;
+        }
+
+        $existingPrimaryKey = trim((string) ($existingChild?->primary_key ?? ''));
+        if ($existingPrimaryKey !== '') {
+            return $existingPrimaryKey;
+        }
+
+        $resolvedTableName = trim((string) ($tableName ?? $childTable['table_name'] ?? ''));
+        if ($resolvedTableName !== '') {
+            $databasePrimaryKey = $this->resolveTablePrimaryKeyName($resolvedTableName);
+            if ($databasePrimaryKey !== '') {
+                return $databasePrimaryKey;
+            }
+        }
+
+        return 'id';
+    }
+
+    protected function resolveChildUpdateKey(array $childTable, ?ApiTable $existingChild = null, ?string $resolvedPrimaryKey = null, ?string $tableName = null): string
+    {
+        $lookupKey = trim((string) ($childTable['child_update_key'] ?? ''));
+
+        if ($lookupKey !== '') {
+            return $lookupKey;
+        }
+
+        $existingLookupKey = trim((string) ($existingChild?->child_update_key ?? ''));
+        if ($existingLookupKey !== '') {
+            return $existingLookupKey;
+        }
+
+        $primaryKey = trim((string) ($resolvedPrimaryKey ?? ($childTable['primary_key'] ?? '')));
+        if ($primaryKey !== '') {
+            return $primaryKey;
+        }
+
+        $resolvedTableName = trim((string) ($tableName ?? $childTable['table_name'] ?? ''));
+        if ($resolvedTableName !== '') {
+            $databasePrimaryKey = $this->resolveTablePrimaryKeyName($resolvedTableName);
+            if ($databasePrimaryKey !== '') {
+                return $databasePrimaryKey;
+            }
+        }
+
+        return 'id';
+    }
+
+    protected function resolveChildForeignKey(array $childTable, ?ApiTable $existingChild = null): ?string
+    {
+        $foreignKey = trim((string) ($childTable['foreign_key'] ?? ''));
+
+        if ($foreignKey !== '') {
+            return $foreignKey;
+        }
+
+        $existingForeignKey = trim((string) ($existingChild?->foreign_key ?? ''));
+
+        return $existingForeignKey !== '' ? $existingForeignKey : null;
+    }
+
+    protected function resolveMissingChildStrategy(array $childTable, ?ApiTable $existingChild = null): string
+    {
+        $strategy = trim((string) ($childTable['missing_child_strategy'] ?? ''));
+
+        if ($strategy !== '') {
+            return $this->normalizeMissingChildStrategy($strategy);
+        }
+
+        $existingStrategy = trim((string) ($existingChild?->missing_child_strategy ?? ''));
+        if ($existingStrategy !== '') {
+            return $this->normalizeMissingChildStrategy($existingStrategy);
+        }
+
+        return 'KEEP_EXISTING';
+    }
+
+    protected function resolveTablePrimaryKeyName(string $tableName): string
+    {
+        $tableName = trim($tableName);
+
+        if ($tableName === '') {
+            return '';
+        }
+
+        try {
+            $indexes = $this->databaseMetadataProvider?->listIndexes($tableName) ?? [];
+        } catch (\Throwable $e) {
+            return '';
+        }
+
+        foreach ($indexes as $index) {
+            if (! empty($index['primary']) && ! empty($index['column'])) {
+                return trim((string) $index['column']);
+            }
+        }
+
+        return '';
+    }
+
+    protected function normalizeMissingChildStrategy(mixed $value): string
+    {
+        $normalized = strtoupper(trim((string) ($value ?? 'KEEP_EXISTING')));
+
+        return $normalized === 'DELETE_MISSING' ? 'DELETE_MISSING' : 'KEEP_EXISTING';
     }
 
     /**
@@ -1151,7 +1364,8 @@ class DataAPIBuilderController extends Controller
           
           $validateParentTable = [
             'table_name' => 'required|string',
-            'primary_key' => 'nullable|string'
+            'primary_key' => 'nullable|string',
+            'key_update_delete' => 'nullable|string'
           ];
 
           $validateChildTable = [
@@ -1380,16 +1594,20 @@ class DataAPIBuilderController extends Controller
               fn ($query) => $query->where('method', strtoupper((string) $request->input('method')))
           ),
       ],
-      'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
-      'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
+      'method' => ["required" , "string", "in:GET,POST,PUT,PATCH,DELETE"],
+      'params' => ['nullable', 'required_if:method,PUT,POST,PATCH', "array"],
       'parent_table' => 'required|array',
       'parent_table.table_name' => 'required|string',
       'parent_table.primary_key' => 'nullable|string',
+      'parent_table.key_update_delete' => 'nullable|string',
       'parent_table.foreign_key' => 'nullable|string',
       'parent_table.data_params' => 'nullable|array',
       'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
       'child_tables.*.table_name' => 'nullable|string',
+      'child_tables.*.primary_key' => 'nullable|string',
+      'child_tables.*.child_update_key' => 'nullable|string',
+      'child_tables.*.missing_child_strategy' => ['nullable', Rule::in(['KEEP_EXISTING', 'DELETE_MISSING'])],
       'child_tables.*.foreign_key' => 'nullable|string',
       'child_tables.*.data_params' => 'nullable|array',
       'child_tables.*.use_soft_delete' => 'nullable|boolean',
@@ -1580,16 +1798,20 @@ class DataAPIBuilderController extends Controller
               ->where(fn ($query) => $query->where('method', strtoupper((string) $request->input('method'))))
               ->ignore($dataApiBuilder->id),
       ],
-      'method' => ["required" , "string", "in:GET,POST,PUT,DELETE"],
-      'params' => ['nullable', 'required_if:method,PUT,POST', "array"],
+      'method' => ["required" , "string", "in:GET,POST,PUT,PATCH,DELETE"],
+      'params' => ['nullable', 'required_if:method,PUT,POST,PATCH', "array"],
       'parent_table' => 'required|array',
       'parent_table.table_name' => 'required|string',
       'parent_table.primary_key' => 'nullable|string',
+      'parent_table.key_update_delete' => 'nullable|string',
       'parent_table.foreign_key' => 'nullable|string',
       'parent_table.data_params' => 'nullable|array',
       'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
       'child_tables.*.table_name' => 'nullable|string',
+      'child_tables.*.primary_key' => 'nullable|string',
+      'child_tables.*.child_update_key' => 'nullable|string',
+      'child_tables.*.missing_child_strategy' => ['nullable', Rule::in(['KEEP_EXISTING', 'DELETE_MISSING'])],
       'child_tables.*.foreign_key' => 'nullable|string',
       'child_tables.*.data_params' => 'nullable|array',
       'child_tables.*.use_soft_delete' => 'nullable|boolean',
@@ -1731,16 +1953,20 @@ class DataAPIBuilderController extends Controller
               }
           },
       ],
-      'method' => ['nullable', 'string', 'in:POST,PUT,DELETE'],
+      'method' => ['nullable', 'string', 'in:POST,PUT,PATCH,DELETE'],
       'params' => ['required', 'array'],
       'parent_table' => 'required|array',
       'parent_table.table_name' => 'required|string',
       'parent_table.primary_key' => 'nullable|string',
+      'parent_table.key_update_delete' => 'nullable|string',
       'parent_table.foreign_key' => 'nullable|string',
       'parent_table.data_params' => 'nullable|array',
       'parent_table.use_soft_delete' => 'nullable|boolean',
       'child_tables' => 'nullable|array',
       'child_tables.*.table_name' => 'nullable|string',
+      'child_tables.*.primary_key' => 'nullable|string',
+      'child_tables.*.child_update_key' => 'nullable|string',
+      'child_tables.*.missing_child_strategy' => ['nullable', Rule::in(['KEEP_EXISTING', 'DELETE_MISSING'])],
       'child_tables.*.foreign_key' => 'nullable|string',
       'child_tables.*.data_params' => 'nullable|array',
       'child_tables.*.use_soft_delete' => 'nullable|boolean',
@@ -1770,7 +1996,7 @@ class DataAPIBuilderController extends Controller
         try {
             $connection->beginTransaction();
 
-            foreach (['POST', 'PUT', 'DELETE'] as $method) {
+            foreach (['POST', 'PUT', 'PATCH', 'DELETE'] as $method) {
                 $bundlePayload = $validated;
                 $bundlePayload['method'] = $method;
                 $bundlePayload['route_name'] = $this->buildCrudBundleRouteName(
