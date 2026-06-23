@@ -16,7 +16,7 @@ class ApiTable extends Model
      *
      * @var array
      */
-    protected $fillable = ['api_config_id', 'parent_id', 'table_name', 'data_params', 'foreign_key', 'primary_key', 'use_soft_delete'];
+    protected $fillable = ['api_config_id', 'parent_id', 'table_name', 'data_params', 'foreign_key', 'primary_key', 'key_update_delete', 'child_update_key', 'missing_child_strategy', 'use_soft_delete'];
     
     /**
      * Cast attributes to a specific data type.

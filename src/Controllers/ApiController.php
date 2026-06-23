@@ -11,6 +11,7 @@ use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Models\UploadConfig;
 use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Support\MiddlewareConnectionResolver;
 use ESolution\DataSources\Support\UploadConfigResolver;
@@ -38,6 +39,7 @@ class ApiController extends Controller
     protected ?AfterHitApiDispatcher $afterHitApiDispatcher = null;
     protected ?DataSourceController $dataSourceController = null;
     protected ?UploadConfigResolver $uploadConfigResolver = null;
+    protected ?DatabaseMetadataProvider $databaseMetadataProvider = null;
 
     /**
      * Keep track of the connection that should be used for runtime validation
@@ -55,11 +57,13 @@ class ApiController extends Controller
         protected ExecutionConnectionResolver $executionConnectionResolver,
         ?AfterHitApiDispatcher $afterHitApiDispatcher = null,
         ?DataSourceController $dataSourceController = null,
-        ?UploadConfigResolver $uploadConfigResolver = null
+        ?UploadConfigResolver $uploadConfigResolver = null,
+        ?DatabaseMetadataProvider $databaseMetadataProvider = null
     ) {
         $this->uploadConfigResolver = $uploadConfigResolver;
         $this->afterHitApiDispatcher = $afterHitApiDispatcher;
         $this->dataSourceController = $dataSourceController;
+        $this->databaseMetadataProvider = $databaseMetadataProvider;
     }
 
   /**
@@ -512,10 +516,12 @@ class ApiController extends Controller
 
   protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id, ?string $action = null): JsonResponse
   {
+        $lookupKey = $this->resolveParentLookupKey($apiConfigs);
+
         if($apiConfigs->method == 'POST'){
             if ($action === 'restore') {
                 if (empty($id)) {
-                    return response()->json(['status' => 400, 'error'=> 'primary_key is required', 'message'=>'primary_key is required'], 400);
+                    return response()->json(['status' => 400, 'error'=> "{$lookupKey} is required", 'message'=> "{$lookupKey} is required"], 400);
                 }
 
                 return $this->restore($request, $apiConfigs, $id);
@@ -534,10 +540,9 @@ class ApiController extends Controller
             );
         }
 
-        if($apiConfigs->method == 'PUT'){
+        if(in_array($apiConfigs->method, ['PUT', 'PATCH'], true)){
             if(empty($id)){
-
-              return response()->json(['status' => 400, 'error'=> 'primary_key is required', 'message'=>'primary_key is required'], 400);
+              return response()->json(['status' => 400, 'error'=> "{$lookupKey} is required", 'message'=> "{$lookupKey} is required"], 400);
             }
 
             return $this->update($request, $apiConfigs, $id);
@@ -546,8 +551,7 @@ class ApiController extends Controller
 
         if($apiConfigs->method == 'DELETE'){
             if(empty($id)){
-
-              return response()->json(['status' => 400, 'error'=> 'primary_key is required', 'message'=>'primary_key is required'], 400);
+              return response()->json(['status' => 400, 'error'=> "{$lookupKey} is required", 'message'=> "{$lookupKey} is required"], 400);
             }
 
             return $this->destroy($request, $apiConfigs, $id);
@@ -598,6 +602,290 @@ class ApiController extends Controller
         }
 
         $query->delete();
+  }
+
+  protected function resolveParentLookupKey(ApiConfig $apiConfig): string
+  {
+        $lookupKey = trim((string) ($apiConfig->parentTable?->key_update_delete ?? ''));
+
+        if ($lookupKey !== '') {
+            return $lookupKey;
+        }
+
+        $primaryKey = trim((string) ($apiConfig->parentTable?->primary_key ?? ''));
+
+        return $primaryKey !== '' ? $primaryKey : 'id';
+  }
+
+  protected function resolveRecordValue(mixed $record, string $field, mixed $fallback = null): mixed
+  {
+        if (is_object($record) && isset($record->{$field})) {
+            return $record->{$field};
+        }
+
+        if (is_array($record) && array_key_exists($field, $record)) {
+            return $record[$field];
+        }
+
+        return $fallback;
+  }
+
+  protected function resolveParentRecordContext(ApiConfig $apiConfig, $connection, string $cleanParentTable, mixed $id): ?array
+  {
+        $lookupKey = $this->resolveParentLookupKey($apiConfig);
+        $primaryKey = trim((string) ($apiConfig->parentTable?->primary_key ?? ''));
+        $record = $connection->table($cleanParentTable)
+            ->where($lookupKey, $id)
+            ->first();
+
+        if ($record === null) {
+            return null;
+        }
+
+        $resolvedPrimaryKey = $primaryKey !== '' ? $primaryKey : $lookupKey;
+        $parentId = $this->resolveRecordValue($record, $resolvedPrimaryKey, $id);
+
+        return [
+            'lookup_key' => $lookupKey,
+            'primary_key' => $resolvedPrimaryKey,
+            'record' => $record,
+            'parent_id' => $parentId,
+        ];
+  }
+
+  protected function resolveChildUpdateKey(array $childTable, ?string $connectionName = null): string
+  {
+        $lookupKey = trim((string) ($childTable['child_update_key'] ?? ''));
+
+        if ($lookupKey !== '') {
+            return $lookupKey;
+        }
+
+        $primaryKey = trim((string) ($childTable['primary_key'] ?? ''));
+
+        if ($primaryKey !== '') {
+            return $primaryKey;
+        }
+
+        $tableName = trim((string) ($childTable['table_name'] ?? ''));
+
+        if ($tableName !== '') {
+            $resolvedPrimaryKey = $this->resolveTablePrimaryKeyName($tableName, $connectionName);
+
+            if ($resolvedPrimaryKey !== '') {
+                return $resolvedPrimaryKey;
+            }
+        }
+
+        return 'id';
+  }
+
+  protected function normalizeMissingChildStrategy(mixed $value): string
+  {
+        $normalized = strtoupper(trim((string) ($value ?? 'KEEP_EXISTING')));
+
+        return $normalized === 'DELETE_MISSING' ? 'DELETE_MISSING' : 'KEEP_EXISTING';
+  }
+
+  protected function resolveTablePrimaryKeyName(string $tableName, ?string $connectionName = null): string
+  {
+        $tableName = trim($tableName);
+
+        if ($tableName === '' || $this->databaseMetadataProvider === null) {
+            return '';
+        }
+
+        try {
+            $indexes = $this->databaseMetadataProvider->listIndexes($tableName, $connectionName);
+        } catch (\Throwable $e) {
+            return '';
+        }
+
+        foreach ($indexes as $index) {
+            if (! empty($index['primary']) && ! empty($index['column'])) {
+                return trim((string) $index['column']);
+            }
+        }
+
+        return '';
+  }
+
+  protected function resolveChildRowIdentifier(array $row, string $lookupKey): mixed
+  {
+        if ($lookupKey === '' || ! array_key_exists($lookupKey, $row)) {
+            return null;
+        }
+
+        $value = $row[$lookupKey];
+
+        if ($this->isMissingBuilderValue($value)) {
+            return null;
+        }
+
+        return $value;
+  }
+
+  protected function isMissingBuilderValue(mixed $value): bool
+  {
+        if ($value === self::DATA_BUILDER_MISSING) {
+            return true;
+        }
+
+        return is_string($value) && trim($value) === self::DATA_BUILDER_MISSING;
+  }
+
+  protected function sanitizePersistedRow(array $row, ?string $lookupKey = null): array
+  {
+        foreach ($row as $column => $value) {
+            if ($this->isMissingBuilderValue($value)) {
+                unset($row[$column]);
+            }
+        }
+
+        if ($lookupKey !== null && array_key_exists($lookupKey, $row) && $this->isMissingBuilderValue($row[$lookupKey])) {
+            unset($row[$lookupKey]);
+        }
+
+        return $row;
+  }
+
+  protected function persistChildTableRows(
+      $connection,
+      array $table,
+      string $tableChild,
+      array $childRows,
+      array $parentIds,
+      ?string $connectionName = null,
+      ?Request $request = null
+  ): void {
+        $foreignKey = trim((string) ($table['foreign_key'] ?? ''));
+
+        if ($foreignKey === '' || $tableChild === '' || $parentIds === []) {
+            return;
+        }
+
+        $childLookupKey = $this->resolveChildUpdateKey($table, $connectionName);
+        $missingChildStrategy = $this->normalizeMissingChildStrategy($table['missing_child_strategy'] ?? null);
+        $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
+        $tablePrimaryKey = trim((string) ($table['primary_key'] ?? ''));
+
+        if ($tablePrimaryKey === '') {
+            $tablePrimaryKey = $this->resolveTablePrimaryKeyName($tableChild, $connectionName);
+        }
+
+        $rawChildCollection = [];
+        if ($request instanceof Request) {
+            $detectedCollection = $this->detectLoopInsertCollection(
+                is_array($table['data_params'] ?? null) ? $table['data_params'] : [],
+                $request
+            );
+
+            if (is_array($detectedCollection)) {
+                $rawChildCollection = array_values($detectedCollection);
+            }
+        }
+
+        \Log::debug('API Builder child persistence config', [
+            'table' => $tableChild,
+            'foreign_key' => $foreignKey,
+            'child_update_key' => $childLookupKey,
+            'missing_child_strategy' => $missingChildStrategy,
+            'child_row_count' => count($childRows),
+            'raw_child_count' => count($rawChildCollection),
+        ]);
+
+        foreach ($parentIds as $parentId) {
+            $incomingIdentifiers = [];
+            $hasIdentifiedChildRows = false;
+
+            foreach ($childRows as $index => $childRow) {
+                $persistedRow = $this->sanitizePersistedRow($childRow, $childLookupKey);
+                $persistedRow[$foreignKey] = $parentId;
+                $identifier = $this->resolveChildRowIdentifier($persistedRow, $childLookupKey);
+
+                if ($identifier === null && array_key_exists($index, $rawChildCollection)) {
+                    $identifier = $this->resolveValueFromContext($childLookupKey, $rawChildCollection[$index]);
+                    if ($this->isMissingBuilderValue($identifier)) {
+                        $identifier = null;
+                    }
+                }
+
+                if ($identifier !== null) {
+                    $hasIdentifiedChildRows = true;
+                    $incomingIdentifiers[] = $identifier;
+                    $persistedRow[$childLookupKey] = $identifier;
+
+                    $existingQuery = $connection->table($tableChild)
+                        ->where($foreignKey, $parentId)
+                        ->where($childLookupKey, $identifier);
+                    $existingFound = $existingQuery->exists();
+
+                    \Log::debug('API Builder child lookup', [
+                        'table' => $tableChild,
+                        'foreign_key' => $foreignKey,
+                        'child_update_key' => $childLookupKey,
+                        'payload_value' => $identifier,
+                        'parent_id' => $parentId,
+                        'existing_found' => $existingFound,
+                    ]);
+
+                    if ($existingFound) {
+                        \Log::debug('API Builder child action', [
+                            'table' => $tableChild,
+                            'action' => 'UPDATE',
+                            'payload_value' => $identifier,
+                        ]);
+                        $existingQuery->update($persistedRow);
+                        continue;
+                    }
+                }
+                else {
+                    unset($persistedRow[$childLookupKey]);
+                }
+
+                \Log::debug('API Builder child action', [
+                    'table' => $tableChild,
+                    'action' => 'INSERT',
+                    'payload_value' => $identifier,
+                ]);
+                $insertedIds = $this->insertTableRows($connection, $tableChild, [$persistedRow]);
+
+                if ($tablePrimaryKey !== '' && strcasecmp($childLookupKey, $tablePrimaryKey) === 0 && $insertedIds !== []) {
+                    $hasIdentifiedChildRows = true;
+                    $incomingIdentifiers = array_merge($incomingIdentifiers, $insertedIds);
+                }
+            }
+
+            if ($missingChildStrategy !== 'DELETE_MISSING') {
+                continue;
+            }
+
+            if ($childRows === []) {
+                $missingQuery = $connection->table($tableChild)->where($foreignKey, $parentId);
+
+                if ($childUsesSoftDelete) {
+                    $missingQuery->update(['deleted_at' => now()]);
+                } else {
+                    $missingQuery->delete();
+                }
+
+                continue;
+            }
+
+            if (! $hasIdentifiedChildRows) {
+                continue;
+            }
+
+            $missingQuery = $connection->table($tableChild)->where($foreignKey, $parentId);
+            $incomingIdentifiers = array_values(array_unique($incomingIdentifiers));
+            $missingQuery->whereNotIn($childLookupKey, $incomingIdentifiers);
+
+            if ($childUsesSoftDelete) {
+                $missingQuery->update(['deleted_at' => now()]);
+            } else {
+                $missingQuery->delete();
+            }
+        }
   }
 
   protected function logDeleteMode(string $context, ApiConfig $apiConfig, string $tableName, bool $useSoftDelete, string $primaryKey, mixed $id): void
@@ -1059,18 +1347,26 @@ class ApiController extends Controller
         $this->runBeforeExecuteHooks($request, $apiConfigs);
 
         $parentTable = $apiConfigs->parentTable->table_name;
-        $primarykey = $apiConfigs->parentTable->primary_key;
 
         $connection = $this->executionConnectionResolver->connection($request);
         $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
+        $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+        $parentContext = $this->resolveParentRecordContext($apiConfigs, $connection, $cleanParentTable, $id);
+
+        if ($parentContext === null) {
+            return response()->json(['status' => 404, 'error' => 'Data not found', 'message' => 'Data not found'], 404);
+        }
+
+        $lookupKey = $parentContext['lookup_key'];
+        $primarykey = $parentContext['primary_key'];
+        $parentRecordId = $parentContext['parent_id'];
 
         $masterParam1Level = $this->flattenArray($apiConfigs->params);
 
         try {
             $connection->beginTransaction();
-            $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
             $parentRows = $this->buildMappedTableRows(
                 is_array($apiConfigs->parentTable->data_params ?? null) ? $apiConfigs->parentTable->data_params : [],
@@ -1084,12 +1380,12 @@ class ApiController extends Controller
 
             if (count($parentRows) === 1) {
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $id)
+                    ->where($lookupKey, $id)
                     ->update($parentRows[0]);
-                $parentIds = [$id];
+                $parentIds = [$parentRecordId];
             } else {
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $id)
+                    ->where($lookupKey, $id)
                     ->delete();
                 $parentIds = $this->insertTableRows($connection, $cleanParentTable, $parentRows);
             }
@@ -1098,15 +1394,19 @@ class ApiController extends Controller
                 throw new \RuntimeException('Unable to persist parent table data.');
             }
 
+            $replaceChildRows = count($parentRows) > 1;
+
             foreach ($childTables as $table) {
                 $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
-                $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
+                if ($replaceChildRows) {
+                    $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
+                    $childQuery = $connection->table($tableChild)->where($table['foreign_key'], $parentRecordId);
 
-                $childQuery = $connection->table($tableChild)->where($table['foreign_key'], $id);
-                if ($childUsesSoftDelete) {
-                    $childQuery->update(['deleted_at' => now()]);
-                } else {
-                    $childQuery->delete();
+                    if ($childUsesSoftDelete) {
+                        $childQuery->update(['deleted_at' => now()]);
+                    } else {
+                        $childQuery->delete();
+                    }
                 }
 
                 $childRows = $this->buildMappedTableRows(
@@ -1115,20 +1415,21 @@ class ApiController extends Controller
                     $masterParam1Level
                 );
 
-                if ($childRows === []) {
+                $missingChildStrategy = $this->normalizeMissingChildStrategy($table['missing_child_strategy'] ?? null);
+
+                if ($childRows === [] && $missingChildStrategy !== 'DELETE_MISSING') {
                     continue;
                 }
 
-                foreach ($parentIds as $parentId) {
-                    $rowsToInsert = [];
-
-                    foreach ($childRows as $childRow) {
-                        $childRow[$table['foreign_key']] = $parentId;
-                        $rowsToInsert[] = $childRow;
-                    }
-
-                    $this->insertTableRows($connection, $tableChild, $rowsToInsert);
-                }
+                $this->persistChildTableRows(
+                    $connection,
+                    $table,
+                    $tableChild,
+                    $childRows,
+                    $parentIds,
+                    $connectionName,
+                    $request
+                );
             }
 
             $finalRecord = $this->normalizeAfterHitRecord(
@@ -1183,22 +1484,30 @@ class ApiController extends Controller
         $this->runBeforeExecuteHooks($request, $apiConfigs);
 
         $parentTable = $apiConfigs->parentTable->table_name;
-        $primarykey = $apiConfigs->parentTable->primary_key;
 
         $connection = $this->executionConnectionResolver->connection($request);
         $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
+        $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+        $parentContext = $this->resolveParentRecordContext($apiConfigs, $connection, $cleanParentTable, $id);
+
+        if ($parentContext === null) {
+            return response()->json(['status' => 404, 'error' => 'Data not found', 'message' => 'Data not found'], 404);
+        }
+
+        $lookupKey = $parentContext['lookup_key'];
+        $primarykey = $parentContext['primary_key'];
+        $parentRecordId = $parentContext['parent_id'];
 
         $masterParam1Level = $this->flattenArray($apiConfigs->params);
 
         try {
             $connection->beginTransaction();
-            $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
             $beforeData = $this->normalizeAfterHitRecord(
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $id)
+                    ->where($primarykey, $parentRecordId)
                     ->first()
             );
 
@@ -1218,15 +1527,15 @@ class ApiController extends Controller
                 $connectionName
             );
 
-            $this->logDeleteMode('parent', $apiConfigs, $cleanParentTable, $parentUsesSoftDelete, $primarykey, $id);
-            $this->deleteTableRecord($connection, $cleanParentTable, $primarykey, $id, $parentUsesSoftDelete);
+            $this->logDeleteMode('parent', $apiConfigs, $cleanParentTable, $parentUsesSoftDelete, $lookupKey, $id);
+            $this->deleteTableRecord($connection, $cleanParentTable, $lookupKey, $id, $parentUsesSoftDelete);
 
             foreach ($childTables as $key => $table) {
                 $tableChild = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
                 $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
 
-                $this->logDeleteMode('child', $apiConfigs, $tableChild, $childUsesSoftDelete, (string) ($table['foreign_key'] ?? ''), $id);
-                $this->deleteTableRecord($connection, $tableChild, $table['foreign_key'], $id, $childUsesSoftDelete);
+                $this->logDeleteMode('child', $apiConfigs, $tableChild, $childUsesSoftDelete, (string) ($table['foreign_key'] ?? ''), $parentRecordId);
+                $this->deleteTableRecord($connection, $tableChild, $table['foreign_key'], $parentRecordId, $childUsesSoftDelete);
 
             }
 
@@ -1439,20 +1748,27 @@ protected function collectArrayParamNames(array $params, array &$names = [], str
         $this->runBeforeExecuteHooks($request, $apiConfigs);
 
         $parentTable = $apiConfigs->parentTable->table_name;
-        $primarykey = $apiConfigs->parentTable->primary_key;
 
         $connection = $this->executionConnectionResolver->connection($request);
         $connectionName = $this->executionConnectionResolver->resolve($request);
         $prefix = $connection->getTablePrefix();
         $childTables = $apiConfigs->childTables->toArray();
+        $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+        $parentContext = $this->resolveParentRecordContext($apiConfigs, $connection, $cleanParentTable, $id);
+
+        if ($parentContext === null) {
+            return response()->json(['status' => 404, 'error' => 'Data not found', 'message' => 'Data not found'], 404);
+        }
+
+        $primarykey = $parentContext['primary_key'];
+        $parentRecordId = $parentContext['parent_id'];
 
         try {
             $connection->beginTransaction();
-            $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
 
             $beforeData = $this->normalizeAfterHitRecord(
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $id)
+                    ->where($primarykey, $parentRecordId)
                     ->first()
             );
 
@@ -1466,7 +1782,7 @@ protected function collectArrayParamNames(array $params, array &$names = [], str
             );
 
             if ($parentUsesSoftDelete) {
-                $this->restoreTableRecord($connection, $cleanParentTable, $primarykey, $id);
+                $this->restoreTableRecord($connection, $cleanParentTable, $primarykey, $parentRecordId);
             }
 
             foreach ($childTables as $table) {
@@ -1474,13 +1790,13 @@ protected function collectArrayParamNames(array $params, array &$names = [], str
                 $childUsesSoftDelete = $this->usesSoftDeleteForTable($table, $tableChild, $connectionName);
 
                 if ($childUsesSoftDelete) {
-                    $this->restoreTableRecord($connection, $tableChild, $table['foreign_key'], $id);
+                    $this->restoreTableRecord($connection, $tableChild, $table['foreign_key'], $parentRecordId);
                 }
             }
 
             $restoredRecord = $this->normalizeAfterHitRecord(
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $id)
+                    ->where($primarykey, $parentRecordId)
                     ->first()
             );
 
