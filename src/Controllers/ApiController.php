@@ -27,6 +27,8 @@ use Illuminate\Support\Str;
 
 class ApiController extends Controller
 {
+    protected const DATA_BUILDER_MISSING = '__ESOLUTION_DATA_BUILDER_MISSING__';
+
     /**
      * Track whether the request is already running inside the datasource
      * validation connection scope.
@@ -1783,7 +1785,7 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
    * @param Request $request
    * @return mixed
    */
-  protected function resolveDataParamValue(mixed $value, Request $request): mixed
+  protected function resolveDataParamValue(mixed $value, Request $request, mixed $context = null): mixed
   {
       if (! is_string($value)) {
           return $value;
@@ -1799,13 +1801,21 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
           return $this->runtimeVariableParser->parse($value);
       }
 
+      if ($context !== null) {
+          $contextValue = $this->resolveValueFromContext($normalized, $context);
+
+          if ($contextValue !== self::DATA_BUILDER_MISSING) {
+              return $contextValue;
+          }
+      }
+
       if ($request->has($normalized)) {
           return $request->input($normalized);
       }
 
-      $nestedValue = data_get($request->all(), $normalized, '__ESOLUTION_DATA_BUILDER_MISSING__');
+      $nestedValue = data_get($request->all(), $normalized, self::DATA_BUILDER_MISSING);
 
-      if ($nestedValue !== '__ESOLUTION_DATA_BUILDER_MISSING__') {
+      if ($nestedValue !== self::DATA_BUILDER_MISSING) {
           return $nestedValue;
       }
 
@@ -1824,16 +1834,16 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
    * @param array<string, array{type?: string, required?: bool}> $flattenedParams
    * @return mixed
    */
-  protected function resolveMappedDataParamValue(mixed $value, Request $request, array $flattenedParams): mixed
+  protected function resolveMappedDataParamValue(mixed $value, Request $request, array $flattenedParams, mixed $context = null): mixed
   {
       if ($this->isDataParamMappingDescriptor($value)) {
           $mapping = $this->normalizeDataParamMapping($value);
-          $resolved = $this->resolveDataParamValue($mapping['value'] ?? null, $request);
+          $resolved = $this->resolveDataParamValue($mapping['value'] ?? null, $request, $context);
 
           return $this->serializeDatabaseValue($resolved);
       }
 
-      $resolved = $this->resolveDataParamValue($value, $request);
+      $resolved = $this->resolveDataParamValue($value, $request, $context);
 
       return $this->serializeDatabaseValue($resolved);
   }
@@ -1879,6 +1889,86 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       ];
   }
 
+  protected function resolveValueFromContext(string $path, mixed $context): mixed
+  {
+      if (! is_array($context) && ! is_object($context)) {
+          return self::DATA_BUILDER_MISSING;
+      }
+
+      $candidatePaths = [$path];
+
+      if (str_contains($path, '.')) {
+          $segments = explode('.', $path);
+
+          while (count($segments) > 1) {
+              array_shift($segments);
+              $candidatePaths[] = implode('.', $segments);
+          }
+      }
+
+      foreach (array_values(array_unique($candidatePaths)) as $candidatePath) {
+          $resolved = data_get($context, $candidatePath, self::DATA_BUILDER_MISSING);
+
+          if ($resolved !== self::DATA_BUILDER_MISSING) {
+              return $resolved;
+          }
+      }
+
+      return self::DATA_BUILDER_MISSING;
+  }
+
+  protected function isLoopInsertCollection(mixed $value): bool
+  {
+      return is_array($value) && array_is_list($value);
+  }
+
+  protected function isNestedLoopInsertCollection(array $value): bool
+  {
+      foreach ($value as $item) {
+          if (is_array($item) || is_object($item)) {
+              return true;
+          }
+      }
+
+      return false;
+  }
+
+  protected function detectLoopInsertCollection(array $dataParams, Request $request, mixed $context = null): ?array
+  {
+      foreach ($dataParams as $mapping) {
+          $normalized = $this->normalizeDataParamMapping($mapping);
+          $sourceValue = $normalized['value'] ?? null;
+
+          if (! is_string($sourceValue)) {
+              continue;
+          }
+
+          $trimmed = trim($sourceValue);
+          if ($trimmed === '' || ! str_contains($trimmed, '.')) {
+              continue;
+          }
+
+          $root = explode('.', $trimmed)[0] ?? '';
+          if ($root === '') {
+              continue;
+          }
+
+          $candidate = $context !== null
+              ? $this->resolveValueFromContext($root, $context)
+              : (data_get($request->all(), $root, self::DATA_BUILDER_MISSING));
+
+          if ($candidate === self::DATA_BUILDER_MISSING || ! is_array($candidate)) {
+              continue;
+          }
+
+          if ($this->isLoopInsertCollection($candidate) && $this->isNestedLoopInsertCollection($candidate)) {
+              return $candidate;
+          }
+      }
+
+      return null;
+  }
+
   protected function serializeDatabaseValue(mixed $value): mixed
   {
       if (is_array($value) || is_object($value)) {
@@ -1890,10 +1980,27 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       return $value;
   }
 
-  protected function buildMappedTableRows(array $dataParams, Request $request, array $flattenedParams): array
+  protected function buildMappedTableRows(array $dataParams, Request $request, array $flattenedParams, mixed $context = null): array
   {
       if ($dataParams === []) {
           return [[]];
+      }
+
+      if ($context === null) {
+          $nestedCollection = $this->detectLoopInsertCollection($dataParams, $request);
+
+          if (is_array($nestedCollection) && $nestedCollection !== []) {
+              $rows = [];
+
+              foreach ($nestedCollection as $item) {
+                  $nestedContext = is_array($item) || is_object($item) ? $item : ['value' => $item];
+                  $nestedRows = $this->buildMappedTableRows($dataParams, $request, $flattenedParams, $nestedContext);
+
+                  $rows = array_merge($rows, $nestedRows);
+              }
+
+              return $rows === [] ? [] : $rows;
+          }
       }
 
       $staticRow = [];
@@ -1902,12 +2009,29 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       foreach ($dataParams as $column => $mapping) {
           $normalized = $this->normalizeDataParamMapping($mapping, is_string($column) ? $column : null);
           $sourceValue = $normalized['value'] ?? null;
-          $resolvedValue = $this->resolveDataParamValue($sourceValue, $request);
+          $resolvedValue = $this->resolveDataParamValue($sourceValue, $request, $context);
 
           if (
               ($normalized['array_handling'] ?? 'RAW_VALUE') === 'LOOP_INSERT'
               && is_array($resolvedValue)
           ) {
+              if (
+                  $resolvedValue !== []
+                  && $this->isLoopInsertCollection($resolvedValue)
+                  && $this->isNestedLoopInsertCollection($resolvedValue)
+              ) {
+                  $rows = [];
+
+                  foreach ($resolvedValue as $item) {
+                      $nestedContext = is_array($item) || is_object($item) ? $item : ['value' => $item];
+                      $nestedRows = $this->buildMappedTableRows($dataParams, $request, $flattenedParams, $nestedContext);
+
+                      $rows = array_merge($rows, $nestedRows);
+                  }
+
+                  return $rows === [] ? [] : $rows;
+              }
+
               $loopColumns[(string) $column] = array_values($resolvedValue);
               continue;
           }
