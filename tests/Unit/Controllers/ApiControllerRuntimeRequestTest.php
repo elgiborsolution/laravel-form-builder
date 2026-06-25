@@ -307,6 +307,35 @@ class ApiControllerRuntimeRequestTest extends TestCase
         $this->assertSame('unique:central_financia.users,email', $rule);
     }
 
+    public function test_it_uses_the_route_lookup_column_when_building_unique_rules_for_updates(): void
+    {
+        $controller = new class(
+            $this->createMock(DynamicApiConfigResolver::class),
+            $this->createMock(DataQueryService::class),
+            $this->createMock(Pipeline::class),
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            $this->createMock(MiddlewareConnectionResolver::class),
+            $this->createMock(ExecutionConnectionResolver::class),
+            $this->createMock(\ESolution\DataSources\Services\AfterHitApiDispatcher::class)
+        ) extends TestableApiController {
+            protected function resolveValidationConnectionName(?string $connectionName = null): string
+            {
+                return 'tenant_financia';
+            }
+        };
+
+        $rule = $controller->exposeFindValidateRule([
+            'name' => 'username',
+            'type' => 'string',
+            'unique' => true,
+        ], 'users', '5d517203-a82d-448d-bb0b-92e20f94fd39', 'uuid');
+
+        $this->assertSame(
+            'unique:tenant_financia.users,username,5d517203-a82d-448d-bb0b-92e20f94fd39,uuid',
+            $rule
+        );
+    }
+
     public function test_it_keeps_legacy_behavior_when_custom_rules_are_empty(): void
     {
         $controller = $this->makeController();
@@ -410,8 +439,8 @@ class TestableApiController extends ApiController
         return $this->prepareRuntimeRequest($request, $params);
     }
 
-    public function exposeFindValidateRule(array $rowParam, string $tableParent, int $primaryKey = 0): string
+    public function exposeFindValidateRule(array $rowParam, string $tableParent, mixed $primaryKey = 0, ?string $ignoreColumn = null): string
     {
-        return $this->findValidateRule($rowParam, $tableParent, $primaryKey);
+        return $this->findValidateRule($rowParam, $tableParent, $primaryKey, $ignoreColumn);
     }
 }

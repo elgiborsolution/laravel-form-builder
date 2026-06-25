@@ -1338,7 +1338,13 @@ class ApiController extends Controller
         }
 
         $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-        $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name, $id);
+        $validationRules = $this->buildValidationRulesFromParams(
+            $apiConfigs->params ?? [],
+            $apiConfigs->parentTable->table_name,
+            $id,
+            '',
+            $this->resolveParentLookupKey($apiConfigs)
+        );
 
         if ($validationRules !== []) {
             $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
@@ -1475,7 +1481,13 @@ class ApiController extends Controller
         }
 
         $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-        $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name, $id);
+        $validationRules = $this->buildValidationRulesFromParams(
+            $apiConfigs->params ?? [],
+            $apiConfigs->parentTable->table_name,
+            $id,
+            '',
+            $this->resolveParentLookupKey($apiConfigs)
+        );
 
         if ($validationRules !== []) {
             $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
@@ -1571,10 +1583,10 @@ class ApiController extends Controller
  *   - 'childValidate': Validation rules for array-type parameters.
  *   - 'paramIsArray': A list of parameters identified as arrays.
  */
-public function validateRule($params=[], $tableParent = '', $primaryKey = 0)
+public function validateRule($params=[], $tableParent = '', $primaryKey = 0, ?string $ignoreColumn = null)
   {
       $params = is_array($params) ? $params : [];
-      $validationRules = $this->buildValidationRulesFromParams($params, $tableParent, $primaryKey);
+      $validationRules = $this->buildValidationRulesFromParams($params, $tableParent, $primaryKey, '', $ignoreColumn);
 
       return [
           'parentValidate' => $validationRules,
@@ -1595,12 +1607,13 @@ public function validateRule($params=[], $tableParent = '', $primaryKey = 0)
  *
  * @return string The generated validation rule string.
  */
-public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
+public function findValidateRule($rowParam, $tableParent, $primaryKey = 0, ?string $ignoreColumn = null)
 {
     $value = $rowParam;
     $customRules = trim((string) ($value['validation_rules'] ?? ''));
     $rules = [];
     $typeRule = $this->mapValidationTypeRule($value['type'] ?? null);
+    $ignoreColumn = trim((string) ($ignoreColumn ?? 'id'));
 
     if (!empty($value['required']) && $value['required']) {
         $rules[] = 'required';
@@ -1612,10 +1625,16 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
         $rules[] = $typeRule;
     }
 
-    if (!empty($value['unique']) && $value['unique'] && $primaryKey == 0) {
+    if (!empty($value['unique']) && $value['unique']) {
         $prefix = DatabaseConnection::connection()->getTablePrefix();
         $table = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $tableParent);
-        $rules[] = 'unique:' . $this->validationTableForCurrentConnection($table) . ',' . $value['name'];
+        $uniqueRule = 'unique:' . $this->validationTableForCurrentConnection($table) . ',' . $value['name'];
+
+        if ($primaryKey != 0) {
+            $uniqueRule .= ',' . strval($primaryKey) . ',' . $ignoreColumn;
+        }
+
+        $rules[] = $uniqueRule;
     }
 
     if ($customRules !== '') {
@@ -1625,7 +1644,7 @@ public function findValidateRule($rowParam, $tableParent, $primaryKey = 0)
     return implode('|', array_values(array_filter($rules, static fn ($rule) => is_string($rule) && trim($rule) !== '')));
 }
 
-protected function buildValidationRulesFromParams(array $params, string $tableParent = '', mixed $primaryKey = 0, string $pathPrefix = ''): array
+protected function buildValidationRulesFromParams(array $params, string $tableParent = '', mixed $primaryKey = 0, string $pathPrefix = '', ?string $ignoreColumn = null): array
 {
     $rules = [];
 
@@ -1644,7 +1663,7 @@ protected function buildValidationRulesFromParams(array $params, string $tablePa
         $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
 
         if ($this->isContainerApiBuilderParamType($type)) {
-            $rules[$path] = $this->buildContainerValidationRule($param, $tableParent, $primaryKey);
+            $rules[$path] = $this->buildContainerValidationRule($param, $tableParent, $primaryKey, $ignoreColumn);
 
             $childPrefix = $type === 'object' ? $path : $path . '.*';
             $childParams = is_array($param['params'] ?? null) ? $param['params'] : [];
@@ -1652,7 +1671,7 @@ protected function buildValidationRulesFromParams(array $params, string $tablePa
             if ($childParams !== []) {
                 $rules = array_merge(
                     $rules,
-                    $this->buildValidationRulesFromParams($childParams, $tableParent, $primaryKey, $childPrefix)
+                    $this->buildValidationRulesFromParams($childParams, $tableParent, $primaryKey, $childPrefix, $ignoreColumn)
                 );
             }
 
@@ -1661,22 +1680,22 @@ protected function buildValidationRulesFromParams(array $params, string $tablePa
 
         if ($this->isPrimitiveArrayApiBuilderParamType($type)) {
             $rules[$path] = $this->buildPrimitiveArrayValidationRule($param);
-            $rules[$path . '.*'] = $this->buildPrimitiveArrayItemValidationRule($param, $tableParent, $primaryKey);
+            $rules[$path . '.*'] = $this->buildPrimitiveArrayItemValidationRule($param, $tableParent, $primaryKey, $ignoreColumn);
             continue;
         }
 
-        $rules[$path] = $this->findValidateRule($param, $tableParent, $primaryKey);
+        $rules[$path] = $this->findValidateRule($param, $tableParent, $primaryKey, $ignoreColumn);
     }
 
     return $rules;
 }
 
-protected function buildContainerValidationRule(array $param, string $tableParent, mixed $primaryKey): string
+protected function buildContainerValidationRule(array $param, string $tableParent, mixed $primaryKey, ?string $ignoreColumn = null): string
 {
     $baseParam = $param;
     $baseParam['type'] = 'array';
 
-    return $this->findValidateRule($baseParam, $tableParent, $primaryKey);
+    return $this->findValidateRule($baseParam, $tableParent, $primaryKey, $ignoreColumn);
 }
 
 protected function buildPrimitiveArrayValidationRule(array $param): string
@@ -1687,13 +1706,13 @@ protected function buildPrimitiveArrayValidationRule(array $param): string
     return implode('|', $rules);
 }
 
-protected function buildPrimitiveArrayItemValidationRule(array $param, string $tableParent, mixed $primaryKey): string
+protected function buildPrimitiveArrayItemValidationRule(array $param, string $tableParent, mixed $primaryKey, ?string $ignoreColumn = null): string
 {
     $itemParam = $param;
     $itemParam['type'] = $this->primitiveArrayItemType($param['type'] ?? null);
     $itemParam['required'] = true;
 
-    return $this->findValidateRule($itemParam, $tableParent, $primaryKey);
+    return $this->findValidateRule($itemParam, $tableParent, $primaryKey, $ignoreColumn);
 }
 
 protected function primitiveArrayItemType(mixed $type): string
@@ -1739,7 +1758,13 @@ protected function collectArrayParamNames(array $params, array &$names = [], str
         }
 
         $validationConnectionName = $this->executionConnectionResolver->resolve($request);
-        $validationRules = $this->buildValidationRulesFromParams($apiConfigs->params ?? [], $apiConfigs->parentTable->table_name, $id);
+        $validationRules = $this->buildValidationRulesFromParams(
+            $apiConfigs->params ?? [],
+            $apiConfigs->parentTable->table_name,
+            $id,
+            '',
+            $this->resolveParentLookupKey($apiConfigs)
+        );
 
         if ($validationRules !== []) {
             $this->validateWithDatasourceConnection($request->all(), $validationRules, $validationConnectionName);
