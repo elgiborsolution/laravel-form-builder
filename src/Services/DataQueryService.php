@@ -1128,15 +1128,16 @@ class DataQueryService
     protected function normalizeResultJsonColumns(mixed $result, array $definition): mixed
     {
         $jsonColumns = $this->resolveJsonColumnMap($definition);
+        $safeDetectAllColumns = empty($jsonColumns) && ! empty($definition['use_custom_query']);
 
-        if ($jsonColumns === []) {
+        if ($jsonColumns === [] && ! $safeDetectAllColumns) {
             return $result;
         }
 
         if ($result instanceof LengthAwarePaginator) {
             $result->setCollection(
                 $result->getCollection()->map(
-                    fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns)
+                    fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns, $safeDetectAllColumns)
                 )
             );
 
@@ -1145,13 +1146,13 @@ class DataQueryService
 
         if ($result instanceof Collection) {
             return $result->map(
-                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns)
+                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns, $safeDetectAllColumns)
             );
         }
 
         if (is_array($result) && isset($result['data']) && is_array($result['data'])) {
             $result['data'] = array_map(
-                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns),
+                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns, $safeDetectAllColumns),
                 $result['data']
             );
 
@@ -1160,7 +1161,7 @@ class DataQueryService
 
         if (is_array($result) && array_is_list($result)) {
             return array_map(
-                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns),
+                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns, $safeDetectAllColumns),
                 $result
             );
         }
@@ -1263,27 +1264,37 @@ class DataQueryService
         return [];
     }
 
-    protected function normalizeJsonColumnsForRow(mixed $row, array $jsonColumns): mixed
+    protected function normalizeJsonColumnsForRow(mixed $row, array $jsonColumns, bool $safeDetectAllColumns = false): mixed
     {
         if (is_object($row)) {
-            foreach ($jsonColumns as $column => $enabled) {
-                if (! property_exists($row, $column)) {
+            foreach (get_object_vars($row) as $column => $value) {
+                if ($safeDetectAllColumns) {
+                    $row->{$column} = $this->decodePotentialJsonValue($value);
                     continue;
                 }
 
-                $row->{$column} = $this->decodeJsonColumnValue($row->{$column});
+                if (! isset($jsonColumns[$column])) {
+                    continue;
+                }
+
+                $row->{$column} = $this->decodeJsonColumnValue($value);
             }
 
             return $row;
         }
 
         if (is_array($row)) {
-            foreach ($jsonColumns as $column => $enabled) {
-                if (! array_key_exists($column, $row)) {
+            foreach ($row as $column => $value) {
+                if ($safeDetectAllColumns) {
+                    $row[$column] = $this->decodePotentialJsonValue($value);
                     continue;
                 }
 
-                $row[$column] = $this->decodeJsonColumnValue($row[$column]);
+                if (! isset($jsonColumns[$column])) {
+                    continue;
+                }
+
+                $row[$column] = $this->decodeJsonColumnValue($value);
             }
         }
 
@@ -1298,6 +1309,31 @@ class DataQueryService
 
         try {
             return json_decode($value, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            return $value;
+        }
+    }
+
+    protected function decodePotentialJsonValue(mixed $value): mixed
+    {
+        if (! is_string($value)) {
+            return $value;
+        }
+
+        $trimmed = trim($value);
+
+        if ($trimmed === '') {
+            return $value;
+        }
+
+        $firstChar = $trimmed[0] ?? '';
+
+        if (! in_array($firstChar, ['{', '['], true)) {
+            return $value;
+        }
+
+        try {
+            return json_decode($trimmed, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             return $value;
         }
