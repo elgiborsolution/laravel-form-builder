@@ -22,6 +22,9 @@ use Illuminate\Support\Facades\Validator;
 class DataQueryService
 {
     protected const ALLOWED_FILTER_OPERATORS = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE', 'ILIKE', 'NOT ILIKE'];
+    protected const JSON_NATIVE_COLUMN_TYPES = ['json', 'jsonb'];
+    protected const JSON_AUTO_DECODE_TEXT_COLUMN_TYPES = ['mediumtext', 'longtext'];
+    protected const JSON_CONFIGURABLE_TEXT_COLUMN_TYPES = ['text'];
     protected bool $cacheEnabled = true;
     protected bool $forceDisableCacheForDataSource = true;
     protected ?string $executionConnectionName = null;
@@ -250,6 +253,8 @@ class DataQueryService
             if (!empty($result['error'])) {
                 return response()->json(['error' => $result['error'], 'message' => $result['error']], 400);
             }
+
+            $result = $this->normalizeResultJsonColumns($result, $definition);
 
             Log::debug('DataSource query final', [
                 'identifier' => $definition['identifier'] ?? null,
@@ -1118,6 +1123,216 @@ class DataQueryService
             'data' => (object) [],
             'message' => 'Data not found',
         ];
+    }
+
+    protected function normalizeResultJsonColumns(mixed $result, array $definition): mixed
+    {
+        $jsonColumns = $this->resolveJsonColumnMap($definition);
+
+        if ($jsonColumns === []) {
+            return $result;
+        }
+
+        if ($result instanceof LengthAwarePaginator) {
+            $result->setCollection(
+                $result->getCollection()->map(
+                    fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns)
+                )
+            );
+
+            return $result;
+        }
+
+        if ($result instanceof Collection) {
+            return $result->map(
+                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns)
+            );
+        }
+
+        if (is_array($result) && isset($result['data']) && is_array($result['data'])) {
+            $result['data'] = array_map(
+                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns),
+                $result['data']
+            );
+
+            return $result;
+        }
+
+        if (is_array($result) && array_is_list($result)) {
+            return array_map(
+                fn (mixed $row): mixed => $this->normalizeJsonColumnsForRow($row, $jsonColumns),
+                $result
+            );
+        }
+
+        return $result;
+    }
+
+    /**
+     * @return array<string, true>
+     */
+    protected function resolveJsonColumnMap(array $definition): array
+    {
+        $tableName = trim((string) ($definition['table_name'] ?? ''));
+
+        if ($tableName === '' || ! empty($definition['use_custom_query'])) {
+            return [];
+        }
+
+        try {
+            $columns = $this->databaseMetadataProvider->listColumns($tableName, $this->executionConnectionName);
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $configuredJsonColumns = $this->configuredJsonColumnsForTable($tableName);
+        $jsonColumns = [];
+
+        foreach ($columns as $column) {
+            if (! is_array($column)) {
+                continue;
+            }
+
+            $name = trim((string) ($column['name'] ?? ''));
+            $type = $this->normalizeDatabaseColumnType($column['type'] ?? null);
+
+            if ($name === '' || $type === '') {
+                continue;
+            }
+
+            if (in_array($type, self::JSON_NATIVE_COLUMN_TYPES, true)) {
+                $jsonColumns[$name] = true;
+                continue;
+            }
+
+            if (in_array($type, self::JSON_AUTO_DECODE_TEXT_COLUMN_TYPES, true)) {
+                $jsonColumns[$name] = true;
+                continue;
+            }
+
+            if (
+                in_array($type, self::JSON_CONFIGURABLE_TEXT_COLUMN_TYPES, true)
+                && isset($configuredJsonColumns[strtolower($name)])
+            ) {
+                $jsonColumns[$name] = true;
+            }
+        }
+
+        return $jsonColumns;
+    }
+
+    /**
+     * @return array<string, true>
+     */
+    protected function configuredJsonColumnsForTable(string $tableName): array
+    {
+        $configured = config('datasources.json_columns', []);
+
+        if (! is_array($configured)) {
+            return [];
+        }
+
+        $candidates = array_values(array_unique(array_filter([
+            $tableName,
+            strtolower($tableName),
+            $this->normalizeTableLookupKey($tableName),
+        ], static fn (mixed $value): bool => is_string($value) && trim($value) !== '')));
+
+        foreach ($candidates as $candidate) {
+            $columns = $configured[$candidate] ?? null;
+
+            if (! is_array($columns)) {
+                continue;
+            }
+
+            $normalized = [];
+
+            foreach ($columns as $column) {
+                if (! is_string($column) || trim($column) === '') {
+                    continue;
+                }
+
+                $normalized[strtolower(trim($column))] = true;
+            }
+
+            if ($normalized !== []) {
+                return $normalized;
+            }
+        }
+
+        return [];
+    }
+
+    protected function normalizeJsonColumnsForRow(mixed $row, array $jsonColumns): mixed
+    {
+        if (is_object($row)) {
+            foreach ($jsonColumns as $column => $enabled) {
+                if (! property_exists($row, $column)) {
+                    continue;
+                }
+
+                $row->{$column} = $this->decodeJsonColumnValue($row->{$column});
+            }
+
+            return $row;
+        }
+
+        if (is_array($row)) {
+            foreach ($jsonColumns as $column => $enabled) {
+                if (! array_key_exists($column, $row)) {
+                    continue;
+                }
+
+                $row[$column] = $this->decodeJsonColumnValue($row[$column]);
+            }
+        }
+
+        return $row;
+    }
+
+    protected function decodeJsonColumnValue(mixed $value): mixed
+    {
+        if (! is_string($value) || trim($value) === '') {
+            return $value;
+        }
+
+        try {
+            return json_decode($value, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            return $value;
+        }
+    }
+
+    protected function normalizeDatabaseColumnType(mixed $type): string
+    {
+        $normalized = strtolower(trim((string) $type));
+
+        if ($normalized === '') {
+            return '';
+        }
+
+        $normalized = preg_replace('/\(.+\)$/', '', $normalized) ?? $normalized;
+
+        return trim($normalized);
+    }
+
+    protected function normalizeTableLookupKey(string $tableName): string
+    {
+        $segments = array_values(array_filter(
+            array_map(static fn (string $segment): string => trim($segment, " \t\n\r\0\x0B`\""),
+            explode('.', $tableName)),
+            static fn (string $segment): bool => $segment !== ''
+        ));
+
+        if ($segments === []) {
+            return '';
+        }
+
+        if (count($segments) >= 2) {
+            return strtolower($segments[count($segments) - 2] . '.' . $segments[count($segments) - 1]);
+        }
+
+        return strtolower($segments[0]);
     }
 
     protected function columnsFromApiConfig(ApiConfig $apiConfig): array

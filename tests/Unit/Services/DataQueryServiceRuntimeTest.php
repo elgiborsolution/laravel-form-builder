@@ -7,6 +7,7 @@ use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\ApiTable;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
@@ -266,6 +267,110 @@ class DataQueryServiceRuntimeTest extends TestCase
             '{"data":{},"message":"Data not found"}',
             json_encode($response)
         );
+    }
+
+    public function test_it_decodes_native_json_columns_using_database_metadata(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            new FakeDatabaseMetadataProvider([
+                'users' => [
+                    ['name' => 'id', 'type' => 'bigint'],
+                    ['name' => 'roles', 'type' => 'json'],
+                    ['name' => 'profile', 'type' => 'json'],
+                ],
+            ])
+        );
+
+        $result = $service->exposeNormalizeResultJsonColumns([
+            'data' => [
+                (object) [
+                    'id' => 1,
+                    'roles' => '["admin","user"]',
+                    'profile' => '{"name":"John","age":20}',
+                ],
+            ],
+        ], [
+            'table_name' => 'users',
+            'use_custom_query' => false,
+        ]);
+
+        $this->assertSame(['admin', 'user'], $result['data'][0]->roles);
+        $this->assertSame(['name' => 'John', 'age' => 20], $result['data'][0]->profile);
+    }
+
+    public function test_it_decodes_longtext_json_columns_without_extra_configuration(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            new FakeDatabaseMetadataProvider([
+                'users' => [
+                    ['name' => 'id', 'type' => 'bigint'],
+                    ['name' => 'settings', 'type' => 'longtext'],
+                    ['name' => 'notes', 'type' => 'text'],
+                ],
+            ])
+        );
+
+        $result = $service->exposeNormalizeResultJsonColumns([
+            'data' => [
+                [
+                    'id' => 1,
+                    'settings' => '{"theme":"dark"}',
+                    'notes' => '{"raw":"keep"}',
+                ],
+                [
+                    'id' => 2,
+                    'settings' => '{invalid json}',
+                    'notes' => 'plain text',
+                ],
+            ],
+        ], [
+            'table_name' => 'users',
+            'use_custom_query' => false,
+        ]);
+
+        $this->assertSame(['theme' => 'dark'], $result['data'][0]['settings']);
+        $this->assertSame('{"raw":"keep"}', $result['data'][0]['notes']);
+        $this->assertSame('{invalid json}', $result['data'][1]['settings']);
+        $this->assertSame('plain text', $result['data'][1]['notes']);
+    }
+
+    public function test_it_decodes_configured_plain_text_json_columns_only_when_opted_in(): void
+    {
+        $service = new ConfigurableJsonCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            ['users' => ['notes']],
+            new FakeDatabaseMetadataProvider([
+                'users' => [
+                    ['name' => 'id', 'type' => 'bigint'],
+                    ['name' => 'notes', 'type' => 'text'],
+                    ['name' => 'description', 'type' => 'text'],
+                ],
+            ])
+        );
+
+        $result = $service->exposeNormalizeResultJsonColumns([
+            'data' => [
+                [
+                    'id' => 1,
+                    'notes' => '{"raw":"decode"}',
+                    'description' => '{"raw":"keep"}',
+                ],
+            ],
+        ], [
+            'table_name' => 'users',
+            'use_custom_query' => false,
+        ]);
+
+        $this->assertSame(['raw' => 'decode'], $result['data'][0]['notes']);
+        $this->assertSame('{"raw":"keep"}', $result['data'][0]['description']);
     }
 
     public function test_it_propagates_soft_delete_flag_for_api_builder_parent_tables(): void
@@ -565,6 +670,20 @@ class CapturingDataQueryService extends DataQueryService
     public string $capturedQuery = '';
     public string $capturedQueryCount = '';
 
+    public function __construct(
+        DynamicVariableParser $runtimeVariableParser,
+        ExecutionConnectionResolver $executionConnectionResolver,
+        ?DatabaseDriverResolver $databaseDriverResolver = null,
+        ?DatabaseMetadataProvider $databaseMetadataProvider = null
+    ) {
+        parent::__construct(
+            $runtimeVariableParser,
+            $executionConnectionResolver,
+            $databaseDriverResolver,
+            $databaseMetadataProvider
+        );
+    }
+
     public function execute(Request $request, array $definition): JsonResponse
     {
         $this->capturedDefinition = $definition;
@@ -608,6 +727,11 @@ class CapturingDataQueryService extends DataQueryService
     public function exposeApplyResponseType(mixed $result, string $responseType): mixed
     {
         return $this->applyResponseType($result, $responseType);
+    }
+
+    public function exposeNormalizeResultJsonColumns(mixed $result, array $definition): mixed
+    {
+        return $this->normalizeResultJsonColumns($result, $definition);
     }
 
     public function exposeResolveRequestValue(Request $request, string $name): mixed
@@ -738,5 +862,55 @@ class FakeDatabaseDriver implements DatabaseDriver
     public function listForeignKeys(ConnectionInterface $connection, string $table): array
     {
         return [];
+    }
+}
+
+class FakeDatabaseMetadataProvider extends DatabaseMetadataProvider
+{
+    /**
+     * @param array<string, array<int, array<string, mixed>>> $columnsByTable
+     */
+    public function __construct(
+        private readonly array $columnsByTable
+    ) {
+        parent::__construct();
+    }
+
+    public function listColumns(string $table, ?string $connectionName = null): array
+    {
+        return $this->columnsByTable[$table] ?? [];
+    }
+}
+
+class ConfigurableJsonCapturingDataQueryService extends CapturingDataQueryService
+{
+    /**
+     * @param array<string, array<int, string>> $jsonColumnsByTable
+     */
+    public function __construct(
+        DynamicVariableParser $runtimeVariableParser,
+        ExecutionConnectionResolver $executionConnectionResolver,
+        ?DatabaseDriverResolver $databaseDriverResolver,
+        private readonly array $jsonColumnsByTable,
+        ?DatabaseMetadataProvider $databaseMetadataProvider = null
+    ) {
+        parent::__construct(
+            $runtimeVariableParser,
+            $executionConnectionResolver,
+            $databaseDriverResolver,
+            $databaseMetadataProvider
+        );
+    }
+
+    protected function configuredJsonColumnsForTable(string $tableName): array
+    {
+        $columns = $this->jsonColumnsByTable[$tableName] ?? [];
+        $normalized = [];
+
+        foreach ($columns as $column) {
+            $normalized[strtolower($column)] = true;
+        }
+
+        return $normalized;
     }
 }
