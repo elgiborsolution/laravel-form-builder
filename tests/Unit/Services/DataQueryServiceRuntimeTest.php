@@ -373,6 +373,34 @@ class DataQueryServiceRuntimeTest extends TestCase
         $this->assertSame('{"raw":"keep"}', $result['data'][0]['description']);
     }
 
+    public function test_it_safely_decodes_custom_query_stringified_json_without_metadata(): void
+    {
+        $service = new CapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            new FakeDatabaseMetadataProvider([])
+        );
+
+        $result = $service->exposeNormalizeResultJsonColumns([
+            'data' => [
+                (object) [
+                    'id' => 1,
+                    'name' => 'Example',
+                    'data_detail' => '[{"name":"example","id":1}]',
+                    'message' => 'Hello World',
+                ],
+            ],
+        ], [
+            'use_custom_query' => true,
+            'custom_query' => 'SELECT id, name, data_detail FROM example_table',
+        ]);
+
+        $this->assertSame([['name' => 'example', 'id' => 1]], $result['data'][0]->data_detail);
+        $this->assertSame('Example', $result['data'][0]->name);
+        $this->assertSame('Hello World', $result['data'][0]->message);
+    }
+
     public function test_it_propagates_soft_delete_flag_for_api_builder_parent_tables(): void
     {
         $service = new CapturingDataQueryService(
