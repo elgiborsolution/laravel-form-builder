@@ -64,6 +64,55 @@ class ApiControllerChildConfigTest extends TestCase
         );
     }
 
+    public function test_it_treats_primitive_array_params_as_array_mappings_for_loop_insert(): void
+    {
+        $controller = $this->makeController();
+
+        $this->assertTrue($controller->exposeIsArrayType('tenants', [
+            [
+                'name' => 'tenants',
+                'type' => 'array string',
+            ],
+        ]));
+
+        $this->assertTrue($controller->exposeIsArrayType('quantity_codes', [
+            [
+                'name' => 'quantity_codes',
+                'type' => 'array integer',
+            ],
+        ]));
+    }
+
+    public function test_it_discovers_loop_insert_tables_for_primitive_array_params(): void
+    {
+        $controller = $this->makeController();
+
+        $config = [
+            'params' => [
+                [
+                    'name' => 'tenants',
+                    'type' => 'array string',
+                ],
+            ],
+            'parent_table' => [
+                'table_name' => 'users',
+                'data_params' => [
+                    'tenant_id' => [
+                        'value' => 'tenants',
+                        'array_handling' => 'LOOP_INSERT',
+                    ],
+                ],
+            ],
+            'child_tables' => [],
+        ];
+
+        $tables = $controller->exposeGetTablesWithArrayParams($config);
+
+        $this->assertSame([
+            'users' => ['tenants'],
+        ], $tables);
+    }
+
     private function makeController(): TestableChildConfigApiController
     {
         return new TestableChildConfigApiController(
@@ -98,5 +147,15 @@ class TestableChildConfigApiController extends ApiController
     public function exposeSanitizePersistedRow(array $row, ?string $lookupKey = null): array
     {
         return $this->sanitizePersistedRow($row, $lookupKey);
+    }
+
+    public function exposeIsArrayType(mixed $param, array $params): bool
+    {
+        return $this->isArrayType($param, $params);
+    }
+
+    public function exposeGetTablesWithArrayParams(array $config): array
+    {
+        return $this->getTablesWithArrayParams($config);
     }
 }

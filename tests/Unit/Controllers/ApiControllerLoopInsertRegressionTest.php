@@ -65,6 +65,18 @@ class ApiControllerLoopInsertRegressionTest extends TestCase
                 ],
                 [11, 12, 13],
             ],
+            'duplicate array string' => [
+                [
+                    'tenants' => ['tenant-a', 'tenant-a'],
+                ],
+                [
+                    'tenant_id' => [
+                        'value' => 'tenants',
+                        'array_handling' => 'LOOP_INSERT',
+                    ],
+                ],
+                ['tenant-a', 'tenant-a'],
+            ],
             'array object' => [
                 [
                     'tenants' => [
@@ -165,6 +177,52 @@ class ApiControllerLoopInsertRegressionTest extends TestCase
         $this->assertNotSame($rows[0]['id'], $rows[1]['id']);
         $this->assertSame('tenant-a', $rows[0]['tenant_id']);
         $this->assertSame('tenant-b', $rows[1]['tenant_id']);
+    }
+
+    public function test_it_persists_unique_runtime_primary_keys_for_each_loop_insert_child_row(): void
+    {
+        $controller = $this->makeControllerWithRuntimeRegistry();
+        $request = Request::create('/api/users/53', 'PUT', [
+            'tenants' => ['tenant-a', 'tenant-b', 'tenant-c'],
+        ]);
+
+        $childRows = $controller->exposeBuildMappedTableRows([
+            'id' => ['value' => '{{ uuid.random }}'],
+            'tenant_id' => [
+                'value' => 'tenants',
+                'array_handling' => 'LOOP_INSERT',
+            ],
+        ], $request, []);
+
+        $connection = new FakeLoopInsertConnection();
+
+        $controller->exposePersistChildTableRows(
+            $connection,
+            [
+                'foreign_key' => 'user_id',
+                'primary_key' => 'id',
+                'child_update_key' => 'id',
+                'missing_child_strategy' => 'KEEP_EXISTING',
+                'table_name' => 'tenant_user',
+                'data_params' => [
+                    'id' => ['value' => '{{ uuid.random }}'],
+                    'tenant_id' => [
+                        'value' => 'tenants',
+                        'array_handling' => 'LOOP_INSERT',
+                    ],
+                ],
+            ],
+            'tenant_user',
+            $childRows,
+            [53],
+            null,
+            $request
+        );
+
+        $this->assertCount(3, $controller->insertedPayloads);
+        $this->assertSame(3, count(array_unique(array_column($controller->insertedPayloads, 'id'))));
+        $this->assertSame(['tenant-a', 'tenant-b', 'tenant-c'], array_column($controller->insertedPayloads, 'tenant_id'));
+        $this->assertSame([53, 53, 53], array_column($controller->insertedPayloads, 'user_id'));
     }
 
     public function test_it_keeps_existing_child_rows_and_only_inserts_new_items_for_primitive_loop_insert_updates(): void
@@ -457,7 +515,13 @@ class TestableLoopInsertApiController extends \ESolution\DataSources\Controllers
         $this->persistChildTableRows($connection, $table, $tableChild, $childRows, $parentIds, $connectionName, $request);
     }
 
-    protected function insertTableRows($connection, string $tableName, array $rows): array
+    protected function insertTableRows(
+        $connection,
+        string $tableName,
+        array $rows,
+        ?string $primaryKey = null,
+        bool $returnInsertedIds = true
+    ): array
     {
         foreach ($rows as $row) {
             $this->insertedPayloads[] = $row;

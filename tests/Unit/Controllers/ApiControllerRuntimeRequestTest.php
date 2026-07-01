@@ -139,6 +139,33 @@ class ApiControllerRuntimeRequestTest extends TestCase
         ], $request->all());
     }
 
+    public function test_it_reindexes_primitive_array_payloads_during_runtime_preparation(): void
+    {
+        $controller = $this->makeController();
+
+        $request = Request::create('/', 'POST', [
+            'tenants' => [
+                1 => 'tenant-a',
+                3 => 'tenant-a',
+            ],
+        ]);
+
+        $params = [
+            [
+                'name' => 'tenants',
+                'type' => 'array string',
+            ],
+        ];
+
+        $response = $controller->exposePrepareRuntimeRequest($request, $params);
+
+        $this->assertNull($response);
+        $this->assertSame([
+            'tenants' => ['tenant-a', 'tenant-a'],
+        ], $request->all());
+        $this->assertTrue(array_is_list($request->input('tenants')));
+    }
+
     public function test_it_invokes_after_hit_dispatch_after_a_successful_handle_request(): void
     {
         $resolver = $this->createMock(DynamicApiConfigResolver::class);
