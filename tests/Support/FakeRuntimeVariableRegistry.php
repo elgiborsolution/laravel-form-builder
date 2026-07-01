@@ -58,6 +58,12 @@ class FakeRuntimeVariableRegistry implements RuntimeVariableRegistryInterface
                 static fn () => 'UnitTestAgent',
                 'Current request user agent',
             ),
+            'date.now' => RuntimeVariableDefinition::make(
+                'date.now',
+                'string',
+                static fn () => '2026-07-01 08:25:10',
+                'Current date and time',
+            ),
             'app.env' => RuntimeVariableDefinition::make(
                 'app.env',
                 'string',

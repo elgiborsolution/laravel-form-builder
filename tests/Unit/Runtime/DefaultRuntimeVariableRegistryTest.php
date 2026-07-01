@@ -14,6 +14,7 @@ class DefaultRuntimeVariableRegistryTest extends TestCase
         $this->assertTrue($registry->has('auth.id'));
         $this->assertTrue($registry->has('auth.role.name'));
         $this->assertTrue($registry->has('request.ip'));
+        $this->assertTrue($registry->has('date.now'));
         $this->assertTrue($registry->has('app.env'));
 
         $definition = $registry->get('auth.id');
@@ -21,6 +22,16 @@ class DefaultRuntimeVariableRegistryTest extends TestCase
         $this->assertNotNull($definition);
         $this->assertSame('number', $definition->type);
         $this->assertSame('Current authenticated user ID', $definition->description);
+    }
+
+    public function test_it_resolves_the_current_date_time_variable(): void
+    {
+        $registry = new DefaultRuntimeVariableRegistry();
+
+        $this->assertMatchesRegularExpression(
+            '/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$/',
+            (string) $registry->resolve('date.now')
+        );
     }
 
     public function test_it_can_be_extended_and_resolve_custom_variables(): void

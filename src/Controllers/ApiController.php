@@ -337,16 +337,31 @@ class ApiController extends Controller
 
   protected function applyRuntimeVariables(Request $request): void
   {
-      $request->merge($this->resolveRuntimePayload($request->all()));
+      $request->merge($this->resolveRuntimeVariablesForParent($request->all()));
+  }
+
+  protected function resolveRuntimeVariablesForParent(mixed $payload): mixed
+  {
+      return $this->resolveRuntimeVariablesPayload($payload);
+  }
+
+  protected function resolveRuntimeVariablesForChild(mixed $payload): mixed
+  {
+      return $this->resolveRuntimeVariablesPayload($payload);
   }
 
   protected function resolveRuntimePayload(mixed $payload): mixed
+  {
+      return $this->resolveRuntimeVariablesForParent($payload);
+  }
+
+  private function resolveRuntimeVariablesPayload(mixed $payload): mixed
   {
       if (is_array($payload)) {
           $resolved = [];
 
           foreach ($payload as $key => $value) {
-              $resolved[$key] = $this->resolveRuntimePayload($value);
+              $resolved[$key] = $this->resolveRuntimeVariablesPayload($value);
           }
 
           return $this->normalizeNumericIndexedArray($resolved);
@@ -2535,7 +2550,16 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       }
 
       if ($loopColumns === []) {
-          return [$staticRow];
+          $resolvedRow = $this->resolveRuntimeVariablesForParent($staticRow);
+
+          foreach ($deferredRuntimeColumns as $column => $sourceValue) {
+              $resolvedRuntimeValue = $this->resolveRuntimeVariablesForParent(
+                  $this->resolveDataParamValue($sourceValue, $request, $context)
+              );
+              $resolvedRow[$column] = $this->serializeDatabaseValue($resolvedRuntimeValue);
+          }
+
+          return [$resolvedRow];
       }
 
       $rows = [[]];
@@ -2559,10 +2583,12 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       }
 
       foreach ($rows as &$row) {
-          $row = array_merge($staticRow, $row);
+          $row = $this->resolveRuntimeVariablesForParent(array_merge($staticRow, $row));
 
           foreach ($deferredRuntimeColumns as $column => $sourceValue) {
-              $resolvedRuntimeValue = $this->resolveDataParamValue($sourceValue, $request, $context);
+              $resolvedRuntimeValue = $this->resolveRuntimeVariablesForChild(
+                  $this->resolveDataParamValue($sourceValue, $request, $context)
+              );
               $row[$column] = $this->serializeDatabaseValue($resolvedRuntimeValue);
           }
       }

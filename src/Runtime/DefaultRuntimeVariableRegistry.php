@@ -95,6 +95,11 @@ class DefaultRuntimeVariableRegistry implements RuntimeVariableRegistryInterface
                 'description' => 'Current request IP address',
                 'resolver' => static fn () => request()?->ip(),
             ],
+            'date.now' => [
+                'type' => 'string',
+                'description' => 'Current date and time',
+                'resolver' => static fn () => \Illuminate\Support\Carbon::now()->format('Y-m-d H:i:s'),
+            ],
             'app.env' => [
                 'type' => 'string',
                 'description' => 'Current application environment',

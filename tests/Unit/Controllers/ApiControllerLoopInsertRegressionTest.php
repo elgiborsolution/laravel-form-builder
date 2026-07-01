@@ -10,6 +10,7 @@ use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Support\MiddlewareConnectionResolver;
 use ESolution\DataSources\Tests\Support\FakeRuntimeVariableRegistry;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Pipeline\Pipeline;
 use PHPUnit\Framework\TestCase;
@@ -223,6 +224,44 @@ class ApiControllerLoopInsertRegressionTest extends TestCase
         $this->assertSame(3, count(array_unique(array_column($controller->insertedPayloads, 'id'))));
         $this->assertSame(['tenant-a', 'tenant-b', 'tenant-c'], array_column($controller->insertedPayloads, 'tenant_id'));
         $this->assertSame([53, 53, 53], array_column($controller->insertedPayloads, 'user_id'));
+    }
+
+    public function test_it_resolves_parent_runtime_variables_before_child_rows_are_built(): void
+    {
+        Carbon::setTestNow(Carbon::parse('2026-07-01 08:25:10', 'Asia/Bangkok'));
+
+        try {
+            $controller = $this->makeControllerWithRuntimeRegistry();
+            $request = Request::create('/api/customers', 'POST', [
+                'tenants' => ['tenant-a', 'tenant-b', 'tenant-c'],
+            ]);
+
+            $parentRows = $controller->exposeBuildMappedTableRows([
+                'id' => ['value' => '{{ uuid.random }}'],
+                'created_at' => ['value' => '{{ date.now }}'],
+            ], $request, []);
+
+            $childRows = $controller->exposeBuildMappedTableRows([
+                'id' => ['value' => '{{ uuid.random }}'],
+                'tenant_id' => [
+                    'value' => 'tenants',
+                    'array_handling' => 'LOOP_INSERT',
+                ],
+            ], $request, []);
+
+            $this->assertCount(1, $parentRows);
+            $this->assertNotEmpty($parentRows[0]['id']);
+            $this->assertMatchesRegularExpression(
+                '/^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$/',
+                (string) $parentRows[0]['created_at']
+            );
+
+            $this->assertCount(3, $childRows);
+            $this->assertCount(3, array_unique(array_column($childRows, 'id')));
+            $this->assertNotContains($parentRows[0]['id'], array_column($childRows, 'id'));
+        } finally {
+            Carbon::setTestNow();
+        }
     }
 
     public function test_it_keeps_existing_child_rows_and_only_inserts_new_items_for_primitive_loop_insert_updates(): void
