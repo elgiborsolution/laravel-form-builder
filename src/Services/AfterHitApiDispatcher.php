@@ -133,7 +133,7 @@ class AfterHitApiDispatcher
             return null;
         }
 
-        return 'App\\Listeners\\' . $this->buildListenerName($routeName);
+        return null;//'App\\Listeners\\' . $this->buildListenerName($routeName);
     }
 
     protected function buildListenerName(string $routeName): string
