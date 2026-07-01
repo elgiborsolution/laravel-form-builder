@@ -47,6 +47,24 @@ class ApiControllerRecursiveValidationTest extends TestCase
         $this->assertSame('required|string', $rules['orders.*.items.*.tags.*']);
     }
 
+    public function test_it_adds_distinct_rule_for_unique_primitive_arrays(): void
+    {
+        $controller = $this->makeController();
+
+        $rules = $controller->exposeBuildValidationRulesFromParams([
+            [
+                'name' => 'tenants',
+                'type' => 'array string',
+                'required' => false,
+                'unique' => true,
+            ],
+        ]);
+
+        $this->assertSame('nullable|array', $rules['tenants']);
+        $this->assertStringStartsWith('required|string|unique:', $rules['tenants.*']);
+        $this->assertStringEndsWith('|distinct', $rules['tenants.*']);
+    }
+
     private function makeController(): TestableRecursiveApiController
     {
         return new TestableRecursiveApiController(
@@ -65,6 +83,6 @@ class TestableRecursiveApiController extends \ESolution\DataSources\Controllers\
 {
     public function exposeBuildValidationRulesFromParams(array $params): array
     {
-        return $this->buildValidationRulesFromParams($params);
+        return $this->buildValidationRulesFromParams($params, 'users');
     }
 }

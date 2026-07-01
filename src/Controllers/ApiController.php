@@ -349,7 +349,7 @@ class ApiController extends Controller
               $resolved[$key] = $this->resolveRuntimePayload($value);
           }
 
-          return $resolved;
+          return $this->normalizeNumericIndexedArray($resolved);
       }
 
       return $this->runtimeVariableParser->parse($payload);
@@ -378,6 +378,14 @@ class ApiController extends Controller
           $name = (string) $param['name'];
           $type = (string) ($param['type'] ?? '');
 
+          if ($this->isPrimitiveArrayApiBuilderParamType($type)) {
+              if (array_key_exists($name, $payload) && is_array($payload[$name])) {
+                  $payload[$name] = $this->normalizeNumericIndexedArray($payload[$name]);
+              }
+
+              continue;
+          }
+
           if (in_array($type, ['array', 'object'], true)) {
               if (! array_key_exists($name, $payload) || ! is_array($payload[$name])) {
                   continue;
@@ -388,6 +396,8 @@ class ApiController extends Controller
               if ($childParams === []) {
                   continue;
               }
+
+              $payload[$name] = $this->normalizeNumericIndexedArray($payload[$name]);
 
               if (array_is_list($payload[$name])) {
                   foreach ($payload[$name] as $index => $item) {
@@ -416,6 +426,72 @@ class ApiController extends Controller
       }
 
       return $payload;
+  }
+
+  protected function normalizeDeclaredArrayPayload(array $payload, array $params): array
+  {
+      foreach ($params as $param) {
+          if (! is_array($param) || empty($param['name']) || empty($param['type'])) {
+              continue;
+          }
+
+          $name = trim((string) $param['name']);
+          if ($name === '' || ! array_key_exists($name, $payload) || ! is_array($payload[$name])) {
+              continue;
+          }
+
+          $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+          $payload[$name] = $this->normalizeNumericIndexedArray($payload[$name]);
+
+          if (! $this->isContainerApiBuilderParamType($type)) {
+              continue;
+          }
+
+          $childParams = is_array($param['params'] ?? null) ? $param['params'] : [];
+          if ($childParams === []) {
+              continue;
+          }
+
+          if (array_is_list($payload[$name])) {
+              foreach ($payload[$name] as $index => $item) {
+                  if (! is_array($item)) {
+                      continue;
+                  }
+
+                  $payload[$name][$index] = $this->normalizeDeclaredArrayPayload($item, $childParams);
+              }
+
+              continue;
+          }
+
+          $payload[$name] = $this->normalizeDeclaredArrayPayload($payload[$name], $childParams);
+      }
+
+      return $payload;
+  }
+
+  protected function firstArrayValue(array $values): mixed
+  {
+      if ($values === []) {
+          return null;
+      }
+
+      return reset($values);
+  }
+
+  protected function normalizeNumericIndexedArray(mixed $value): mixed
+  {
+      if (! is_array($value) || $value === []) {
+          return $value;
+      }
+
+      foreach (array_keys($value) as $key) {
+          if (! is_int($key)) {
+              return $value;
+          }
+      }
+
+      return array_values($value);
   }
 
   protected function normalizeUploadExtensions(mixed $extensions): array
@@ -503,6 +579,7 @@ class ApiController extends Controller
       try {
           $this->applyRuntimeVariables($request);
           $this->applyRuntimeDefaults($request, $params);
+          $request->merge($this->normalizeDeclaredArrayPayload($request->all(), $params));
       } catch (InvalidRuntimeVariableException $e) {
           return response()->json([
               'status' => 422,
@@ -781,7 +858,7 @@ class ApiController extends Controller
             );
 
             if (is_array($detectedCollection)) {
-                $rawChildCollection = array_values($detectedCollection);
+                $rawChildCollection = array_values($this->normalizeNumericIndexedArray($detectedCollection));
             }
         }
 
@@ -848,7 +925,14 @@ class ApiController extends Controller
                     'action' => 'INSERT',
                     'payload_value' => $identifier,
                 ]);
-                $insertedIds = $this->insertTableRows($connection, $tableChild, [$persistedRow]);
+                $needsInsertedIds = $tablePrimaryKey !== '' && strcasecmp($childLookupKey, $tablePrimaryKey) === 0 && $identifier === null;
+                $insertedIds = $this->insertTableRows(
+                    $connection,
+                    $tableChild,
+                    [$persistedRow],
+                    $tablePrimaryKey !== '' ? $tablePrimaryKey : null,
+                    $needsInsertedIds
+                );
 
                 if ($tablePrimaryKey !== '' && strcasecmp($childLookupKey, $tablePrimaryKey) === 0 && $insertedIds !== []) {
                     $hasIdentifiedChildRows = true;
@@ -1252,12 +1336,18 @@ class ApiController extends Controller
               $request,
               $masterParam1Level
           );
+          $parentRows = array_values($this->normalizeNumericIndexedArray($parentRows));
 
           if ($parentRows === []) {
               $parentRows = [[]];
           }
 
-          $parentIds = $this->insertTableRows($connection, $cleanParentTable, $parentRows);
+          $parentIds = $this->insertTableRows(
+              $connection,
+              $cleanParentTable,
+              $parentRows,
+              trim((string) ($apiConfigs->parentTable->primary_key ?? ''))
+          );
           if ($parentIds === []) {
               throw new \RuntimeException('Unable to insert parent table data.');
           }
@@ -1269,6 +1359,7 @@ class ApiController extends Controller
                   $request,
                   $masterParam1Level
               );
+              $childRows = array_values($this->normalizeNumericIndexedArray($childRows));
 
               if ($childRows === []) {
                   continue;
@@ -1282,13 +1373,18 @@ class ApiController extends Controller
                       $rowsToInsert[] = $childRow;
                   }
 
-                  $this->insertTableRows($connection, $cleanChildTable, $rowsToInsert);
+                  $this->insertTableRows($connection, $cleanChildTable, $rowsToInsert, null, false);
               }
+          }
+
+          $firstParentId = $this->firstArrayValue($parentIds);
+          if ($firstParentId === null) {
+              throw new \RuntimeException('Unable to resolve inserted parent identifier.');
           }
 
           $finalRecord = $this->normalizeAfterHitRecord(
               $connection->table($cleanParentTable)
-                  ->where($apiConfigs->parentTable->primary_key, $parentIds[0])
+                  ->where($apiConfigs->parentTable->primary_key, $firstParentId)
                   ->first()
           );
 
@@ -1379,21 +1475,32 @@ class ApiController extends Controller
                 $request,
                 $masterParam1Level
             );
+            $parentRows = array_values($this->normalizeNumericIndexedArray($parentRows));
 
             if ($parentRows === []) {
                 $parentRows = [[]];
             }
 
             if (count($parentRows) === 1) {
+                $singleParentRow = $this->firstArrayValue($parentRows);
+                if (! is_array($singleParentRow)) {
+                    throw new \RuntimeException('Unable to resolve parent row payload.');
+                }
+
                 $connection->table($cleanParentTable)
                     ->where($lookupKey, $id)
-                    ->update($parentRows[0]);
+                    ->update($singleParentRow);
                 $parentIds = [$parentRecordId];
             } else {
                 $connection->table($cleanParentTable)
                     ->where($lookupKey, $id)
                     ->delete();
-                $parentIds = $this->insertTableRows($connection, $cleanParentTable, $parentRows);
+                $parentIds = $this->insertTableRows(
+                    $connection,
+                    $cleanParentTable,
+                    $parentRows,
+                    $primarykey
+                );
             }
 
             if ($parentIds === []) {
@@ -1420,6 +1527,7 @@ class ApiController extends Controller
                     $request,
                     $masterParam1Level
                 );
+                $childRows = array_values($this->normalizeNumericIndexedArray($childRows));
 
                 $missingChildStrategy = $this->normalizeMissingChildStrategy($table['missing_child_strategy'] ?? null);
 
@@ -1438,9 +1546,14 @@ class ApiController extends Controller
                 );
             }
 
+            $firstParentId = $this->firstArrayValue($parentIds);
+            if ($firstParentId === null) {
+                throw new \RuntimeException('Unable to resolve persisted parent identifier.');
+            }
+
             $finalRecord = $this->normalizeAfterHitRecord(
                 $connection->table($cleanParentTable)
-                    ->where($primarykey, $parentIds[0])
+                    ->where($primarykey, $firstParentId)
                     ->first()
             );
 
@@ -1459,7 +1572,11 @@ class ApiController extends Controller
         } catch (\Exception $e) {
             $connection->rollBack();
             \Log::error("STORE API BUILDER ERROR => " . $e->getMessage());
-            return response()->json(["status" => 422, "data" => [], "error" => $e->getMessage()], 422);
+            return response()->json([
+                "status" => 422,
+                "data" => [],
+                "error" => $e->getMessage()
+            ], 422);
         }
     }
 
@@ -1712,7 +1829,13 @@ protected function buildPrimitiveArrayItemValidationRule(array $param, string $t
     $itemParam['type'] = $this->primitiveArrayItemType($param['type'] ?? null);
     $itemParam['required'] = true;
 
-    return $this->findValidateRule($itemParam, $tableParent, $primaryKey, $ignoreColumn);
+    $rule = $this->findValidateRule($itemParam, $tableParent, $primaryKey, $ignoreColumn);
+
+    if (! empty($param['unique'])) {
+        $rule .= '|distinct';
+    }
+
+    return $rule;
 }
 
 protected function primitiveArrayItemType(mixed $type): string
@@ -2082,7 +2205,13 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
               continue;
           }
 
-          if ($p['name'] === explode('.', $param)[0] && $this->isArrayContainerApiBuilderParamType($this->normalizeApiBuilderParamType($p['type']))) {
+          if (
+              $p['name'] === explode('.', $param)[0]
+              && (
+                  $this->isArrayContainerApiBuilderParamType($this->normalizeApiBuilderParamType($p['type']))
+                  || $this->isPrimitiveArrayApiBuilderParamType($this->normalizeApiBuilderParamType($p['type']))
+              )
+          ) {
               return true;
           }
       }
@@ -2161,6 +2290,11 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       }
 
       return $value;
+  }
+
+  protected function isRuntimeVariableExpression(mixed $value): bool
+  {
+      return is_string($value) && str_contains(trim($value), '{{');
   }
 
   /**
@@ -2302,6 +2436,8 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
               continue;
           }
 
+          $candidate = $this->normalizeNumericIndexedArray($candidate);
+
           if ($this->isLoopInsertCollection($candidate) && $this->isNestedLoopInsertCollection($candidate)) {
               return $candidate;
           }
@@ -2346,11 +2482,29 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
 
       $staticRow = [];
       $loopColumns = [];
+      $deferredRuntimeColumns = [];
 
       foreach ($dataParams as $column => $mapping) {
           $normalized = $this->normalizeDataParamMapping($mapping, is_string($column) ? $column : null);
+          $targetColumn = is_string($normalized['column'] ?? null)
+              ? (string) $normalized['column']
+              : (is_string($column) ? $column : null);
           $sourceValue = $normalized['value'] ?? null;
+
+          if ($targetColumn === null || $targetColumn === '') {
+              continue;
+          }
+
+          if (
+              ($normalized['array_handling'] ?? 'RAW_VALUE') !== 'LOOP_INSERT'
+              && $this->isRuntimeVariableExpression($sourceValue)
+          ) {
+              $deferredRuntimeColumns[$targetColumn] = $sourceValue;
+              continue;
+          }
+
           $resolvedValue = $this->resolveDataParamValue($sourceValue, $request, $context);
+          $resolvedValue = $this->normalizeNumericIndexedArray($resolvedValue);
 
           if (
               ($normalized['array_handling'] ?? 'RAW_VALUE') === 'LOOP_INSERT'
@@ -2373,11 +2527,11 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
                   return $rows === [] ? [] : $rows;
               }
 
-              $loopColumns[(string) $column] = array_values($resolvedValue);
+              $loopColumns[$targetColumn] = array_values($resolvedValue);
               continue;
           }
 
-          $staticRow[(string) $column] = $this->serializeDatabaseValue($resolvedValue);
+          $staticRow[$targetColumn] = $this->serializeDatabaseValue($resolvedValue);
       }
 
       if ($loopColumns === []) {
@@ -2406,18 +2560,46 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
 
       foreach ($rows as &$row) {
           $row = array_merge($staticRow, $row);
+
+          foreach ($deferredRuntimeColumns as $column => $sourceValue) {
+              $resolvedRuntimeValue = $this->resolveDataParamValue($sourceValue, $request, $context);
+              $row[$column] = $this->serializeDatabaseValue($resolvedRuntimeValue);
+          }
       }
       unset($row);
 
       return $rows;
   }
 
-  protected function insertTableRows($connection, string $tableName, array $rows): array
+  protected function insertTableRows(
+      $connection,
+      string $tableName,
+      array $rows,
+      ?string $primaryKey = null,
+      bool $returnInsertedIds = true
+  ): array
   {
       $insertedIds = [];
+      $primaryKey = is_string($primaryKey) ? trim($primaryKey) : '';
 
       foreach ($rows as $row) {
           if ($row === []) {
+              continue;
+          }
+
+          $knownPrimaryKey = null;
+          if ($primaryKey !== '' && array_key_exists($primaryKey, $row) && $row[$primaryKey] !== null && $row[$primaryKey] !== '') {
+              $knownPrimaryKey = $row[$primaryKey];
+          }
+
+          if (! $returnInsertedIds) {
+              $connection->table($tableName)->insert($row);
+              continue;
+          }
+
+          if ($knownPrimaryKey !== null) {
+              $connection->table($tableName)->insert($row);
+              $insertedIds[] = $knownPrimaryKey;
               continue;
           }
 
