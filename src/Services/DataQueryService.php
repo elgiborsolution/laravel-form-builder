@@ -236,6 +236,12 @@ class DataQueryService
                 ];
             }
 
+            $runtimeOrdering = $this->resolveRuntimeOrdering($request, $definition);
+
+            if ($runtimeOrdering !== null && ! $this->containsOrderByClause($query)) {
+                $query .= ' ORDER BY ' . $this->quoteOrderByIdentifier($runtimeOrdering['column']) . ' ' . $runtimeOrdering['direction'];
+            }
+
             $cacheKey = $this->cachePrefixForExecution($definition['identifier'] . '_query_' . md5(
             $query . '|' . $queryCount . '|' . json_encode($appliedFilters) . '|' . ($request->page ?? '0') . '|' . ($request->per_page ?? '0')
             ));
@@ -348,6 +354,122 @@ class DataQueryService
         $query = trim($query);
 
         return trim((string) preg_replace('/;+\s*$/', '', $query));
+    }
+
+    /**
+     * Resolve request-time ordering for the current datasource execution.
+     *
+     * @param Request $request
+     * @param array<string, mixed> $definition
+     * @return array{column:string,direction:string}|null
+     */
+    protected function resolveRuntimeOrdering(Request $request, array $definition): ?array
+    {
+        $orderBy = trim((string) $request->input('order_by', ''));
+
+        if ($orderBy === '') {
+            return null;
+        }
+
+        $direction = strtoupper(trim((string) $request->input('order_direction', 'ASC')));
+
+        if (! in_array($direction, ['ASC', 'DESC'], true)) {
+            $direction = 'ASC';
+        }
+
+        $allowedColumns = $this->normalizeSelectableColumns($definition['columns'] ?? []);
+        $allowedLookup = [];
+
+        foreach ($allowedColumns as $column) {
+            $allowedLookup[strtolower($column)] = $column;
+        }
+
+        if ($allowedColumns === []) {
+            return null;
+        }
+
+        $matchedColumn = $allowedLookup[strtolower($orderBy)] ?? null;
+
+        if (! is_string($matchedColumn) || $matchedColumn === '') {
+            return null;
+        }
+
+        return [
+            'column' => $matchedColumn,
+            'direction' => $direction,
+        ];
+    }
+
+    /**
+     * Determine whether the SQL already contains an ORDER BY clause.
+     */
+    protected function containsOrderByClause(string $query): bool
+    {
+        return preg_match('/\border\s+by\b/i', $query) === 1;
+    }
+
+    /**
+     * Normalize selected/displayed columns into a safe list of sort options.
+     *
+     * @param array<int, mixed> $columns
+     * @return array<int, string>
+     */
+    protected function normalizeSelectableColumns(array $columns): array
+    {
+        $normalized = [];
+
+        foreach ($columns as $column) {
+            if (is_array($column)) {
+                $candidate = $column['name'] ?? $column['column'] ?? $column['value'] ?? $column['label'] ?? null;
+            } else {
+                $candidate = $column;
+            }
+
+            $candidate = trim((string) $candidate);
+
+            if ($candidate === '' || $candidate === '*') {
+                continue;
+            }
+
+            $normalized[] = $candidate;
+        }
+
+        return array_values(array_unique($normalized));
+    }
+
+    /**
+     * Quote a validated ORDER BY identifier without re-applying strict identifier
+     * validation so custom query aliases remain usable.
+     */
+    protected function quoteOrderByIdentifier(string $identifier): string
+    {
+        $identifier = trim($identifier);
+
+        if ($identifier === '') {
+            return '';
+        }
+
+        $driver = $this->databaseDriverResolver->resolve($this->executionConnectionName);
+
+        if (str_contains($identifier, '.')) {
+            $segments = array_map(
+                static fn (string $segment): string => trim($segment, " \t\n\r\0\x0B`\""),
+                explode('.', $identifier)
+            );
+
+            $segments = array_values(array_filter($segments, static fn (string $segment): bool => $segment !== ''));
+
+            if ($segments === []) {
+                return '';
+            }
+
+            return implode('.', array_map(
+                static fn (string $segment) => $driver->quoteIdentifier($segment),
+                $segments
+            ));
+        }
+
+        return $driver->quoteIdentifier(trim($identifier, " \t\n\r\0\x0B`\""));
     }
 
     /**
