@@ -231,6 +231,90 @@ class DataQueryServiceRuntimeTest extends TestCase
         $this->assertStringNotContainsString("AND id = 'd-invoice'", $service->capturedQuery);
     }
 
+    public function test_it_applies_request_sorting_for_selected_columns_before_pagination(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            false
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->table_name = 'es_direct_invoice';
+        $dataSource->columns = ['id', 'name', 'created_at'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $request = Request::create('/api/products', 'GET', [
+            'order_by' => 'name',
+            'order_direction' => 'DESC',
+        ]);
+
+        $service->executeForDataSource($request, $dataSource, 'datasource_q_sorting');
+
+        $this->assertStringContainsString(
+            'FROM es_direct_invoice WHERE 1=1 ORDER BY `name` DESC',
+            $service->capturedQuery
+        );
+        $this->assertStringNotContainsString('ORDER BY `created_at` DESC', $service->capturedQuery);
+    }
+
+    public function test_it_does_not_append_a_second_order_by_when_the_sql_is_already_sorted(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            false
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 1;
+        $dataSource->custom_query = 'select id, name from products order by name desc';
+        $dataSource->columns = ['id', 'name'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $request = Request::create('/api/products', 'GET', [
+            'order_by' => 'id',
+            'order_direction' => 'ASC',
+        ]);
+
+        $service->executeForDataSource($request, $dataSource, 'datasource_q_existing_order');
+
+        $this->assertStringContainsString(
+            'select id, name from products order by name desc',
+            strtolower($service->capturedQuery)
+        );
+        $this->assertStringNotContainsString('ORDER BY `id` ASC', $service->capturedQuery);
+    }
+
+    public function test_it_rejects_sorting_columns_outside_the_selected_columns(): void
+    {
+        $service = new SoftDeleteCapturingDataQueryService(
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            new ExecutionConnectionResolver(),
+            new FakeDatabaseDriverResolver(new FakeDatabaseDriver('mysql')),
+            false
+        );
+
+        $dataSource = new DataSource();
+        $dataSource->use_custom_query = 0;
+        $dataSource->table_name = 'es_direct_invoice';
+        $dataSource->columns = ['id', 'name'];
+        $dataSource->setRelation('parameters', new Collection([]));
+
+        $request = Request::create('/api/products', 'GET', [
+            'order_by' => 'price',
+            'order_direction' => 'DESC',
+        ]);
+
+        $response = $service->executeForDataSource($request, $dataSource, 'datasource_q_invalid_sort');
+
+        $this->assertSame(422, $response->getStatusCode());
+        $this->assertStringContainsString('Invalid order_by column', (string) $response->getContent());
+    }
+
     public function test_it_wraps_object_response_data_when_record_exists(): void
     {
         $service = new CapturingDataQueryService(
