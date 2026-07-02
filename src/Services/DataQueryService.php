@@ -374,7 +374,7 @@ class DataQueryService
         $direction = strtoupper(trim((string) $request->input('order_direction', 'ASC')));
 
         if (! in_array($direction, ['ASC', 'DESC'], true)) {
-            throw new \InvalidArgumentException('Invalid order_direction value.');
+            $direction = 'ASC';
         }
 
         $allowedColumns = $this->normalizeSelectableColumns($definition['columns'] ?? []);
@@ -385,13 +385,13 @@ class DataQueryService
         }
 
         if ($allowedColumns === []) {
-            throw new \InvalidArgumentException('Sorting is not available for this data source.');
+            return null;
         }
 
         $matchedColumn = $allowedLookup[strtolower($orderBy)] ?? null;
 
         if (! is_string($matchedColumn) || $matchedColumn === '') {
-            throw new \InvalidArgumentException('Invalid order_by column.');
+            return null;
         }
 
         return [
@@ -446,7 +446,7 @@ class DataQueryService
         $identifier = trim($identifier);
 
         if ($identifier === '') {
-            throw new \InvalidArgumentException('Invalid order_by column.');
+            return '';
         }
 
         $driver = $this->databaseDriverResolver->resolve($this->executionConnectionName);
@@ -460,7 +460,7 @@ class DataQueryService
             $segments = array_values(array_filter($segments, static fn (string $segment): bool => $segment !== ''));
 
             if ($segments === []) {
-                throw new \InvalidArgumentException('Invalid order_by column.');
+                return '';
             }
 
             return implode('.', array_map(
