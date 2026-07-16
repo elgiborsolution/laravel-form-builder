@@ -6,8 +6,9 @@
 - [Invalid JSON Import](#invalid-json-import)
 - [Middleware Auth Issue](#middleware-auth-issue)
 - [Endpoint Not Found](#endpoint-not-found)
-- [CORS Issue](#cors-issue)
+- [Scope Mismatch](#scope-mismatch)
 - [Custom Query Validation](#custom-query-validation)
+- [Runtime Variable Error](#runtime-variable-error)
 
 ## Columns Must Be Array
 
@@ -70,15 +71,16 @@ Example middleware:
 - make sure another route is not shadowing the dynamic path
 - confirm the HTTP method matches the saved config
 
-## CORS Issue
+## Scope Mismatch
 
-**Problem:** Browser requests are blocked.
+**Problem:** A central record is still present when the request includes `X-Tenant`, or a tenant record is hidden when the header is missing.
 
 **Fix:**
 
-- allow the frontend origin in your app CORS settings
-- make sure the API prefix is included in allowed paths
-- confirm preflight requests are not blocked by auth middleware
+- `X-Tenant` present and not empty means request scope is `tenant`
+- missing or empty `X-Tenant` means request scope is `central`
+- Data Source and API Builder list endpoints only return records for the current scope
+- runtime execution rejects requests when the request scope and `database_scope` do not match
 
 ## Custom Query Validation
 
@@ -96,3 +98,20 @@ Example valid query:
 select id, name from users where status = 'active'
 ```
 
+## Runtime Variable Error
+
+**Problem:** Save or import fails with an invalid runtime variable expression.
+
+**Fix:**
+
+- verify the expression uses `{{ variable.name }}`
+- make sure the runtime variable exists in your registry
+- check nested JSON payloads for unresolved values
+
+Example:
+
+```json
+{
+  "custom_query": "select * from users where company_id = {{ auth.company_id }}"
+}
+```

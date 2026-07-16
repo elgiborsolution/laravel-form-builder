@@ -6,7 +6,8 @@
 - [Example 2: Custom Query Data Source](#example-2-custom-query-data-source)
 - [Example 3: Dynamic API Endpoint](#example-3-dynamic-api-endpoint)
 - [Example 4: Nested Parameters](#example-4-nested-parameters)
-- [Example 5: Import / Export Workflow](#example-5-import--export-workflow)
+- [Example 5: Scope-Aware Builder Records](#example-5-scope-aware-builder-records)
+- [Example 6: Import / Export Workflow](#example-6-import--export-workflow)
 
 ## Example 1: Table-Based Data Source
 
@@ -126,12 +127,38 @@ Authorization: Bearer TOKEN
 }
 ```
 
-## Example 5: Import / Export Workflow
+## Example 5: Scope-Aware Builder Records
+
+Create the same builder request in two different contexts:
+
+```http
+POST /api/data-source
+```
+
+Without `X-Tenant`, the saved row uses:
+
+```json
+{
+  "database_scope": "central"
+}
+```
+
+With `X-Tenant: jayasuksesrejeki`, the saved row uses:
+
+```json
+{
+  "database_scope": "tenant"
+}
+```
+
+The same rule applies to API Builder create, update, and import requests.
+
+## Example 6: Import / Export Workflow
 
 1. Export builder configs from one environment.
 2. Commit the JSON file to your deployment workflow or artifact store.
 3. Import the JSON file into another environment.
-4. Verify that routes, middleware, and table mappings match.
+4. Verify that routes, middleware, table mappings, and scope are correct.
 
 Example export request:
 

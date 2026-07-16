@@ -6,6 +6,7 @@
 - [First API Config](#first-api-config)
 - [Form Builder Flow](#form-builder-flow)
 - [How the Runtime Works](#how-the-runtime-works)
+- [Database Scope](#database-scope)
 
 ## First Data Source
 
@@ -32,6 +33,8 @@ Content-Type: application/json
   ]
 }
 ```
+
+If the request includes `X-Tenant`, the record is saved as `database_scope = tenant`. Without `X-Tenant`, the record is saved as `database_scope = central`.
 
 ## First API Config
 
@@ -90,11 +93,11 @@ Typical workflow:
 
 Common builder capabilities:
 
-- Input validation
-- Conditional fields
-- Dynamic select options
-- Nested object and array params
-- Reusable field mappings
+- input validation
+- conditional fields
+- dynamic select options
+- nested object and array params
+- reusable field mappings
 
 ## How the Runtime Works
 
@@ -103,10 +106,23 @@ High-level request flow:
 1. Developer creates a builder config.
 2. The config is stored in the database.
 3. The package resolves the matching route or data source.
-4. `DataQueryService` validates incoming params.
+4. `DataQueryService` validates incoming params or CRUD payloads.
 5. Laravel executes the query and returns JSON.
+
+## Database Scope
+
+Package Builder management records are scope-aware.
+
+- `X-Tenant` present and not empty -> `tenant`
+- no `X-Tenant` header -> `central`
+
+The same rule is used when:
+
+- listing Data Source and API Builder records
+- creating or updating configurations
+- importing configurations
+- validating runtime access before execution
 
 ## Screenshot Placeholder
 
 > Screenshot placeholder: onboarding overview in the builder UI
-

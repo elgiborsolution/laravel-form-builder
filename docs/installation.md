@@ -53,8 +53,14 @@ The published config includes the database connection setting:
 
 ```php
 return [
-    'database_connection' => env('LARAVEL_FORM_BUILDER_DB_CONNECTION', env('DB_CONNECTION', 'mysql')),
+    'database_connection' => env('LARAVEL_FORM_BUILDER_DB_CONNECTION', env('DB_CONNECTION')),
 ];
+```
+
+The package reads that value from:
+
+```php
+config('datasources.database_connection')
 ```
 
 Publish the package migrations:

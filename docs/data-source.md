@@ -3,24 +3,38 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Database Scope](#database-scope)
 - [Configuration Fields](#configuration-fields)
 - [Endpoints](#endpoints)
 - [Filtering and Pagination](#filtering-and-pagination)
+- [Runtime Behavior](#runtime-behavior)
 - [Custom Query Mode](#custom-query-mode)
-- [Contoh Response](#contoh-response)
 - [Examples](#examples)
-- [Screenshot Placeholder](#screenshot-placeholder)
 
 ## Overview
 
-Data Source is the simplest builder in the package. It stores a reusable query definition for a table or a custom SQL statement, then exposes that definition through a query endpoint.
+Data Source stores a reusable query definition for a table or a custom SQL statement, then exposes that definition through a query endpoint.
 
 Use it when you want:
 
 - one place to define a list query
 - reusable filtering and pagination
 - async select options for the form builder
-- exportable/importable configuration
+- exportable and importable configuration
+
+## Database Scope
+
+Every Data Source record has a `database_scope` field:
+
+- `central`
+- `tenant`
+
+The backend determines the value automatically from the current request:
+
+- `X-Tenant` present and not empty -> `tenant`
+- otherwise -> `central`
+
+The management list endpoint only returns records for the current scope, and runtime execution rejects a Data Source when the request scope does not match the stored scope.
 
 ## Configuration Fields
 
@@ -31,6 +45,10 @@ The `DataSource` model stores:
 - `use_custom_query`
 - `columns`
 - `custom_query`
+- `use_soft_delete`
+- `response_type`
+- `custom_parameters`
+- `database_scope`
 
 The related parameter table stores:
 
@@ -67,19 +85,20 @@ Helper endpoints:
 ```http
 GET /api/data-source/tables
 GET /api/data-source/tables/{table}/columns
-GET /api/{id}
-```
-
-Legacy alias during the transition:
-
-```http
-GET /api/data-source/{id}
+POST /api/data-source/query/validate
+POST /api/data-source/query/columns
 GET /api/data-source/{id}/query
+GET /api/data-source/{id}/{routePath}
 ```
+
+The list endpoint is scope-aware:
+
+- `X-Tenant` present and not empty -> only `database_scope = tenant`
+- no `X-Tenant` header -> only `database_scope = central`
 
 ## Filtering and Pagination
 
-The query endpoint can accept request params and pagination arguments.
+The runtime query endpoint accepts request parameters, route parameters, ordering, and pagination arguments.
 
 Example:
 
@@ -89,10 +108,29 @@ GET /api/users-list?page=1&per_page=10&status=active
 
 Behavior:
 
-- `page` enables pagination
-- `per_page` sets page size
 - matching parameter names are read from the request
-- default values are used when a parameter is not supplied
+- route parameters can be used inside `{placeholder}` expressions
+- `order_by` and `order_direction` are applied when the column exists in the configured column list
+- `page` and `per_page` use Laravel pagination in the runtime query layer
+- the management list endpoint paginates only when `page` is present and currently uses a default page size of 10
+
+The package does not use `simplePaginate`, `cursorPaginate`, or `lazy` pagination in the current implementation.
+
+## Runtime Behavior
+
+Runtime execution handles the following before returning the response:
+
+- runtime variable parsing
+- request parameter resolution
+- route parameter replacement
+- JSON result decoding for configured JSON columns
+- soft delete filtering when enabled and the table has `deleted_at`
+- automatic ordering when `order_by` is supplied
+
+The result payload keeps the existing response shape:
+
+- `data` for non-paginated responses
+- Laravel paginator output when pagination is active
 
 ## Custom Query Mode
 
@@ -101,111 +139,16 @@ When `use_custom_query` is enabled:
 - `custom_query` must be a `SELECT` statement
 - the package rejects non-select statements
 - `columns` are derived from the query result structure
+- custom parameters in the query are resolved from the request at runtime
 
 Example:
 
 ```json
 {
-  "name": "Active Customers",
-  "table_name": "",
+  "name": "Low Stock Products",
   "use_custom_query": true,
-  "columns": ["id", "name", "email"],
-  "custom_query": "select id, name, email from customers where status = 'active'"
-}
-```
-
-## Contoh Response
-
-Gunakan struktur berikut sebagai contoh response yang konsisten dengan output backend terbaru.
-
-### Non paginate
-
-Jika `columns` bernilai:
-
-```json
-["id", "name"]
-```
-
-Maka response non paginate:
-
-```json
-{
-  "data": [
-    {
-      "id": 6,
-      "name": "BARU"
-    },
-    {
-      "id": 7,
-      "name": "BEKAS"
-    },
-    {
-      "id": 8,
-      "name": "AKAN DIREKONDISI"
-    },
-    {
-      "id": 9,
-      "name": "TELAH DIREKONDISI"
-    }
-  ]
-}
-```
-
-### Paginate
-
-Jika paginate aktif, response akan mengikuti format paginator Laravel:
-
-```json
-{
-  "current_page": 1,
-  "data": [
-    {
-      "id": 6,
-      "name": "BARU"
-    },
-    {
-      "id": 7,
-      "name": "BEKAS"
-    },
-    {
-      "id": 8,
-      "name": "AKAN DIREKONDISI"
-    },
-    {
-      "id": 9,
-      "name": "TELAH DIREKONDISI"
-    }
-  ],
-  "first_page_url": "/?page=1",
-  "from": 1,
-  "last_page": 1,
-  "last_page_url": "/?page=1",
-  "links": [
-    {
-      "url": null,
-      "label": "« Sebelumnya",
-      "page": null,
-      "active": false
-    },
-    {
-      "url": "/?page=1",
-      "label": "1",
-      "page": 1,
-      "active": true
-    },
-    {
-      "url": null,
-      "label": "Berikutnya »",
-      "page": null,
-      "active": false
-    }
-  ],
-  "next_page_url": null,
-  "path": "/",
-  "per_page": 10,
-  "prev_page_url": null,
-  "to": 4,
-  "total": 4
+  "columns": ["id", "name", "stock"],
+  "custom_query": "select id, name, stock from products where stock < 10"
 }
 ```
 
@@ -218,7 +161,9 @@ Jika paginate aktif, response akan mengikuti format paginator Laravel:
   "name": "Product List",
   "table_name": "products",
   "use_custom_query": false,
-  "columns": ["id", "sku", "name", "price"]
+  "columns": ["id", "sku", "name", "price"],
+  "use_soft_delete": true,
+  "response_type": "array"
 }
 ```
 
@@ -229,11 +174,30 @@ Jika paginate aktif, response akan mengikuti format paginator Laravel:
   "name": "Low Stock Products",
   "use_custom_query": true,
   "columns": ["id", "name", "stock"],
-  "custom_query": "select id, name, stock from products where stock < 10"
+  "custom_query": "select id, name, stock from products where stock < 10",
+  "custom_parameters": [
+    {
+      "name": "company_id",
+      "type": "integer",
+      "required": true,
+      "default": "{{ auth.company_id }}"
+    }
+  ]
 }
 ```
 
-### Response example
+### Route-based data source
+
+```json
+{
+  "name": "customers/{customer_id}",
+  "table_name": "customers",
+  "use_custom_query": false,
+  "columns": ["id", "name", "email"]
+}
+```
+
+### Runtime response
 
 ```json
 {
@@ -247,7 +211,3 @@ Jika paginate aktif, response akan mengikuti format paginator Laravel:
   ]
 }
 ```
-
-## Screenshot Placeholder
-
-> Screenshot placeholder: create and test a data source
