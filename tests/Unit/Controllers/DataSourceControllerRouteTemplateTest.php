@@ -3,6 +3,7 @@
 namespace ESolution\DataSources\Tests\Unit\Controllers;
 
 use ESolution\DataSources\Controllers\DataSourceController;
+use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Services\CustomQueryService;
 use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
@@ -65,6 +66,40 @@ class DataSourceControllerRouteTemplateTest extends TestCase
         $this->assertSame(['product', '123'], $controller->capturedExecuteQueryArgs);
     }
 
+    public function test_it_rejects_central_data_sources_from_tenant_requests_before_execution(): void
+    {
+        $controller = new TestableDataSourceControllerRuntime(
+            $this->createMock(DataQueryService::class),
+            $this->createMock(CustomQueryService::class),
+            $this->createMock(Pipeline::class),
+            $this->createMock(DatabaseMetadataProvider::class)
+        );
+
+        $response = $controller->executeRuntimeRequest(
+            Request::create('/api/tesas', 'GET', [], [], [], [
+                'HTTP_X_TENANT' => 'jayasuksesrejeki',
+            ]),
+            'tesas'
+        );
+
+        $this->assertInstanceOf(JsonResponse::class, $response);
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertNull($controller->capturedExecuteQueryArgs);
+        $this->assertFalse($controller->executeQueryCalled);
+    }
+
+    public function test_it_treats_empty_x_tenant_values_as_central_requests(): void
+    {
+        $controller = $this->makeController();
+
+        $this->assertSame(
+            'central',
+            $controller->exposeResolveRequestDatabaseScope(Request::create('/api/tesas', 'GET', [], [], [], [
+                'HTTP_X_TENANT' => '   ',
+            ]))
+        );
+    }
+
     private function makeController(): TestableDataSourceController
     {
         return new TestableDataSourceController(
@@ -92,14 +127,21 @@ class TestableDataSourceController extends DataSourceController
     {
         return $this->extractRouteTemplateParameters($template);
     }
+
+    public function exposeResolveRequestDatabaseScope(Request $request): string
+    {
+        return $this->resolveRequestDatabaseScope($request);
+    }
 }
 
 class TestableDataSourceControllerRuntime extends DataSourceController
 {
     public ?array $capturedExecuteQueryArgs = null;
+    public bool $executeQueryCalled = false;
 
     public function executeQuery(Request $request, $id, ?string $routePath = null)
     {
+        $this->executeQueryCalled = true;
         $this->capturedExecuteQueryArgs = [(string) $id, $routePath];
 
         return new JsonResponse(['data' => []], 200);
@@ -107,8 +149,12 @@ class TestableDataSourceControllerRuntime extends DataSourceController
 
     protected function resolveDataSourceForExecution(string $identifier, ?string $routePath = null): ?array
     {
+        $dataSource = new DataSource();
+        $dataSource->name = $identifier;
+        $dataSource->database_scope = 'central';
+
         return [
-            new \ESolution\DataSources\Models\DataSource(),
+            $dataSource,
             [],
             $identifier,
         ];

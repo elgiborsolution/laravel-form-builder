@@ -1255,8 +1255,16 @@ class DataSourceController extends Controller
       return null;
     }
 
-    if ($this->resolveDataSourceForExecution((string) $identifier, $routePath) === null) {
+    $dataSourceMatch = $this->resolveDataSourceForExecution((string) $identifier, $routePath);
+
+    if ($dataSourceMatch === null) {
       return null;
+    }
+
+    [$dataSource] = $dataSourceMatch;
+
+    if ($databaseScopeResponse = $this->validateDataSourceDatabaseScope($request, $dataSource)) {
+      return $databaseScopeResponse;
     }
 
     return $this->executeQuery($request, (string) $identifier, $routePath);
@@ -1296,6 +1304,41 @@ class DataSourceController extends Controller
     }
 
     return null;
+  }
+
+  protected function resolveRequestDatabaseScope(Request $request): string
+  {
+    $tenantId = trim((string) $request->header('X-Tenant', ''));
+
+    return $tenantId !== '' ? 'tenant' : 'central';
+  }
+
+  protected function validateDataSourceDatabaseScope(Request $request, DataSource $dataSource): ?JsonResponse
+  {
+    $requestScope = $this->resolveRequestDatabaseScope($request);
+    $configuredScope = trim((string) ($dataSource->database_scope ?? 'central'));
+
+    if (! in_array($configuredScope, ['central', 'tenant'], true)) {
+      $configuredScope = 'central';
+    }
+
+    Log::debug('DataSource database_scope validation', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'request_scope' => $requestScope,
+      'data_source' => (string) ($dataSource->name ?? ''),
+      'database_scope' => $configuredScope,
+      'validation_result' => $requestScope === $configuredScope ? 'PASSED' : 'FAILED',
+    ]);
+
+    if ($requestScope === $configuredScope) {
+      return null;
+    }
+
+    return response()->json([
+      'status' => 403,
+      'error' => 'Data source access denied',
+      'message' => 'This data source cannot be accessed from the current database scope.',
+    ], 403);
   }
 
   protected function matchRouteTemplate(string $template, string $path): array
