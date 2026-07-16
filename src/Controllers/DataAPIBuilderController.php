@@ -1566,6 +1566,8 @@ class DataAPIBuilderController extends Controller
   public function store(Request $request)
   {
      $this->logApiConfigPayload('store.incoming_request', $request->all());
+     $databaseScope = $this->resolveRequestDatabaseScope($request);
+     $databaseScopeBeforeSave = (string) $request->input('database_scope', 'central');
 
      $request->merge([
         'method' => strtoupper((string) $request->input('method')),
@@ -1655,6 +1657,14 @@ class DataAPIBuilderController extends Controller
                   $validated['middlewares'] ?? null,
                   $validated['use_default_middlewares'] ?? true
               ),
+              'database_scope' => $databaseScope,
+            ]);
+
+            \Log::debug('ApiConfig database_scope save', [
+                'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+                'Detected scope' => $databaseScope,
+                'database_scope before save' => $databaseScopeBeforeSave,
+                'database_scope after save' => (string) ($dataApiBuilder->database_scope ?? ''),
             ]);
 
             $this->syncApiConfigRelations($dataApiBuilder, $payload);
@@ -1760,6 +1770,7 @@ class DataAPIBuilderController extends Controller
   public function update(Request $request, $id)
   {
      $this->logApiConfigPayload('update.incoming_request', $request->all());
+     $databaseScope = $this->resolveRequestDatabaseScope($request);
 
      $request->merge([
         'method' => strtoupper((string) $request->input('method')),
@@ -1780,6 +1791,7 @@ class DataAPIBuilderController extends Controller
     if (empty($dataApiBuilder)) {
         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
     }
+    $databaseScopeBeforeSave = (string) ($dataApiBuilder->database_scope ?? 'central');
     $dataApiBuilder->loadMissing('parentTable', 'childTables');
 
     $originalEndpoint = $dataApiBuilder->endpoint;
@@ -1854,6 +1866,14 @@ class DataAPIBuilderController extends Controller
               'enabled' => array_key_exists('enabled', $validated) ? (bool) $validated['enabled'] : true,
               'description' => $validated['description'] ?? null,
               'middlewares' => $this->normalizeMiddlewares($validated['middlewares'] ?? null),
+              'database_scope' => $databaseScope,
+            ]);
+
+            \Log::debug('ApiConfig database_scope save', [
+                'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+                'Detected scope' => $databaseScope,
+                'database_scope before save' => $databaseScopeBeforeSave,
+                'database_scope after save' => (string) ($dataApiBuilder->database_scope ?? ''),
             ]);
 
             $this->syncApiConfigRelations($dataApiBuilder, $payload);
@@ -1942,6 +1962,8 @@ class DataAPIBuilderController extends Controller
      if (!class_exists($eventClass)) {
          Artisan::call('make:event AfterRunnerApiBuiderEvent');
      }
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
+    $databaseScopeBeforeSave = (string) $request->input('database_scope', 'central');
 
     $validated = $request->validate([
       'route_name' => ['nullable', 'string'],
@@ -2028,6 +2050,14 @@ class DataAPIBuilderController extends Controller
                     'enabled' => (bool) $bundlePayload['enabled'],
                     'description' => $bundlePayload['description'] ?? null,
                     'middlewares' => $bundlePayload['middlewares'],
+                    'database_scope' => $databaseScope,
+                ]);
+
+                \Log::debug('ApiConfig database_scope save', [
+                    'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+                    'Detected scope' => $databaseScope,
+                    'database_scope before save' => $databaseScopeBeforeSave,
+                    'database_scope after save' => (string) ($dataApiBuilder->database_scope ?? ''),
                 ]);
 
                 $this->syncApiConfigRelations($dataApiBuilder, $bundlePayload);
@@ -2216,6 +2246,13 @@ class DataAPIBuilderController extends Controller
                 array_map(static fn ($middleware) => is_string($middleware) ? trim($middleware) : '', $defaultMiddlewares),
                 static fn (string $middleware) => $middleware !== ''
             ));
+      }
+
+      protected function resolveRequestDatabaseScope(Request $request): string
+      {
+            $tenantId = trim((string) $request->header('X-Tenant', ''));
+
+            return $tenantId !== '' ? 'tenant' : 'central';
       }
 
       protected function normalizeUseDefaultMiddlewares(mixed $value): bool

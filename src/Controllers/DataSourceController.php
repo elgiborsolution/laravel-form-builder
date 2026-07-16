@@ -339,6 +339,14 @@ class DataSourceController extends Controller
       'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters')),
     ]);
 
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
+    $databaseScopeBeforeSave = (string) $request->input('database_scope', 'central');
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+    ]);
+
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
       'use_soft_delete' => ['nullable', 'boolean'],
@@ -380,6 +388,7 @@ class DataSourceController extends Controller
       'custom_parameters.*.default' => ['nullable'],
       'custom_parameters.*.description' => ['nullable', 'string'],
       'custom_parameters.*.unused' => ['nullable', 'boolean'],
+      'database_scope' => ['nullable', 'string', Rule::in(['central', 'tenant'])],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -444,6 +453,7 @@ class DataSourceController extends Controller
     if ((bool) $validated['use_custom_query']) {
       $validated['use_soft_delete'] = false;
     }
+    $validated['database_scope'] = $databaseScope;
 
     $dataSource = DataSource::create([
       'name' => $validated['name'],
@@ -455,6 +465,14 @@ class DataSourceController extends Controller
       'middlewares' => $validated['middlewares'] ?? null,
       'response_type' => $validated['response_type'] ?? 'array',
       'custom_parameters' => $validated['custom_parameters'] ?? [],
+      'database_scope' => $validated['database_scope'],
+    ]);
+
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+      'database_scope after save' => (string) ($dataSource->database_scope ?? ''),
     ]);
 
     if(count($dataParam) > 0){
@@ -511,6 +529,14 @@ class DataSourceController extends Controller
       'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters', $dataSource->custom_parameters ?? [])),
     ]);
 
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
+    $databaseScopeBeforeSave = (string) ($dataSource->database_scope ?? 'central');
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+    ]);
+
     $validated = $request->validate([
       'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
@@ -542,6 +568,7 @@ class DataSourceController extends Controller
       'custom_parameters.*.unused' => ['nullable', 'boolean'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
+      'database_scope' => ['nullable', 'string', Rule::in(['central', 'tenant'])],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -606,6 +633,7 @@ class DataSourceController extends Controller
     if ((bool) $validated['use_custom_query']) {
       $validated['use_soft_delete'] = false;
     }
+    $validated['database_scope'] = $databaseScope;
 
 
     $dataSource->update([
@@ -618,6 +646,14 @@ class DataSourceController extends Controller
       'middlewares' => $validated['middlewares'] ?? null,
       'response_type' => $validated['response_type'] ?? 'array',
       'custom_parameters' => $validated['custom_parameters'] ?? [],
+      'database_scope' => $validated['database_scope'],
+    ]);
+
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+      'database_scope after save' => (string) ($dataSource->database_scope ?? ''),
     ]);
 
     $dataSource->parameters()->delete();
@@ -1122,6 +1158,13 @@ class DataSourceController extends Controller
     return DatabaseConnection::configuredName();
   }
 
+  protected function resolveRequestDatabaseScope(Request $request): string
+  {
+    $tenantId = trim((string) $request->header('X-Tenant', ''));
+
+    return $tenantId !== '' ? 'tenant' : 'central';
+  }
+
   /**
    * Resolve middleware definitions using Laravel router middleware aliases and groups.
    *
@@ -1304,13 +1347,6 @@ class DataSourceController extends Controller
     }
 
     return null;
-  }
-
-  protected function resolveRequestDatabaseScope(Request $request): string
-  {
-    $tenantId = trim((string) $request->header('X-Tenant', ''));
-
-    return $tenantId !== '' ? 'tenant' : 'central';
   }
 
   protected function validateDataSourceDatabaseScope(Request $request, DataSource $dataSource): ?JsonResponse
