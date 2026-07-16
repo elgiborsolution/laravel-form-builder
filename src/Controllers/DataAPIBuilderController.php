@@ -42,10 +42,11 @@ class DataAPIBuilderController extends Controller
       public function index(Request $request)
       {
         $search = trim((string) $request->query('search', ''));
+        $scope = $this->resolveDatabaseScope($request);
 
         $dataApiBuilder = $search !== ''
             ? $this->loadApiConfigs($request)
-            : Cache::remember($this->cacheKey('list-api-configs'), 60, function () use ($request) {
+            : Cache::remember($this->cacheKey('list-api-configs', $scope), 60, function () use ($request) {
                 return $this->loadApiConfigs($request);
             });
 
@@ -169,7 +170,7 @@ class DataAPIBuilderController extends Controller
             ], 422);
         }
 
-        Cache::forget($this->cacheKey('list-api-configs'));
+        $this->forgetListApiConfigsCache();
 
         return response()->json([
             'status' => 200,
@@ -810,7 +811,7 @@ class DataAPIBuilderController extends Controller
 
         $this->syncApiConfigRelations($config, $payload);
 
-        Cache::forget($this->cacheKey('list-api-configs'));
+        $this->forgetListApiConfigsCache();
         $this->resolver->forget($endpoint, $method);
 
         if ($originalEndpoint && $originalMethod && ($originalEndpoint !== $endpoint || $originalMethod !== $method)) {
@@ -1703,7 +1704,7 @@ class DataAPIBuilderController extends Controller
             );
 
             $connection->commit();
-              Cache::forget($this->cacheKey('list-api-configs'));
+              $this->forgetListApiConfigsCache();
               $this->resolver->forget($validated['endpoint'], $validated['method']);
              return response()->json(["status" => 200, 'message' => 'Data api builder created', 'data'=>$dataApiBuilder], 201);
         } catch (\Exception $e) {
@@ -1903,7 +1904,7 @@ class DataAPIBuilderController extends Controller
 
 
             $connection->commit();
-            Cache::forget($this->cacheKey('list-api-configs'));
+            $this->forgetListApiConfigsCache();
             $this->resolver->forget($originalEndpoint, $originalMethod);
             $this->resolver->forget($validated['endpoint'], $validated['method']);
             return response()->json(["status" => 200, 'message' => 'Data api builder updated', 'data'=>$dataApiBuilder], 200);
@@ -2066,7 +2067,7 @@ class DataAPIBuilderController extends Controller
             }
 
             $connection->commit();
-            Cache::forget($this->cacheKey('list-api-configs'));
+            $this->forgetListApiConfigsCache();
 
             return response()->json([
                 "status" => 200,
@@ -2107,13 +2108,21 @@ class DataAPIBuilderController extends Controller
         $this->resolver->forget($dataApiBuilder->endpoint, $dataApiBuilder->method);
         $dataApiBuilder->delete();
 
-        Cache::forget($this->cacheKey('list-api-configs'));
+        $this->forgetListApiConfigsCache();
         return response()->json(['message' => 'Data api builder deleted']);
       }
 
-      protected function cacheKey(string $key): string
+      protected function cacheKey(string $key, ?string $scope = null): string
       {
-            return DatabaseConnection::cachePrefix($key);
+            $suffix = $scope !== null ? ':' . $scope : '';
+
+            return DatabaseConnection::cachePrefix($key . $suffix);
+      }
+
+      protected function forgetListApiConfigsCache(): void
+      {
+            Cache::forget($this->cacheKey('list-api-configs', 'central'));
+            Cache::forget($this->cacheKey('list-api-configs', 'tenant'));
       }
 
       /**
@@ -2125,9 +2134,13 @@ class DataAPIBuilderController extends Controller
       protected function loadApiConfigs(Request $request): array
       {
             return $this->applySearchFilter(
-                ApiConfig::on(DatabaseConnection::configuredName())
-                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
-                    ->orderBy('id'),
+                $this->applyDatabaseScopeFilter(
+                    ApiConfig::on(DatabaseConnection::configuredName())
+                        ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
+                        ->orderBy('id'),
+                    $request,
+                    'api_configs'
+                ),
                 $request,
                 ['route_name', 'endpoint', 'description', 'method'],
                 'api_configs'

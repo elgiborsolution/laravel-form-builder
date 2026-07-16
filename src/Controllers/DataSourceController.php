@@ -44,11 +44,15 @@ class DataSourceController extends Controller
   public function index(Request $request)
   {
     $connection = DatabaseConnection::configuredName();
-    $data = $this->applySearchFilter(
+    $data = $this->applyDatabaseScopeFilter(
+      $this->applySearchFilter(
         DataSource::on($connection)->orderBy('id'),
         $request,
         ['code', 'name', 'description', 'table_name', 'custom_query'],
         'data_sources'
+      ),
+      $request,
+      'data_sources'
     );
 
     if(!empty($request->page)){
