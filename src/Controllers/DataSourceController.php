@@ -176,6 +176,7 @@ class DataSourceController extends Controller
     $errors = [];
     $duplicateColumns = $this->duplicateColumns();
     $insertedCount = 0;
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
 
     try {
       if (empty($rows)) {
@@ -209,6 +210,16 @@ class DataSourceController extends Controller
         $row['columns'] = $this->normalizeColumnsInput($row['columns'] ?? []);
         $row['middlewares'] = $this->normalizeMiddlewaresInput($row['middlewares'] ?? null);
         $row['custom_parameters'] = $this->normalizeCustomParametersInput($row['custom_parameters'] ?? []);
+        $importedDatabaseScope = (string) ($row['database_scope'] ?? 'central');
+        $finalDatabaseScope = $databaseScope;
+
+        Log::debug('DataSource import database_scope save', [
+          'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+          'Detected scope' => $databaseScope,
+          'Imported record name' => (string) ($row['name'] ?? ''),
+          'Imported database_scope' => $importedDatabaseScope,
+          'Final database_scope before save' => $finalDatabaseScope,
+        ]);
 
         $validated = Validator::make($row, [
           'name' => ['required', 'string'],
@@ -262,6 +273,7 @@ class DataSourceController extends Controller
           'custom_query' => $row['custom_query'] ?? null,
           'middlewares' => $row['middlewares'] ?? null,
           'custom_parameters' => $row['custom_parameters'] ?? [],
+          'database_scope' => $finalDatabaseScope,
         ];
 
         try {
@@ -269,6 +281,14 @@ class DataSourceController extends Controller
           if ($dataSource && $dataSource->exists) {
             $insertedCount++;
             $summary['imported']++;
+
+            Log::debug('DataSource import database_scope save', [
+              'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+              'Detected scope' => $databaseScope,
+              'Imported record name' => (string) ($row['name'] ?? ''),
+              'Imported database_scope' => $importedDatabaseScope,
+              'Final database_scope before save' => (string) ($dataSource->database_scope ?? ''),
+            ]);
           } else {
             $summary['failed']++;
             $errors[] = [

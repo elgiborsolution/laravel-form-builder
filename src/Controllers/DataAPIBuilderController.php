@@ -144,6 +144,7 @@ class DataAPIBuilderController extends Controller
         try {
             foreach ($rows as $rowIndex => $row) {
                 $result = $this->importApiConfigRow(
+                    $request,
                     $row,
                     $summary,
                     $processedKeys,
@@ -681,10 +682,12 @@ class DataAPIBuilderController extends Controller
         return ! $this->isSequentialArray($value);
     }
 
-    protected function importApiConfigRow(array $row, array &$batchSummary, array &$processedKeys, string $fileName, int $rowNumber): ?array
+    protected function importApiConfigRow(Request $request, array $row, array &$batchSummary, array &$processedKeys, string $fileName, int $rowNumber): ?array
     {
         $payload = array_key_exists('data', $row) && is_array($row['data']) ? $row['data'] : $row;
         $payload = $this->normalizeLegacyApiConfigPayload($payload);
+        $databaseScope = $this->resolveRequestDatabaseScope($request);
+        $importedDatabaseScope = (string) ($payload['database_scope'] ?? 'central');
 
         if (! is_array($payload)) {
             $batchSummary['failed']++;
@@ -761,6 +764,14 @@ class DataAPIBuilderController extends Controller
         $method = strtoupper((string) $payload['method']);
         $duplicateKey = implode('|', [$routeName, $endpoint, $method]);
 
+        \Log::debug('ApiConfig import database_scope save', [
+            'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+            'Detected scope' => $databaseScope,
+            'Imported record name' => $routeName,
+            'Imported database_scope' => $importedDatabaseScope,
+            'Final database_scope before save' => $databaseScope,
+        ]);
+
         if (isset($processedKeys[$duplicateKey])) {
             $batchSummary['skipped']++;
 
@@ -806,8 +817,17 @@ class DataAPIBuilderController extends Controller
             'middlewares' => $this->normalizeMiddlewares($payload['middlewares'] ?? null),
             'params' => $payload['params'] ?? null,
             'enabled' => (bool) $payload['enabled'],
+            'database_scope' => $databaseScope,
         ]);
         $config->save();
+
+        \Log::debug('ApiConfig import database_scope save', [
+            'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+            'Detected scope' => $databaseScope,
+            'Imported record name' => $routeName,
+            'Imported database_scope' => $importedDatabaseScope,
+            'Final database_scope before save' => (string) ($config->database_scope ?? ''),
+        ]);
 
         $this->syncApiConfigRelations($config, $payload);
 
