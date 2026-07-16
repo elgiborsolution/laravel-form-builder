@@ -10,7 +10,8 @@
 
 ## Overview
 
-The package does not replace Laravel authentication. Instead, it works with your existing auth layer through standard middleware and request headers.
+The package does not replace Laravel authentication.
+It works with your existing auth layer through standard middleware and request headers.
 
 ## Token-Based Requests
 
@@ -34,10 +35,13 @@ If your project uses tenancy, the package can initialize tenant context from req
 Example:
 
 ```http
-x-tenant: tenant-id
+X-Tenant: tenant-id
 ```
 
-The package service provider also wires tenant-aware management routes when tenancy middleware is available.
+`X-Tenant` is also used by Package Builder to determine request scope:
+
+- present and not empty -> `tenant`
+- missing or empty -> `central`
 
 ## Middleware Examples
 
@@ -60,6 +64,5 @@ Custom middleware can be used for:
 ## Common Notes
 
 - If a request returns `401`, verify your auth middleware and token.
-- If a tenant-aware route cannot find data, confirm the `x-tenant` header and tenant initialization middleware.
+- If a tenant-aware route cannot find data, confirm the `X-Tenant` header and tenant initialization middleware.
 - If dynamic routes are blocked, check route prefix collisions and reserved paths in `config/datasources.php`.
-

@@ -1,6 +1,8 @@
 # Laravel Form Builder
 
-Laravel Form Builder is a backend package for building dynamic data sources, reusable API configurations, and form-driven CRUD flows without writing a new controller for every use case. It is designed for teams that want a configurable, JSON-friendly builder layer on top of Laravel.
+Laravel Form Builder is a backend package for building dynamic data sources, reusable API configurations, and form-driven CRUD flows on top of Laravel.
+
+It is designed for teams that want a configurable, JSON-friendly builder layer without writing a new controller for every use case.
 
 ## Live Demo
 
@@ -15,24 +17,30 @@ https://github.com/elgiborsolution/laravel-form-builder.git
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-- [Screenshots](#screenshots)
 - [Documentation](#documentation)
 - [Architecture](#architecture)
 - [Support](#support)
 
 ## Features
 
-- Dynamic form builder
-- Data source builder
-- API builder
-- Import/export configuration
-- Middleware support
-- Dynamic validation
-- Custom query support
-- Reusable API configuration
-- JSON-based configuration
-- Dynamic select datasource
-- Form API integration
+- Data Source builder
+- API Builder
+- Form Builder
+- Runtime variables
+- Before execute hooks
+- After execute listeners
+- Parent and child table mapping
+- Child update key support
+- LOOP_INSERT array handling
+- Route parameter expressions
+- JSON field auto decoding
+- Table-based and custom query data sources
+- Filtering, pagination, and automatic ordering
+- Import and export
+- Validation rules and unique validation
+- Soft delete support
+- File upload field support
+- Package Builder `database_scope` filtering and access validation
 
 ## Installation
 
@@ -86,10 +94,10 @@ Set the connection the package should use for its models, queries, and migration
 LARAVEL_FORM_BUILDER_DB_CONNECTION=tenant
 ```
 
-The package will fall back to `DB_CONNECTION` and then `mysql` when this variable is not set. You can also read the resolved value from config:
+The package falls back to `DB_CONNECTION` when this variable is not set. You can also read the resolved value from config:
 
 ```php
-config('laravel-form-builder.database_connection')
+config('datasources.database_connection')
 ```
 
 ## Quick Start
@@ -98,41 +106,19 @@ config('laravel-form-builder.database_connection')
 2. Create an API config if you need a public dynamic endpoint.
 3. Use the form builder to define fields and bind select options.
 4. Call the generated endpoint from your frontend or server-to-server integration.
+5. Use `X-Tenant` to switch Package Builder scope automatically between `central` and `tenant` records.
 
-Example:
+Example runtime request:
 
 ```http
 GET /api/data-source/users-list/query?page=1&per_page=10
 ```
 
-Response example:
-
-```json
-{
-  "current_page": 1,
-  "data": [
-    {
-      "id": 1,
-      "name": "Alice",
-      "email": "alice@example.com"
-    }
-  ],
-  "total": 1
-}
-```
-
-## Screenshots
-
-> Screenshot placeholder: Data Source Builder
->
-> Screenshot placeholder: Data API Builder
->
-> Screenshot placeholder: Form Builder
-
 ## Documentation
 
 - [Installation](docs/installation.md)
 - [Getting Started](docs/getting-started.md)
+- [Runtime Variables](docs/runtime-variables.md)
 - [Data Source](docs/data-source.md)
 - [Data API Builder](docs/data-api-builder.md)
 - [Form Builder](docs/form-builder.md)
@@ -149,15 +135,15 @@ The package is organized around a small set of backend layers:
 - `Controllers` accept management requests for builders and runtime API requests.
 - `Models` store the configuration records such as data sources, API configs, listeners, permissions, and mappings.
 - `Services` turn configuration into executable queries.
-- `Support` classes resolve dynamic routes and normalize endpoint lookups.
+- `Support` classes resolve dynamic routes, database scope, and endpoint lookups.
 - `Providers` register routes, migrations, and configuration.
 
 High-level flow:
 
 1. A developer creates a builder configuration.
 2. The configuration is persisted in Laravel models and database tables.
-3. The runtime route resolver finds the matching API config.
-4. The query service validates input, builds SQL, and returns the response.
+3. The runtime route resolver finds the matching API config or data source.
+4. The query service validates input, builds SQL or CRUD payloads, and returns the response.
 
 ## Support
 
@@ -165,4 +151,5 @@ If you are documenting the package for your team, start with:
 
 1. [Getting Started](docs/getting-started.md)
 2. [Data API Builder](docs/data-api-builder.md)
-3. [Form Builder](docs/form-builder.md)
+3. [Data Source](docs/data-source.md)
+4. [Runtime Variables](docs/runtime-variables.md)

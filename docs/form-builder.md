@@ -8,15 +8,15 @@
 - [Datasource Integration](#datasource-integration)
 - [Validation](#validation)
 - [Conditional Fields](#conditional-fields)
-- [Async Select Options](#async-select-options)
-- [API Import & Export](#api-import--export)
+- [Runtime Variables](#runtime-variables)
+- [Import and Export](#import-and-export)
 - [API Documentation](#api-documentation)
 - [Example Flow](#example-flow)
-- [Screenshot Placeholder](#screenshot-placeholder)
 
 ## Overview
 
-The form builder is the configuration layer for dynamic forms. It allows developers to define fields, validation, and data bindings in a reusable format instead of hard-coding every form.
+The form builder is the configuration layer for dynamic forms.
+It allows developers to define fields, validation, and data bindings in a reusable format instead of hard-coding every form.
 
 ## What It Solves
 
@@ -50,6 +50,11 @@ For API-style form payloads, the parameter types used by the builder include:
 - `object`
 - `array`
 - `url`
+- `email`
+- `uuid`
+- `json`
+- `file`
+- `image`
 
 ## Datasource Integration
 
@@ -67,6 +72,28 @@ Example lookup scenario:
 - a product select field reads from `products`
 - the select option label is `name`
 - the select option value is `id`
+
+## Management Endpoints
+
+```http
+GET    /api/form-builder
+POST   /api/form-builder
+GET    /api/form-builder/id/{id}
+GET    /api/form-builder/{code}
+PUT    /api/form-builder/{id}
+PATCH  /api/form-builder/{id}/status
+DELETE /api/form-builder/{id}
+```
+
+Import/export and documentation helpers:
+
+```http
+POST /api/form-builder/export
+GET  /api/form-builder/export-all
+POST /api/form-builder/import
+GET  /api/form-builder/docs
+GET  /api/form-builder/postman
+```
 
 ## Validation
 
@@ -100,98 +127,40 @@ Examples:
 - show child array fields only when `order_type = bulk`
 - require a field only when a checkbox is checked
 
-## Async Select Options
+## Runtime Variables
 
-Async select fields are the main integration point with data sources and data pickers.
+Form Builder can use runtime variables in schema payloads and default values.
 
-Recommended pattern:
+Examples:
 
-1. Define a data source for the option list.
-2. Add query filters if needed.
-3. Request the list dynamically from the backend.
-4. Map the response into label/value options.
+- `{{ auth.company_id }}`
+- `{{ app.env }}`
+- `{{ uuid.random }}`
 
-Example response mapped to select options:
+For details, see [Runtime Variables](runtime-variables.md).
 
-```json
-[
-  {
-    "id": 1,
-    "name": "Admin"
-  },
-  {
-    "id": 2,
-    "name": "Staff"
-  }
-]
-```
+## Import and Export
 
-Mapped options:
-
-- label: `name`
-- value: `id`
-
-## API Import & Export
-
-Form Builder now includes environment-friendly import and export endpoints so configurations can be moved between projects without losing the decoded schema payload.
+Form Builder includes JSON import and export endpoints so configurations can be moved between projects without losing the decoded schema payload.
 
 ### Export Selected
 
 - `POST /api/form-builder/export`
-- Body examples:
-
-```json
-{ "ids": [1, 2, 3] }
-```
-
-```json
-{ "codes": ["FORM_CUSTOMER", "FORM_PRODUCT"] }
-```
-
-The response is a JSON download with this structure:
-
-```json
-{
-  "version": 1,
-  "exported_at": "2026-06-22 10:00:00",
-  "items": [
-    {
-      "id": 1,
-      "code": "FORM_CUSTOMER",
-      "name": "Customer Form",
-      "description": "...",
-      "enabled": true,
-      "schema": [
-        {
-          "name": "customer_name",
-          "type": "string"
-        }
-      ]
-    }
-  ]
-}
-```
+- body: `ids` or `codes`
 
 ### Export All
 
 - `GET /api/form-builder/export-all`
-- Exports every form builder record in the same JSON structure.
 
 ### Import
 
 - `POST /api/form-builder/import`
 - `Content-Type: multipart/form-data`
-- Fields:
+- fields:
   - `file` required JSON export file
   - `mode` optional, `skip` or `update`
 
-Behavior:
-
-- `skip` leaves existing codes unchanged.
-- `update` overwrites existing records using the imported payload.
-- schema is validated and restored as JSON data.
-
-### Validation Rules
+Validation rules:
 
 - file is required
 - file must be JSON
@@ -206,7 +175,8 @@ The package also exposes:
 - `GET /api/form-builder/docs`
 - `GET /api/form-builder/postman`
 
-`/docs` returns developer-friendly JSON documentation with request and response examples. `/postman` returns a Postman Collection v2.1 JSON that can be imported directly into Postman without edits.
+`/docs` returns developer-friendly JSON documentation with request and response examples.
+`/postman` returns a Postman Collection v2.1 JSON that can be imported directly into Postman without edits.
 
 ## Example Flow
 
@@ -217,7 +187,3 @@ Create builder config
   -> Render form in frontend
   -> Submit payload to API
 ```
-
-## Screenshot Placeholder
-
-> Screenshot placeholder: dynamic form builder screen

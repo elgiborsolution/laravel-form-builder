@@ -6,11 +6,13 @@
 - [Data Source Export](#data-source-export)
 - [Data API Export](#data-api-export)
 - [Import Format](#import-format)
+- [Database Scope Behavior](#database-scope-behavior)
 - [Best Practices](#best-practices)
 
 ## Overview
 
-The package supports JSON-based import and export for data sources and API configs. This makes it easy to move builder definitions between environments.
+The package supports JSON-based import and export for data sources and API configs.
+This makes it easy to move builder definitions between environments.
 
 ## Data Source Export
 
@@ -30,6 +32,8 @@ Request example:
 
 If `ids` is empty, the package exports all records.
 
+The exported rows include the stored Data Source columns, including `database_scope`.
+
 Example exported row:
 
 ```json
@@ -38,7 +42,8 @@ Example exported row:
   "table_name": "users",
   "use_custom_query": false,
   "columns": ["id", "name", "email"],
-  "custom_query": null
+  "custom_query": null,
+  "database_scope": "central"
 }
 ```
 
@@ -50,7 +55,13 @@ Export endpoint:
 POST /api/data-api-builder/export
 ```
 
-Request example:
+Related helper endpoint:
+
+```http
+POST /api/data-api-builder/bundle-crud
+```
+
+Example export request:
 
 ```json
 {
@@ -58,39 +69,7 @@ Request example:
 }
 ```
 
-Example exported row:
-
-```json
-{
-  "route_name": "customers.index",
-  "endpoint": "customers",
-  "method": "GET",
-  "description": "Return customer list",
-  "middlewares": ["auth:sanctum"],
-  "params": [
-    {
-      "name": "status",
-      "type": "string",
-      "required": false,
-      "unique": false,
-      "params": []
-    }
-  ],
-  "enabled": true,
-  "parent_table": {
-    "table_name": "customers",
-    "primary_key": "id",
-    "foreign_key": null,
-    "data_params": {
-      "id": "id",
-      "name": "name"
-    }
-  },
-  "child_tables": [],
-  "permission": null,
-  "hook": null
-}
-```
+The export payload contains the API configuration tree, including parent tables, child tables, permissions, hooks, and before-execute hooks.
 
 ## Import Format
 
@@ -105,18 +84,40 @@ Supported import style:
 
 - JSON array of rows
 - JSON object containing `rows`
-- file upload payload for supported import handlers
+- uploaded JSON file for supported import handlers
+- legacy API config aliases such as `name`, `base_url`, `headers`, and `rules`
 
-Data API builder import also supports legacy aliases such as:
+### Data Source import
 
-- `name`
-- `base_url`
-- `headers`
-- `rules`
+Data Source import expects each row to describe a data source definition.
+
+The backend ignores any incoming `database_scope` value and sets it from the current request scope before save.
+
+### API Builder import
+
+API Builder import accepts rows that match the saved configuration shape.
+
+The backend ignores any incoming `database_scope` value and sets it from the current request scope before save.
+
+## Database Scope Behavior
+
+The request scope is determined by `X-Tenant`:
+
+- `X-Tenant` present and not empty -> `tenant`
+- otherwise -> `central`
+
+This rule is used when:
+
+- listing Data Source and API Builder records
+- creating configurations
+- updating configurations
+- importing configurations
+- validating runtime access before execution
 
 ## Best Practices
 
 - Keep one builder per logical business use case.
 - Export related configs together so they can be restored consistently.
 - Validate JSON before importing into production.
-- Store API config changes in version control if you maintain seed files.
+- Keep `X-Tenant` handling consistent between management requests and runtime requests.
+- Treat `database_scope` as backend-owned data, not frontend input.
