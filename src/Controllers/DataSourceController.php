@@ -44,11 +44,15 @@ class DataSourceController extends Controller
   public function index(Request $request)
   {
     $connection = DatabaseConnection::configuredName();
-    $data = $this->applySearchFilter(
+    $data = $this->applyDatabaseScopeFilter(
+      $this->applySearchFilter(
         DataSource::on($connection)->orderBy('id'),
         $request,
         ['code', 'name', 'description', 'table_name', 'custom_query'],
         'data_sources'
+      ),
+      $request,
+      'data_sources'
     );
 
     if(!empty($request->page)){
@@ -172,6 +176,7 @@ class DataSourceController extends Controller
     $errors = [];
     $duplicateColumns = $this->duplicateColumns();
     $insertedCount = 0;
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
 
     try {
       if (empty($rows)) {
@@ -205,6 +210,16 @@ class DataSourceController extends Controller
         $row['columns'] = $this->normalizeColumnsInput($row['columns'] ?? []);
         $row['middlewares'] = $this->normalizeMiddlewaresInput($row['middlewares'] ?? null);
         $row['custom_parameters'] = $this->normalizeCustomParametersInput($row['custom_parameters'] ?? []);
+        $importedDatabaseScope = (string) ($row['database_scope'] ?? 'central');
+        $finalDatabaseScope = $databaseScope;
+
+        Log::debug('DataSource import database_scope save', [
+          'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+          'Detected scope' => $databaseScope,
+          'Imported record name' => (string) ($row['name'] ?? ''),
+          'Imported database_scope' => $importedDatabaseScope,
+          'Final database_scope before save' => $finalDatabaseScope,
+        ]);
 
         $validated = Validator::make($row, [
           'name' => ['required', 'string'],
@@ -258,6 +273,7 @@ class DataSourceController extends Controller
           'custom_query' => $row['custom_query'] ?? null,
           'middlewares' => $row['middlewares'] ?? null,
           'custom_parameters' => $row['custom_parameters'] ?? [],
+          'database_scope' => $finalDatabaseScope,
         ];
 
         try {
@@ -265,6 +281,14 @@ class DataSourceController extends Controller
           if ($dataSource && $dataSource->exists) {
             $insertedCount++;
             $summary['imported']++;
+
+            Log::debug('DataSource import database_scope save', [
+              'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+              'Detected scope' => $databaseScope,
+              'Imported record name' => (string) ($row['name'] ?? ''),
+              'Imported database_scope' => $importedDatabaseScope,
+              'Final database_scope before save' => (string) ($dataSource->database_scope ?? ''),
+            ]);
           } else {
             $summary['failed']++;
             $errors[] = [
@@ -335,6 +359,14 @@ class DataSourceController extends Controller
       'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters')),
     ]);
 
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
+    $databaseScopeBeforeSave = (string) $request->input('database_scope', 'central');
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+    ]);
+
     $validated = $request->validate([
       'use_custom_query' => 'required|boolean',
       'use_soft_delete' => ['nullable', 'boolean'],
@@ -376,6 +408,7 @@ class DataSourceController extends Controller
       'custom_parameters.*.default' => ['nullable'],
       'custom_parameters.*.description' => ['nullable', 'string'],
       'custom_parameters.*.unused' => ['nullable', 'boolean'],
+      'database_scope' => ['nullable', 'string', Rule::in(['central', 'tenant'])],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -440,6 +473,7 @@ class DataSourceController extends Controller
     if ((bool) $validated['use_custom_query']) {
       $validated['use_soft_delete'] = false;
     }
+    $validated['database_scope'] = $databaseScope;
 
     $dataSource = DataSource::create([
       'name' => $validated['name'],
@@ -451,6 +485,14 @@ class DataSourceController extends Controller
       'middlewares' => $validated['middlewares'] ?? null,
       'response_type' => $validated['response_type'] ?? 'array',
       'custom_parameters' => $validated['custom_parameters'] ?? [],
+      'database_scope' => $validated['database_scope'],
+    ]);
+
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+      'database_scope after save' => (string) ($dataSource->database_scope ?? ''),
     ]);
 
     if(count($dataParam) > 0){
@@ -507,6 +549,14 @@ class DataSourceController extends Controller
       'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters', $dataSource->custom_parameters ?? [])),
     ]);
 
+    $databaseScope = $this->resolveRequestDatabaseScope($request);
+    $databaseScopeBeforeSave = (string) ($dataSource->database_scope ?? 'central');
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+    ]);
+
     $validated = $request->validate([
       'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
       'use_custom_query' => 'boolean',
@@ -538,6 +588,7 @@ class DataSourceController extends Controller
       'custom_parameters.*.unused' => ['nullable', 'boolean'],
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
+      'database_scope' => ['nullable', 'string', Rule::in(['central', 'tenant'])],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -602,6 +653,7 @@ class DataSourceController extends Controller
     if ((bool) $validated['use_custom_query']) {
       $validated['use_soft_delete'] = false;
     }
+    $validated['database_scope'] = $databaseScope;
 
 
     $dataSource->update([
@@ -614,6 +666,14 @@ class DataSourceController extends Controller
       'middlewares' => $validated['middlewares'] ?? null,
       'response_type' => $validated['response_type'] ?? 'array',
       'custom_parameters' => $validated['custom_parameters'] ?? [],
+      'database_scope' => $validated['database_scope'],
+    ]);
+
+    Log::debug('DataSource database_scope save', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'Detected scope' => $databaseScope,
+      'database_scope before save' => $databaseScopeBeforeSave,
+      'database_scope after save' => (string) ($dataSource->database_scope ?? ''),
     ]);
 
     $dataSource->parameters()->delete();
@@ -1118,6 +1178,13 @@ class DataSourceController extends Controller
     return DatabaseConnection::configuredName();
   }
 
+  protected function resolveRequestDatabaseScope(Request $request): string
+  {
+    $tenantId = trim((string) $request->header('X-Tenant', ''));
+
+    return $tenantId !== '' ? 'tenant' : 'central';
+  }
+
   /**
    * Resolve middleware definitions using Laravel router middleware aliases and groups.
    *
@@ -1251,8 +1318,16 @@ class DataSourceController extends Controller
       return null;
     }
 
-    if ($this->resolveDataSourceForExecution((string) $identifier, $routePath) === null) {
+    $dataSourceMatch = $this->resolveDataSourceForExecution((string) $identifier, $routePath);
+
+    if ($dataSourceMatch === null) {
       return null;
+    }
+
+    [$dataSource] = $dataSourceMatch;
+
+    if ($databaseScopeResponse = $this->validateDataSourceDatabaseScope($request, $dataSource)) {
+      return $databaseScopeResponse;
     }
 
     return $this->executeQuery($request, (string) $identifier, $routePath);
@@ -1292,6 +1367,34 @@ class DataSourceController extends Controller
     }
 
     return null;
+  }
+
+  protected function validateDataSourceDatabaseScope(Request $request, DataSource $dataSource): ?JsonResponse
+  {
+    $requestScope = $this->resolveRequestDatabaseScope($request);
+    $configuredScope = trim((string) ($dataSource->database_scope ?? 'central'));
+
+    if (! in_array($configuredScope, ['central', 'tenant'], true)) {
+      $configuredScope = 'central';
+    }
+
+    Log::debug('DataSource database_scope validation', [
+      'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
+      'request_scope' => $requestScope,
+      'data_source' => (string) ($dataSource->name ?? ''),
+      'database_scope' => $configuredScope,
+      'validation_result' => $requestScope === $configuredScope ? 'PASSED' : 'FAILED',
+    ]);
+
+    if ($requestScope === $configuredScope) {
+      return null;
+    }
+
+    return response()->json([
+      'status' => 403,
+      'error' => 'Data source access denied',
+      'message' => 'This data source cannot be accessed from the current database scope.',
+    ], 403);
   }
 
   protected function matchRouteTemplate(string $template, string $path): array

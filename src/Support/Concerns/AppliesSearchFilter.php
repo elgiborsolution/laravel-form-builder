@@ -8,6 +8,17 @@ use Illuminate\Http\Request;
 trait AppliesSearchFilter
 {
     /**
+     * Resolve the Package Builder scope from the request header.
+     *
+     * @param Request $request
+     * @return string
+     */
+    protected function resolveDatabaseScope(Request $request): string
+    {
+        return $request->headers->has('X-Tenant') ? 'tenant' : 'central';
+    }
+
+    /**
      * Apply a case-insensitive search filter when the search term is present.
      *
      * @param mixed $query
@@ -42,6 +53,27 @@ trait AppliesSearchFilter
                 $subQuery->orWhere($column, 'like', '%' . $search . '%');
             }
         });
+    }
+
+    /**
+     * Apply the Package Builder database scope filter when the scope column exists.
+     *
+     * @param mixed $query
+     * @param Request $request
+     * @param string|null $table
+     * @return mixed
+     */
+    protected function applyDatabaseScopeFilter(mixed $query, Request $request, ?string $table = null): mixed
+    {
+        $scopeColumns = $table !== null
+            ? $this->filterExistingColumns($table, ['database_scope'])
+            : ['database_scope'];
+
+        if ($scopeColumns === []) {
+            return $query;
+        }
+
+        return $query->where($scopeColumns[0], $this->resolveDatabaseScope($request));
     }
 
     /**
@@ -85,6 +117,33 @@ trait AppliesSearchFilter
             }
 
             return false;
+        }));
+    }
+
+    /**
+     * Filter already-loaded rows by the Package Builder database scope.
+     *
+     * @param array<int, array<string, mixed>> $rows
+     * @param Request $request
+     * @param string|null $table
+     * @return array<int, array<string, mixed>>
+     */
+    protected function filterDatabaseScopeRows(array $rows, Request $request, ?string $table = null): array
+    {
+        $scopeColumns = $table !== null
+            ? $this->filterExistingColumns($table, ['database_scope'])
+            : ['database_scope'];
+
+        if ($scopeColumns === []) {
+            return $rows;
+        }
+
+        $scope = $this->resolveDatabaseScope($request);
+
+        return array_values(array_filter($rows, static function (array $row) use ($scope, $scopeColumns): bool {
+            $value = $row[$scopeColumns[0]] ?? null;
+
+            return is_string($value) && $value === $scope;
         }));
     }
 

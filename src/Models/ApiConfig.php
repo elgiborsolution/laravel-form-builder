@@ -16,7 +16,7 @@ class ApiConfig extends Model
      *
      * @var array
      */
-    protected $fillable = ['route_name', 'endpoint', 'method', 'params', 'enabled', 'description', 'middlewares'];
+    protected $fillable = ['route_name', 'endpoint', 'method', 'params', 'enabled', 'description', 'middlewares', 'database_scope'];
 
     /**
      * Cast attributes to a specific data type.

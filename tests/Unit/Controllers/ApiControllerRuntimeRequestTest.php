@@ -445,6 +445,106 @@ class ApiControllerRuntimeRequestTest extends TestCase
         $this->assertSame(200, $response->getStatusCode());
     }
 
+    public function test_it_rejects_tenant_only_api_for_a_central_request(): void
+    {
+        $controller = $this->makeController();
+        $apiConfig = new ApiConfig();
+        $apiConfig->database_scope = 'tenant';
+
+        $response = $controller->exposeValidateApiConfigDatabaseScope(
+            Request::create('/api/customers', 'GET'),
+            $apiConfig
+        );
+
+        $this->assertNotNull($response);
+        $this->assertSame(403, $response->getStatusCode());
+    }
+
+    public function test_it_treats_an_empty_x_tenant_header_as_central_scope(): void
+    {
+        $controller = $this->makeController();
+        $request = Request::create('/api/customers', 'GET', [], [], [], [
+            'HTTP_X_TENANT' => '   ',
+        ]);
+
+        $this->assertSame('central', $controller->exposeResolveRequestDatabaseScope($request));
+    }
+
+    public function test_it_rejects_central_only_api_for_a_tenant_request(): void
+    {
+        $controller = $this->makeController();
+        $apiConfig = new ApiConfig();
+        $apiConfig->database_scope = 'central';
+
+        $response = $controller->exposeValidateApiConfigDatabaseScope(
+            Request::create('/api/customers', 'GET', [], [], [], [
+                'HTTP_X_TENANT' => 'jayasuksesrejeki',
+            ]),
+            $apiConfig
+        );
+
+        $this->assertNotNull($response);
+        $this->assertSame(403, $response->getStatusCode());
+    }
+
+    public function test_it_stops_handle_request_before_validation_pipeline_when_scope_mismatches(): void
+    {
+        $resolver = $this->createMock(DynamicApiConfigResolver::class);
+        $apiConfig = new ApiConfig();
+        $apiConfig->route_name = 'customers.index';
+        $apiConfig->method = 'GET';
+        $apiConfig->database_scope = 'tenant';
+
+        $resolver->expects($this->once())
+            ->method('resolve')
+            ->with('customers', 'GET')
+            ->willReturn([
+                'config' => $apiConfig,
+                'id' => null,
+                'endpoint' => 'customers',
+            ]);
+
+        $controller = new class(
+            $resolver,
+            $this->createMock(DataQueryService::class),
+            $this->createMock(Pipeline::class),
+            new DynamicVariableParser(new FakeRuntimeVariableRegistry()),
+            $this->createMock(MiddlewareConnectionResolver::class),
+            $this->createMock(ExecutionConnectionResolver::class),
+            $this->createMock(\ESolution\DataSources\Services\AfterHitApiDispatcher::class)
+        ) extends TestableApiController {
+            public bool $enteredValidationConnection = false;
+            public bool $enteredDispatch = false;
+
+            protected function withDatasourceValidationConnection(\Closure $callback)
+            {
+                $this->enteredValidationConnection = true;
+
+                return $callback();
+            }
+
+            protected function runDynamicMiddlewarePipeline(Request $request, ApiConfig $apiConfig, \Closure $destination): JsonResponse
+            {
+                $this->enteredDispatch = true;
+
+                return $destination($request);
+            }
+
+            protected function dispatchResolvedRequest(Request $request, ApiConfig $apiConfigs, mixed $id, ?string $action = null): JsonResponse
+            {
+                $this->enteredDispatch = true;
+
+                return new JsonResponse(['message' => 'ok'], 200);
+            }
+        };
+
+        $response = $controller->handleRequest(Request::create('/api/customers', 'GET'), 'customers');
+
+        $this->assertSame(403, $response->getStatusCode());
+        $this->assertFalse($controller->enteredValidationConnection);
+        $this->assertFalse($controller->enteredDispatch);
+    }
+
     private function makeController(): TestableApiController
     {
         return new TestableApiController(
@@ -469,5 +569,15 @@ class TestableApiController extends ApiController
     public function exposeFindValidateRule(array $rowParam, string $tableParent, mixed $primaryKey = 0, ?string $ignoreColumn = null): string
     {
         return $this->findValidateRule($rowParam, $tableParent, $primaryKey, $ignoreColumn);
+    }
+
+    public function exposeValidateApiConfigDatabaseScope(Request $request, ApiConfig $apiConfig): ?JsonResponse
+    {
+        return $this->validateApiConfigDatabaseScope($request, $apiConfig);
+    }
+
+    public function exposeResolveRequestDatabaseScope(Request $request): string
+    {
+        return $this->resolveRequestDatabaseScope($request);
     }
 }

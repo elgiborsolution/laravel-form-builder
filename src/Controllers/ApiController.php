@@ -91,7 +91,6 @@ class ApiController extends Controller
                 return $formBuilderResponse;
             }
 
-            return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
             if (($uploadResponse = $this->handleUploadBuilderFallback($request, $dynamicPath)) !== null) {
                 return $uploadResponse;
             }
@@ -103,27 +102,34 @@ class ApiController extends Controller
             $action = $resolvedRoute['action'] ?? null;
 
             if (empty($apiConfigs)) {
-                if ($request->isMethod('GET')) {
-                    $dataSourceResponse = $this->handleDataSourceFallback($request, $dynamicPath);
+                return $this->withDatasourceValidationConnection(function () use ($request, $dynamicPath) {
+                    if ($request->isMethod('GET')) {
+                        $dataSourceResponse = $this->handleDataSourceFallback($request, $dynamicPath);
 
-                    if ($dataSourceResponse !== null) {
-                        return $dataSourceResponse;
+                        if ($dataSourceResponse !== null) {
+                            return $dataSourceResponse;
+                        }
                     }
-                }
 
-                return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
+                    return response()->json(['status' => 404, 'error'=> 'API Builder tidak ditemukan', 'message'=>'API Builder tidak ditemukan'], 404);
+                });
             }
 
-            return $this->runDynamicMiddlewarePipeline(
-                $request,
-                $apiConfigs,
-                function (Request $request) use ($apiConfigs, $id, $action) {
-                    $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id, $action);
-                    $this->dispatchAfterHitApiEvent($apiConfigs, $request, $response, $id);
+            if ($databaseScopeResponse = $this->validateApiConfigDatabaseScope($request, $apiConfigs)) {
+                return $databaseScopeResponse;
+            }
 
-                    return $response;
-                }
-            );
+            return $this->withDatasourceValidationConnection(function () use ($request, $apiConfigs, $id, $action) {
+                return $this->runDynamicMiddlewarePipeline(
+                    $request,
+                    $apiConfigs,
+                    function (Request $request) use ($apiConfigs, $id, $action) {
+                        $response = $this->dispatchResolvedRequest($request, $apiConfigs, $id, $action);
+                        $this->dispatchAfterHitApiEvent($apiConfigs, $request, $response, $id);
+
+                        return $response;
+                    }
+                );
             });
         } catch (ApiHookException $exception) {
             return response()->json(
@@ -133,6 +139,54 @@ class ApiController extends Controller
         } finally {
             $this->runtimeValidationConnectionName = $previousValidationConnection;
         }
+  }
+
+  protected function resolveRequestDatabaseScope(Request $request): string
+  {
+      $tenantId = trim((string) $request->header('X-Tenant', ''));
+
+      return $tenantId !== '' ? 'tenant' : 'central';
+  }
+
+  protected function validateApiConfigDatabaseScope(Request $request, ApiConfig $apiConfig): ?JsonResponse
+  {
+      $requestScope = $this->resolveRequestDatabaseScope($request);
+      $configuredScope = $this->resolveApiConfigDatabaseScope($apiConfig);
+
+      if ($configuredScope === '') {
+          $configuredScope = 'central';
+      }
+
+      if (! in_array($configuredScope, ['central', 'tenant'], true)) {
+          $configuredScope = 'central';
+      }
+
+      if ($requestScope === $configuredScope) {
+          return null;
+      }
+
+      return response()->json([
+          'status' => 403,
+          'error' => 'API Builder access denied',
+          'message' => $requestScope === 'tenant'
+              ? 'This API configuration is central-only and cannot be called from a tenant request.'
+              : 'This API configuration is tenant-only and cannot be called from a central request.',
+      ], 403);
+  }
+
+  protected function resolveApiConfigDatabaseScope(ApiConfig $apiConfig): string
+  {
+      $configuredScope = ApiConfig::query()
+          ->whereKey($apiConfig->getKey())
+          ->value('database_scope');
+
+      if (! is_string($configuredScope) || trim($configuredScope) === '') {
+          $configuredScope = (string) ($apiConfig->database_scope ?? 'central');
+      }
+
+      $configuredScope = trim($configuredScope);
+
+      return in_array($configuredScope, ['central', 'tenant'], true) ? $configuredScope : 'central';
   }
 
   protected function handleDataSourceFallback(Request $request, string $dynamicPath): ?JsonResponse

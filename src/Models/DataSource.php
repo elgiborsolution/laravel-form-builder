@@ -19,6 +19,7 @@ class DataSource extends Model
     protected $fillable = [
         'name',
         'table_name',
+        'database_scope',
         'use_custom_query',
         'use_soft_delete',
         'columns',
