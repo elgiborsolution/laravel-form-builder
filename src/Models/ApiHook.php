@@ -16,7 +16,7 @@ class ApiHook extends Model
      *
      * @var array
      */
-    protected $fillable = ['api_config_id', 'action_type', 'listener_class'];
+    protected $fillable = ['api_config_id', 'data_source_id', 'action_type', 'listener_class'];
 
     /**
      * Define a relationship with the ApiConfig model.
@@ -27,5 +27,15 @@ class ApiHook extends Model
     public function apiConfig()
     {
         return $this->belongsTo(ApiConfig::class);
+    }
+
+    /**
+     * Define a relationship with the DataSource model.
+     *
+     * @return \Illuminate\Database\Eloquent\Relations\BelongsTo
+     */
+    public function dataSource()
+    {
+        return $this->belongsTo(DataSource::class);
     }
 }

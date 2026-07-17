@@ -2,6 +2,9 @@
 
 namespace ESolution\DataSources\Services;
 
+use ESolution\DataSources\Contracts\AfterExecuteHookInterface;
+use ESolution\DataSources\Contracts\DataSourceBeforeExecuteHookInterface;
+use ESolution\DataSources\Exceptions\ApiHookException;
 use ESolution\DataSources\Models\ApiConfig;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
@@ -18,6 +21,7 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
+use Throwable;
 
 class DataQueryService
 {
@@ -44,6 +48,8 @@ class DataQueryService
     {
         try {
             $this->cacheEnabled = ! $this->forceDisableCacheForDataSource;
+            $dataSource->loadMissing(['parameters', 'hooks']);
+            $this->applyBeforeExecuteHooks($request, $dataSource);
 
             $definition = [
                 'identifier' => $cacheKeyPrefix,
@@ -70,7 +76,7 @@ class DataQueryService
                 ),
             ];
 
-            return $this->execute($request, $definition);
+            return $this->execute($request, $definition, $dataSource);
         } catch (InvalidRuntimeVariableException $e) {
             return response()->json([
                 'error' => $e->getMessage(),
@@ -112,7 +118,7 @@ class DataQueryService
         }
     }
 
-    public function execute(Request $request, array $definition): JsonResponse
+    public function execute(Request $request, array $definition, ?DataSource $dataSource = null): JsonResponse
     {
         $previousExecutionConnectionName = $this->executionConnectionName;
         $this->executionConnectionName = $this->normalizeConnectionName($definition['connection_name'] ?? $this->resolveExecutionConnectionName($request));
@@ -272,7 +278,17 @@ class DataQueryService
                 'bindings' => [],
             ]);
 
-            return response()->json($this->applyResponseType($result, (string) ($definition['response_type'] ?? 'array')));
+            $responsePayload = $this->buildResponsePayload(
+                $this->applyResponseType($result, (string) ($definition['response_type'] ?? 'array'))
+            );
+
+            if ($dataSource !== null) {
+                $responsePayload = $this->applyAfterExecuteHooks($request, $dataSource, $responsePayload);
+            }
+
+            return response()->json($responsePayload);
+        } catch (ApiHookException $e) {
+            return response()->json($e->toResponsePayload(), $e->getStatusCode());
         } catch (InvalidRuntimeVariableException $e) {
             return response()->json(['error' => $e->getMessage(), 'message' => $e->getMessage()], 422);
         } catch (\InvalidArgumentException $e) {
@@ -1245,6 +1261,97 @@ class DataQueryService
             'data' => (object) [],
             'message' => 'Data not found',
         ];
+    }
+
+    protected function buildResponsePayload(mixed $result): array
+    {
+        if ($result instanceof LengthAwarePaginator) {
+            return $result->toArray();
+        }
+
+        if (is_array($result)) {
+            return $result;
+        }
+
+        if ($result instanceof Collection) {
+            return ['data' => $result->values()->all()];
+        }
+
+        return ['data' => $result];
+    }
+
+    protected function applyBeforeExecuteHooks(Request $request, DataSource $dataSource): void
+    {
+        $hooks = $dataSource->hooks()
+            ->where('action_type', 'before_execute')
+            ->orderBy('id')
+            ->get();
+
+        if ($hooks->isEmpty()) {
+            return;
+        }
+
+        $payload = $request->all();
+
+        foreach ($hooks as $hook) {
+            $hookClass = trim((string) ($hook->listener_class ?? ''));
+
+            if ($hookClass === '') {
+                continue;
+            }
+
+            if (! class_exists($hookClass)) {
+                throw new \RuntimeException("Before execute hook class not found: {$hookClass}");
+            }
+
+            $instance = app($hookClass);
+
+            if (! $instance instanceof DataSourceBeforeExecuteHookInterface) {
+                throw new \RuntimeException("Before execute hook must implement " . DataSourceBeforeExecuteHookInterface::class);
+            }
+
+            $instance->handle($payload, $dataSource, $request);
+        }
+
+        $request->replace($payload);
+    }
+
+    protected function applyAfterExecuteHooks(Request $request, DataSource $dataSource, array $payload): array
+    {
+        $hooks = $dataSource->hooks()
+            ->where('action_type', 'after_execute')
+            ->orderBy('id')
+            ->get();
+
+        if ($hooks->isEmpty()) {
+            return $payload;
+        }
+
+        $data = $payload['data'] ?? null;
+
+        foreach ($hooks as $hook) {
+            $hookClass = trim((string) ($hook->listener_class ?? ''));
+
+            if ($hookClass === '') {
+                continue;
+            }
+
+            if (! class_exists($hookClass)) {
+                throw new \RuntimeException("After execute hook class not found: {$hookClass}");
+            }
+
+            $instance = app($hookClass);
+
+            if (! $instance instanceof AfterExecuteHookInterface) {
+                throw new \RuntimeException("After execute hook must implement " . AfterExecuteHookInterface::class);
+            }
+
+            $data = $instance->handle($request, $dataSource, $data);
+        }
+
+        $payload['data'] = $data;
+
+        return $payload;
     }
 
     protected function normalizeResultJsonColumns(mixed $result, array $definition): mixed
