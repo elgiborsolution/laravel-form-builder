@@ -1,6 +1,10 @@
 <?php
 namespace ESolution\DataSources\Controllers;
 
+use ESolution\DataSources\Contracts\AfterExecuteHookInterface;
+use ESolution\DataSources\Contracts\DataSourceBeforeExecuteHookInterface;
+use ESolution\DataSources\Exceptions\ApiHookException;
+use ESolution\DataSources\Models\ApiHook;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Models\DataSourceParameter;
 use ESolution\DataSources\Services\DataQueryService;
@@ -10,6 +14,7 @@ use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Collection;
@@ -79,7 +84,7 @@ class DataSourceController extends Controller
     $columns = $this->exportableColumns();
 
     $query = $this->applySearchFilter(
-        DataSource::query()->orderBy('id'),
+        DataSource::with(['hooks'])->orderBy('id'),
         $request,
         ['code', 'name', 'description', 'table_name', 'custom_query'],
         'data_sources'
@@ -96,6 +101,11 @@ class DataSourceController extends Controller
         foreach ($columns as $column) {
           $row[$column] = $dataSource->getAttribute($column);
         }
+
+        $row['generate_before_execute_hook'] = $dataSource->beforeExecuteHook !== null;
+        $row['before_execute_hook_path'] = $dataSource->beforeExecuteHook?->listener_class;
+        $row['generate_after_execute_hook'] = $dataSource->afterExecuteHook !== null;
+        $row['after_execute_hook_path'] = $dataSource->afterExecuteHook?->listener_class;
 
         return $row;
       })
@@ -210,6 +220,10 @@ class DataSourceController extends Controller
         $row['columns'] = $this->normalizeColumnsInput($row['columns'] ?? []);
         $row['middlewares'] = $this->normalizeMiddlewaresInput($row['middlewares'] ?? null);
         $row['custom_parameters'] = $this->normalizeCustomParametersInput($row['custom_parameters'] ?? []);
+        $row['generate_before_execute_hook'] = $this->normalizeGenerateBeforeExecuteHook($row['generate_before_execute_hook'] ?? false);
+        $row['before_execute_hook_path'] = $this->normalizeBeforeExecuteHookPath($row['before_execute_hook_path'] ?? null);
+        $row['generate_after_execute_hook'] = $this->normalizeGenerateAfterExecuteHook($row['generate_after_execute_hook'] ?? false);
+        $row['after_execute_hook_path'] = $this->normalizeAfterExecuteHookPath($row['after_execute_hook_path'] ?? null);
         $importedDatabaseScope = (string) ($row['database_scope'] ?? 'central');
         $finalDatabaseScope = $databaseScope;
 
@@ -240,6 +254,10 @@ class DataSourceController extends Controller
           'custom_parameters.*.required' => ['nullable', 'boolean', 'integer'],
           'custom_parameters.*.default' => ['nullable'],
           'custom_parameters.*.description' => ['nullable', 'string'],
+          'generate_before_execute_hook' => ['nullable', 'boolean'],
+          'before_execute_hook_path' => ['nullable', 'string'],
+          'generate_after_execute_hook' => ['nullable', 'boolean'],
+          'after_execute_hook_path' => ['nullable', 'string'],
         ]);
 
         if ($validated->fails()) {
@@ -278,6 +296,33 @@ class DataSourceController extends Controller
 
         try {
           $dataSource = DataSource::create($data);
+
+          $beforeExecuteHookName = $this->getBeforeExecuteHookName((string) ($row['name'] ?? ''));
+          $afterExecuteHookName = $this->getAfterExecuteHookName((string) ($row['name'] ?? ''));
+          $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
+          $defaultAfterExecuteHookClass = 'App\\Hooks\\Api\\' . $afterExecuteHookName;
+          $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload($row, $defaultBeforeExecuteHookClass, $dataSource);
+          $afterExecuteHookClass = $this->resolveAfterExecuteHookClassFromPayload($row, $defaultAfterExecuteHookClass, $dataSource);
+
+          if ($row['generate_before_execute_hook']) {
+            if ($beforeExecuteHookClass === $defaultBeforeExecuteHookClass) {
+              $this->ensureBeforeExecuteHook($beforeExecuteHookName, true);
+            } elseif (! class_exists($beforeExecuteHookClass)) {
+              throw new \RuntimeException('Before execute hook class not found');
+            }
+          }
+
+          if ($row['generate_after_execute_hook']) {
+            if ($afterExecuteHookClass === $defaultAfterExecuteHookClass) {
+              $this->ensureAfterExecuteHook($afterExecuteHookName, true);
+            } elseif (! class_exists($afterExecuteHookClass)) {
+              throw new \RuntimeException('After execute hook class not found');
+            }
+          }
+
+          $this->syncBeforeExecuteHook($dataSource, $beforeExecuteHookClass, $row['generate_before_execute_hook']);
+          $this->syncAfterExecuteHook($dataSource, $afterExecuteHookClass, $row['generate_after_execute_hook']);
+
           if ($dataSource && $dataSource->exists) {
             $insertedCount++;
             $summary['imported']++;
@@ -357,6 +402,10 @@ class DataSourceController extends Controller
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
       'response_type' => $this->normalizeResponseType($request->input('response_type', 'array')),
       'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters')),
+      'generate_before_execute_hook' => $this->normalizeGenerateBeforeExecuteHook($request->input('generate_before_execute_hook')),
+      'before_execute_hook_path' => $this->normalizeBeforeExecuteHookPath($request->input('before_execute_hook_path')),
+      'generate_after_execute_hook' => $this->normalizeGenerateAfterExecuteHook($request->input('generate_after_execute_hook')),
+      'after_execute_hook_path' => $this->normalizeAfterExecuteHookPath($request->input('after_execute_hook_path')),
     ]);
 
     $databaseScope = $this->resolveRequestDatabaseScope($request);
@@ -401,6 +450,10 @@ class DataSourceController extends Controller
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
       'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],
+      'generate_before_execute_hook' => ['nullable', 'boolean'],
+      'before_execute_hook_path' => ['nullable', 'string'],
+      'generate_after_execute_hook' => ['nullable', 'boolean'],
+      'after_execute_hook_path' => ['nullable', 'string'],
       'custom_parameters' => ['nullable', 'array'],
       'custom_parameters.*.name' => ['required', 'string'],
       'custom_parameters.*.type' => ['required', 'string', Rule::in(['string', 'integer', 'boolean', 'date', 'float'])],
@@ -432,6 +485,12 @@ class DataSourceController extends Controller
 
     $dataParam = $dataParam['data'];
     $validated['columns'] = $validated['columns'] ?? [];
+    $beforeExecuteHookName = $this->getBeforeExecuteHookName((string) $validated['name']);
+    $afterExecuteHookName = $this->getAfterExecuteHookName((string) $validated['name']);
+    $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
+    $defaultAfterExecuteHookClass = 'App\\Hooks\\Api\\' . $afterExecuteHookName;
+    $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload($validated, $defaultBeforeExecuteHookClass);
+    $afterExecuteHookClass = $this->resolveAfterExecuteHookClassFromPayload($validated, $defaultAfterExecuteHookClass);
 
     if ($validated['use_custom_query']) {
       $validated['custom_parameters'] = $this->syncCustomParametersInput(
@@ -488,6 +547,39 @@ class DataSourceController extends Controller
       'database_scope' => $validated['database_scope'],
     ]);
 
+    if ($validated['generate_before_execute_hook'] ?? false) {
+      if ($beforeExecuteHookClass === $defaultBeforeExecuteHookClass) {
+        $this->ensureBeforeExecuteHook($beforeExecuteHookName, true);
+      } elseif (! class_exists($beforeExecuteHookClass)) {
+        return response()->json([
+          'error' => 'Before execute hook class not found',
+          'message' => 'Before execute hook class not found',
+        ], 422);
+      }
+    }
+
+    if ($validated['generate_after_execute_hook'] ?? false) {
+      if ($afterExecuteHookClass === $defaultAfterExecuteHookClass) {
+        $this->ensureAfterExecuteHook($afterExecuteHookName, true);
+      } elseif (! class_exists($afterExecuteHookClass)) {
+        return response()->json([
+          'error' => 'After execute hook class not found',
+          'message' => 'After execute hook class not found',
+        ], 422);
+      }
+    }
+
+    $this->syncBeforeExecuteHook(
+      $dataSource,
+      $beforeExecuteHookClass,
+      (bool) ($validated['generate_before_execute_hook'] ?? false)
+    );
+    $this->syncAfterExecuteHook(
+      $dataSource,
+      $afterExecuteHookClass,
+      (bool) ($validated['generate_after_execute_hook'] ?? false)
+    );
+
     Log::debug('DataSource database_scope save', [
       'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
       'Detected scope' => $databaseScope,
@@ -511,7 +603,7 @@ class DataSourceController extends Controller
   */
   public function show($id)
   {
-    $dataSource = DataSource::with(['parameters'])->findOrFail($id);
+    $dataSource = DataSource::with(['parameters', 'hooks'])->findOrFail($id);
     if (empty($dataSource)) {
       return response()->json(['error' => 'Data source not found'], 422);
     }
@@ -521,6 +613,20 @@ class DataSourceController extends Controller
     $payload['response_type'] = $this->normalizeResponseType($payload['response_type'] ?? 'array');
     $payload['custom_parameters'] = $this->normalizeCustomParametersInput($payload['custom_parameters'] ?? []);
     $payload['use_soft_delete'] = (bool) ($payload['use_soft_delete'] ?? false);
+    $payload['generate_before_execute_hook'] = $dataSource->beforeExecuteHook !== null;
+    $payload['before_execute_hook_path'] = $dataSource->beforeExecuteHook?->listener_class;
+    $payload['generate_after_execute_hook'] = $dataSource->afterExecuteHook !== null;
+    $payload['after_execute_hook_path'] = $dataSource->afterExecuteHook?->listener_class;
+    $payload['before_execute_hook'] = $dataSource->beforeExecuteHook ? [
+      'action_type' => $dataSource->beforeExecuteHook->action_type,
+      'listener_class' => $dataSource->beforeExecuteHook->listener_class,
+      'listener_path' => $dataSource->beforeExecuteHook->listener_class,
+    ] : null;
+    $payload['after_execute_hook'] = $dataSource->afterExecuteHook ? [
+      'action_type' => $dataSource->afterExecuteHook->action_type,
+      'listener_class' => $dataSource->afterExecuteHook->listener_class,
+      'listener_path' => $dataSource->afterExecuteHook->listener_class,
+    ] : null;
 
     return response()->json($payload);
   }
@@ -547,6 +653,18 @@ class DataSourceController extends Controller
       'middlewares' => $this->normalizeMiddlewaresInput($request->input('middlewares')),
       'response_type' => $this->normalizeResponseType($request->input('response_type', $dataSource->response_type ?? 'array')),
       'custom_parameters' => $this->normalizeCustomParametersInput($request->input('custom_parameters', $dataSource->custom_parameters ?? [])),
+      'generate_before_execute_hook' => $this->normalizeGenerateBeforeExecuteHook(
+        $request->input('generate_before_execute_hook', $dataSource->generate_before_execute_hook ?? false)
+      ),
+      'before_execute_hook_path' => $this->normalizeBeforeExecuteHookPath(
+        $request->input('before_execute_hook_path', $dataSource->before_execute_hook_path ?? null)
+      ),
+      'generate_after_execute_hook' => $this->normalizeGenerateAfterExecuteHook(
+        $request->input('generate_after_execute_hook', $dataSource->generate_after_execute_hook ?? false)
+      ),
+      'after_execute_hook_path' => $this->normalizeAfterExecuteHookPath(
+        $request->input('after_execute_hook_path', $dataSource->after_execute_hook_path ?? null)
+      ),
     ]);
 
     $databaseScope = $this->resolveRequestDatabaseScope($request);
@@ -589,6 +707,10 @@ class DataSourceController extends Controller
       'middlewares' => ['nullable', 'array'],
       'middlewares.*' => ['nullable', 'string'],
       'database_scope' => ['nullable', 'string', Rule::in(['central', 'tenant'])],
+      'generate_before_execute_hook' => ['nullable', 'boolean'],
+      'before_execute_hook_path' => ['nullable', 'string'],
+      'generate_after_execute_hook' => ['nullable', 'boolean'],
+      'after_execute_hook_path' => ['nullable', 'string'],
       'custom_query' => [
         'nullable',
         Rule::requiredIf(function () use ($request) {
@@ -654,6 +776,34 @@ class DataSourceController extends Controller
       $validated['use_soft_delete'] = false;
     }
     $validated['database_scope'] = $databaseScope;
+    $beforeExecuteHookName = $this->getBeforeExecuteHookName((string) $validated['name']);
+    $afterExecuteHookName = $this->getAfterExecuteHookName((string) $validated['name']);
+    $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
+    $defaultAfterExecuteHookClass = 'App\\Hooks\\Api\\' . $afterExecuteHookName;
+    $beforeExecuteHookClass = $this->resolveBeforeExecuteHookClassFromPayload($validated, $defaultBeforeExecuteHookClass, $dataSource);
+    $afterExecuteHookClass = $this->resolveAfterExecuteHookClassFromPayload($validated, $defaultAfterExecuteHookClass, $dataSource);
+
+    if ($validated['generate_before_execute_hook'] ?? $dataSource->generate_before_execute_hook ?? false) {
+      if ($beforeExecuteHookClass === $defaultBeforeExecuteHookClass) {
+        $this->ensureBeforeExecuteHook($beforeExecuteHookName, true);
+      } elseif (! class_exists($beforeExecuteHookClass)) {
+        return response()->json([
+          'error' => 'Before execute hook class not found',
+          'message' => 'Before execute hook class not found',
+        ], 422);
+      }
+    }
+
+    if ($validated['generate_after_execute_hook'] ?? $dataSource->generate_after_execute_hook ?? false) {
+      if ($afterExecuteHookClass === $defaultAfterExecuteHookClass) {
+        $this->ensureAfterExecuteHook($afterExecuteHookName, true);
+      } elseif (! class_exists($afterExecuteHookClass)) {
+        return response()->json([
+          'error' => 'After execute hook class not found',
+          'message' => 'After execute hook class not found',
+        ], 422);
+      }
+    }
 
 
     $dataSource->update([
@@ -668,6 +818,17 @@ class DataSourceController extends Controller
       'custom_parameters' => $validated['custom_parameters'] ?? [],
       'database_scope' => $validated['database_scope'],
     ]);
+
+    $this->syncBeforeExecuteHook(
+      $dataSource,
+      $beforeExecuteHookClass,
+      (bool) ($validated['generate_before_execute_hook'] ?? $dataSource->generate_before_execute_hook ?? false)
+    );
+    $this->syncAfterExecuteHook(
+      $dataSource,
+      $afterExecuteHookClass,
+      (bool) ($validated['generate_after_execute_hook'] ?? $dataSource->generate_after_execute_hook ?? false)
+    );
 
     Log::debug('DataSource database_scope save', [
       'X-Tenant' => trim((string) $request->header('X-Tenant', '')),
@@ -1338,7 +1499,7 @@ class DataSourceController extends Controller
     $connection = DatabaseConnection::configuredName();
 
     if ($routePath === null || trim($routePath, '/') === '') {
-      $exactMatch = DataSource::on($connection)->with('parameters')->where('name', $identifier)->first();
+      $exactMatch = DataSource::on($connection)->with(['parameters', 'hooks'])->where('name', $identifier)->first();
 
       if ($exactMatch) {
         return [$exactMatch, [], $identifier];
@@ -1356,7 +1517,7 @@ class DataSourceController extends Controller
       $cacheKeyPath = substr($cacheKeyPath, strlen('data-source/'));
     }
 
-    $dataSources = DataSource::on($connection)->with('parameters')->get();
+    $dataSources = DataSource::on($connection)->with(['parameters', 'hooks'])->get();
 
     foreach ($dataSources as $dataSource) {
       [$matched, $routeParameters] = $this->matchRouteTemplate((string) $dataSource->name, $candidatePath);
@@ -1504,6 +1665,270 @@ class DataSourceController extends Controller
     $normalized = strtolower(trim((string) $value));
 
     return in_array($normalized, ['array', 'object'], true) ? $normalized : 'array';
+  }
+
+  protected function normalizeGenerateBeforeExecuteHook(mixed $value): bool
+  {
+    if (is_bool($value)) {
+      return $value;
+    }
+
+    if (is_int($value)) {
+      return $value === 1;
+    }
+
+    if (is_string($value)) {
+      $normalized = strtolower(trim($value));
+
+      return in_array($normalized, ['1', 'true', 'yes', 'on'], true);
+    }
+
+    return false;
+  }
+
+  protected function normalizeGenerateAfterExecuteHook(mixed $value): bool
+  {
+    return $this->normalizeGenerateBeforeExecuteHook($value);
+  }
+
+  protected function normalizeBeforeExecuteHookPath(mixed $value): ?string
+  {
+    if (! is_string($value)) {
+      return null;
+    }
+
+    $normalized = trim($value);
+
+    return $normalized === '' ? null : $normalized;
+  }
+
+  protected function normalizeAfterExecuteHookPath(mixed $value): ?string
+  {
+    return $this->normalizeBeforeExecuteHookPath($value);
+  }
+
+  protected function getBeforeExecuteHookName(string $routeName): string
+  {
+    $cleanString = preg_replace('/[^A-Za-z0-9]/', ' ', $routeName);
+    $cleanString = ucwords((string) $cleanString);
+
+    return 'BeforeExecute' . str_replace(' ', '', $cleanString) . 'Hook';
+  }
+
+  protected function getAfterExecuteHookName(string $routeName): string
+  {
+    $cleanString = preg_replace('/[^A-Za-z0-9]/', ' ', $routeName);
+    $cleanString = ucwords((string) $cleanString);
+
+    return 'AfterExecute' . str_replace(' ', '', $cleanString) . 'Hook';
+  }
+
+  protected function resolveBeforeExecuteHookClassFromPayload(array $payload, ?string $defaultHookClass = null, ?DataSource $existingConfig = null): ?string
+  {
+    $hookPath = $this->normalizeBeforeExecuteHookPath($payload['before_execute_hook_path'] ?? null);
+
+    if ($hookPath !== null) {
+      return $hookPath;
+    }
+
+    if (isset($payload['before_execute_hook']) && is_array($payload['before_execute_hook'])) {
+      $listener = $this->normalizeBeforeExecuteHookPath($payload['before_execute_hook']['listener_class'] ?? null);
+
+      if ($listener !== null) {
+        return $listener;
+      }
+    }
+
+    $existing = $existingConfig?->beforeExecuteHook?->listener_class;
+
+    if (is_string($existing) && trim($existing) !== '') {
+      return trim($existing);
+    }
+
+    if ($defaultHookClass !== null && trim($defaultHookClass) !== '') {
+      return trim($defaultHookClass);
+    }
+
+    return null;
+  }
+
+  protected function resolveAfterExecuteHookClassFromPayload(array $payload, ?string $defaultHookClass = null, ?DataSource $existingConfig = null): ?string
+  {
+    $hookPath = $this->normalizeAfterExecuteHookPath($payload['after_execute_hook_path'] ?? null);
+
+    if ($hookPath !== null) {
+      return $hookPath;
+    }
+
+    if (isset($payload['after_execute_hook']) && is_array($payload['after_execute_hook'])) {
+      $listener = $this->normalizeAfterExecuteHookPath($payload['after_execute_hook']['listener_class'] ?? null);
+
+      if ($listener !== null) {
+        return $listener;
+      }
+    }
+
+    $existing = $existingConfig?->afterExecuteHook?->listener_class;
+
+    if (is_string($existing) && trim($existing) !== '') {
+      return trim($existing);
+    }
+
+    if ($defaultHookClass !== null && trim($defaultHookClass) !== '') {
+      return trim($defaultHookClass);
+    }
+
+    return null;
+  }
+
+  protected function syncBeforeExecuteHook(
+    DataSource $config,
+    ?string $hookClass = null,
+    bool $generateHook = true
+  ): void {
+    $existingHook = $config->beforeExecuteHook;
+
+    if (! $generateHook) {
+      if ($existingHook !== null) {
+        $existingHook->delete();
+      }
+
+      return;
+    }
+
+    $hookClass = $hookClass ?? 'App\\Hooks\\Api\\' . $this->getBeforeExecuteHookName($config->name);
+    $config->hooks()->updateOrCreate(
+      ['action_type' => 'before_execute'],
+      ['listener_class' => $hookClass]
+    );
+  }
+
+  protected function syncAfterExecuteHook(
+    DataSource $config,
+    ?string $hookClass = null,
+    bool $generateHook = true
+  ): void {
+    $existingHook = $config->afterExecuteHook;
+
+    if (! $generateHook) {
+      if ($existingHook !== null) {
+        $existingHook->delete();
+      }
+
+      return;
+    }
+
+    $hookClass = $hookClass ?? 'App\\Hooks\\Api\\' . $this->getAfterExecuteHookName($config->name);
+    $config->hooks()->updateOrCreate(
+      ['action_type' => 'after_execute'],
+      ['listener_class' => $hookClass]
+    );
+  }
+
+  protected function ensureBeforeExecuteHook(string $hookName, bool $generateHook): bool
+  {
+    if (! $generateHook) {
+      return false;
+    }
+
+    $classPath = app_path('Hooks/Api/' . $hookName . '.php');
+
+    if (File::exists($classPath)) {
+      return true;
+    }
+
+    File::ensureDirectoryExists(dirname($classPath));
+
+    $content = <<<PHP
+<?php
+
+namespace App\Hooks\Api;
+
+use ESolution\DataSources\Contracts\DataSourceBeforeExecuteHookInterface;
+use ESolution\DataSources\Exceptions\ApiHookException;
+use ESolution\DataSources\Models\DataSource;
+use Illuminate\Http\Request;
+
+class {$hookName} implements DataSourceBeforeExecuteHookInterface
+{
+    public function handle(
+        array &\$payload,
+        DataSource \$dataSource,
+        Request \$request
+    ): void {
+        /*
+        |--------------------------------------------------------------------------
+        | Example: Stop execution with a business exception
+        |--------------------------------------------------------------------------
+        |
+        | throw new ApiHookException(422, 'Invalid branch');
+        |
+        */
+
+        /*
+        |--------------------------------------------------------------------------
+        | Example: Mutate the request payload before execution
+        |--------------------------------------------------------------------------
+        |
+        | \$payload['created_by'] = auth()->id();
+        |
+        */
+    }
+}
+PHP;
+
+    File::put($classPath, $content);
+
+    return true;
+  }
+
+  protected function ensureAfterExecuteHook(string $hookName, bool $generateHook): bool
+  {
+    if (! $generateHook) {
+      return false;
+    }
+
+    $classPath = app_path('Hooks/Api/' . $hookName . '.php');
+
+    if (File::exists($classPath)) {
+      return true;
+    }
+
+    File::ensureDirectoryExists(dirname($classPath));
+
+    $content = <<<PHP
+<?php
+
+namespace App\Hooks\Api;
+
+use ESolution\DataSources\Contracts\AfterExecuteHookInterface;
+use ESolution\DataSources\Models\DataSource;
+use Illuminate\Http\Request;
+
+class {$hookName} implements AfterExecuteHookInterface
+{
+    public function handle(
+        Request \$request,
+        DataSource \$dataSource,
+        mixed \$data
+    ): mixed {
+        /*
+        |--------------------------------------------------------------------------
+        | Example: Transform only the data payload
+        |--------------------------------------------------------------------------
+        |
+        | return collect(\$data)->map(fn (\$row) => array_merge((array) \$row, ['label' => strtoupper((string) (\$row['label'] ?? ''))]))->all();
+        |
+        */
+
+        return \$data;
+    }
+}
+PHP;
+
+    File::put($classPath, $content);
+
+    return true;
   }
 
   /**

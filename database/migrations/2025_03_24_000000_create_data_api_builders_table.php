@@ -47,7 +47,7 @@ return new class extends Migration {
         // Table for hooks (before/after create, update, delete)
         $schema->create('api_hooks', function (Blueprint $table) {
             $table->id();
-            $table->foreignId('api_config_id')->references('id')->on('api_configs')->onDelete('cascade');
+            $table->foreignId('api_config_id')->nullable()->references('id')->on('api_configs')->onDelete('cascade');
             $table->string('action_type'); // before_create, after_create, etc.
             $table->string('listener_class'); // Reference to a Laravel event listener
             $table->timestamps();
