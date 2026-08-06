@@ -59,4 +59,43 @@ class DynamicApiConfigResolverTest extends TestCase
         $this->assertNull($resolved['id']);
         $this->assertInstanceOf(ApiConfig::class, $resolved['config']);
     }
+
+    public function test_static_route_is_more_specific_than_parameterized_route(): void
+    {
+        $resolver = new class extends DynamicApiConfigResolver {
+            public function exposeMatch(string $template, string $path): array
+            {
+                return $this->matchEndpointTemplate($template, $path);
+            }
+
+            public function exposeSpecificity(string $endpoint): int
+            {
+                return $this->endpointSpecificity($endpoint);
+            }
+
+            public function exposeBest(array $matches): ?array
+            {
+                return $this->selectBestEndpointMatch($matches);
+            }
+        };
+
+        $static = new ApiConfig(['endpoint' => 'purchase/list']);
+        $parameterized = new ApiConfig(['endpoint' => 'purchase/{id}']);
+
+        [$staticMatched] = $resolver->exposeMatch('purchase/list', 'purchase/list');
+        [$parameterMatched, $parameters] = $resolver->exposeMatch('purchase/{id}', 'purchase/list');
+
+        $this->assertTrue($staticMatched);
+        $this->assertTrue($parameterMatched);
+        $this->assertSame(['id' => 'list'], $parameters);
+        $this->assertGreaterThan(
+            $resolver->exposeSpecificity('purchase/{id}'),
+            $resolver->exposeSpecificity('purchase/list')
+        );
+        $best = $resolver->exposeBest([
+            [$parameterized, ['id' => 'list'], $resolver->exposeSpecificity('purchase/{id}')],
+            [$static, [], $resolver->exposeSpecificity('purchase/list')],
+        ]);
+        $this->assertSame('purchase/list', $best[0]->endpoint);
+    }
 }
