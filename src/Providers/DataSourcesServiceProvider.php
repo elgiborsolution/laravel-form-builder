@@ -7,6 +7,7 @@ use ESolution\DataSources\Controllers\DataAPIBuilderController;
 use ESolution\DataSources\Controllers\DataPickerController;
 use ESolution\DataSources\Controllers\DataSourceController;
 use ESolution\DataSources\Controllers\DataTableBuilderController;
+use ESolution\DataSources\Controllers\ImportBuilderController;
 use ESolution\DataSources\Controllers\FormBuilderController;
 use ESolution\DataSources\Controllers\UploadBuilderController;
 use ESolution\DataSources\Controllers\RuntimeVariableController;
@@ -114,6 +115,10 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.data-api-builder.bundle-crud');
                 Route::get('data-api-builder/defaults', [DataAPIBuilderController::class, 'defaults'])
                     ->name('management.data-api-builder.defaults');
+                Route::get('import-builder/defaults', [ImportBuilderController::class, 'defaults'])
+                    ->name('management.import-builder.defaults');
+                Route::post('import-builder/preview', [ImportBuilderController::class, 'preview'])
+                    ->name('management.import-builder.preview');
                 Route::get('upload-builder/defaults', [UploadBuilderController::class, 'defaults'])
                     ->name('management.upload-builder.defaults');
                 Route::post('upload-builder/export', [UploadBuilderController::class, 'export'])
@@ -165,6 +170,8 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->names($this->resourceRouteNames('management.table-builder'));
                 Route::apiResource('api-config', DataAPIBuilderController::class)
                     ->names($this->resourceRouteNames('management.api-config'));
+                Route::apiResource('import-builder', ImportBuilderController::class)
+                    ->names($this->resourceRouteNames('management.import-builder'));
                 Route::apiResource('upload-builder', UploadBuilderController::class)
                     ->names($this->resourceRouteNames('management.upload-builder'));
             });
@@ -219,6 +226,12 @@ class DataSourcesServiceProvider extends ServiceProvider
         Route::prefix($this->buildPrefix(config('datasources.routes.dynamic.prefix')))
             ->as(config('datasources.routes.name', 'datasources.') . 'dynamic.')
             ->group(function (): void {
+                Route::get('import/{endpoint}/template', [ImportBuilderController::class, 'downloadTemplate'])
+                    ->where('endpoint', '.+')
+                    ->name('import.template');
+                Route::post('import/{endpoint}', [ImportBuilderController::class, 'import'])
+                    ->where('endpoint', '.+')
+                    ->name('import.execute');
                 Route::any('{dynamicPath}', [ApiController::class, 'handleRequest'])
                     ->where('dynamicPath', '.*')
                     ->name('dispatch')
