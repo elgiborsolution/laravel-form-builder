@@ -55,6 +55,18 @@ class DynamicApiConfigResolver
             ];
         }
 
+        $id = null;
+        $config = $this->findParameterizedByPathAndMethod($dynamicPath, $method, $id);
+
+        if ($config !== null) {
+            return [
+                'config' => $config,
+                'id' => $id,
+                'endpoint' => $config->endpoint,
+                'action' => null,
+            ];
+        }
+
         $id = array_pop($segments);
         $endpoint = implode('/', $segments);
         $config = $this->findByEndpointAndMethod($endpoint, $method);
@@ -65,6 +77,83 @@ class DynamicApiConfigResolver
             'endpoint' => $endpoint,
             'action' => null,
         ];
+    }
+
+    protected function findParameterizedByPathAndMethod(string $path, string $method, mixed &$resolvedId = null): ?ApiConfig
+    {
+        $path = $this->normalizeEndpoint($path);
+        $method = strtoupper($method);
+        $matches = [];
+
+        ApiConfig::query()
+            ->with(['parentTable', 'childTables'])
+            ->where('enabled', true)
+            ->where('method', $method)
+            ->get()
+            ->each(function (ApiConfig $config) use ($path, &$matches): void {
+                [$matched, $parameters] = $this->matchEndpointTemplate((string) $config->endpoint, $path);
+
+                if ($matched) {
+                    $matches[] = [$config, $parameters, $this->endpointSpecificity((string) $config->endpoint)];
+                }
+            });
+
+        $bestMatch = $this->selectBestEndpointMatch($matches);
+
+        if ($bestMatch === null) {
+            return null;
+        }
+
+        $resolvedId = array_values($bestMatch[1])[0] ?? null;
+
+        return $bestMatch[0];
+    }
+
+    protected function matchEndpointTemplate(string $template, string $path): array
+    {
+        $templateSegments = explode('/', $this->normalizeEndpoint($template));
+        $pathSegments = explode('/', $this->normalizeEndpoint($path));
+
+        if (count($templateSegments) !== count($pathSegments)) {
+            return [false, []];
+        }
+
+        $parameters = [];
+
+        foreach ($templateSegments as $index => $segment) {
+            if (preg_match('/^\{([^}]+)\}$/', $segment, $matches) === 1) {
+                $parameters[$matches[1]] = $pathSegments[$index];
+                continue;
+            }
+
+            if ($segment !== $pathSegments[$index]) {
+                return [false, []];
+            }
+        }
+
+        return [true, $parameters];
+    }
+
+    protected function endpointSpecificity(string $endpoint): int
+    {
+        $score = 0;
+
+        foreach (explode('/', $this->normalizeEndpoint($endpoint)) as $segment) {
+            $score = ($score * 10) + (preg_match('/^\{[^}]+\}$/', $segment) === 1 ? 0 : 1);
+        }
+
+        return $score;
+    }
+
+    protected function selectBestEndpointMatch(array $matches): ?array
+    {
+        if ($matches === []) {
+            return null;
+        }
+
+        usort($matches, static fn (array $left, array $right): int => $right[2] <=> $left[2]);
+
+        return $matches[0];
     }
 
     public function findByEndpointAndMethod(string $endpoint, string $method): ?ApiConfig
