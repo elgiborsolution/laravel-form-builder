@@ -1497,15 +1497,6 @@ class DataSourceController extends Controller
   protected function resolveDataSourceForExecution(string $identifier, ?string $routePath = null): ?array
   {
     $connection = DatabaseConnection::configuredName();
-
-    if ($routePath === null || trim($routePath, '/') === '') {
-      $exactMatch = DataSource::on($connection)->with(['parameters', 'hooks'])->where('name', $identifier)->first();
-
-      if ($exactMatch) {
-        return [$exactMatch, [], $identifier];
-      }
-    }
-
     $candidatePath = trim($identifier . '/' . trim((string) $routePath, '/'), '/');
     if ($candidatePath === '') {
       return null;
@@ -1517,17 +1508,60 @@ class DataSourceController extends Controller
       $cacheKeyPath = substr($cacheKeyPath, strlen('data-source/'));
     }
 
+    // Static endpoints always win over route templates, regardless of query order.
+    $exactMatch = DataSource::on($connection)
+      ->with(['parameters', 'hooks'])
+      ->where('name', $cacheKeyPath)
+      ->first();
+
+    if ($exactMatch) {
+      return [$exactMatch, [], $this->sanitizeCacheKeySuffix($cacheKeyPath)];
+    }
+
     $dataSources = DataSource::on($connection)->with(['parameters', 'hooks'])->get();
+    $matches = [];
 
     foreach ($dataSources as $dataSource) {
       [$matched, $routeParameters] = $this->matchRouteTemplate((string) $dataSource->name, $candidatePath);
 
       if ($matched) {
-        return [$dataSource, $routeParameters, $this->sanitizeCacheKeySuffix($cacheKeyPath)];
+        $matches[] = [
+          $dataSource,
+          $routeParameters,
+          $this->routeTemplateSpecificity((string) $dataSource->name),
+        ];
       }
     }
 
+    $bestMatch = $this->selectBestRouteMatch($matches);
+
+    if ($bestMatch !== null) {
+      return [$bestMatch[0], $bestMatch[1], $this->sanitizeCacheKeySuffix($cacheKeyPath)];
+    }
+
     return null;
+  }
+
+  protected function routeTemplateSpecificity(string $template): int
+  {
+    $score = 0;
+
+    foreach (explode('/', trim($template, '/')) as $segment) {
+      $score = ($score * 10) + (preg_match(self::ROUTE_PARAMETER_SEGMENT_PATTERN, $segment) === 1 ? 0 : 1);
+    }
+
+    return $score;
+  }
+
+  protected function selectBestRouteMatch(array $matches): ?array
+  {
+    if ($matches === []) {
+      return null;
+    }
+
+    usort($matches, static fn (array $left, array $right): int => $right[2] <=> $left[2]);
+
+    return $matches[0];
   }
 
   protected function validateDataSourceDatabaseScope(Request $request, DataSource $dataSource): ?JsonResponse

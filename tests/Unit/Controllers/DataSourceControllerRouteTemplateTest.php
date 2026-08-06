@@ -34,6 +34,30 @@ class DataSourceControllerRouteTemplateTest extends TestCase
         $this->assertSame(['product_id' => '123'], $params);
     }
 
+    public function test_static_route_is_more_specific_than_parameterized_route(): void
+    {
+        $controller = $this->makeController();
+
+        [$staticMatched] = $controller->exposeMatchRouteTemplate('purchase/list', 'purchase/list');
+        [$parameterMatched, $parameters] = $controller->exposeMatchRouteTemplate('purchase/{id}', 'purchase/list');
+
+        $this->assertTrue($staticMatched);
+        $this->assertTrue($parameterMatched);
+        $this->assertSame(['id' => 'list'], $parameters);
+        $this->assertGreaterThan(
+            $controller->exposeRouteTemplateSpecificity('purchase/{id}'),
+            $controller->exposeRouteTemplateSpecificity('purchase/list')
+        );
+
+        $static = new DataSource(['name' => 'purchase/list']);
+        $parameterized = new DataSource(['name' => 'purchase/{id}']);
+        $best = $controller->exposeBestRouteMatch([
+            [$parameterized, ['id' => 'list'], $controller->exposeRouteTemplateSpecificity('purchase/{id}')],
+            [$static, [], $controller->exposeRouteTemplateSpecificity('purchase/list')],
+        ]);
+        $this->assertSame('purchase/list', $best[0]->name);
+    }
+
     public function test_it_rejects_route_only_templates(): void
     {
         $controller = $this->makeController();
@@ -131,6 +155,16 @@ class TestableDataSourceController extends DataSourceController
     public function exposeResolveRequestDatabaseScope(Request $request): string
     {
         return $this->resolveRequestDatabaseScope($request);
+    }
+
+    public function exposeRouteTemplateSpecificity(string $template): int
+    {
+        return $this->routeTemplateSpecificity($template);
+    }
+
+    public function exposeBestRouteMatch(array $matches): ?array
+    {
+        return $this->selectBestRouteMatch($matches);
     }
 }
 
