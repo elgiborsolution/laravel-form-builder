@@ -22,6 +22,9 @@ class ImportTable extends Model
         'child_update_key',
         'missing_child_strategy',
         'use_soft_delete',
+        'worksheet',
+        'parent_match_column',
+        'child_match_column',
     ];
 
     protected $casts = [

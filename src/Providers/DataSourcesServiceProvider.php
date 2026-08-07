@@ -226,12 +226,15 @@ class DataSourcesServiceProvider extends ServiceProvider
         Route::prefix($this->buildPrefix(config('datasources.routes.dynamic.prefix')))
             ->as(config('datasources.routes.name', 'datasources.') . 'dynamic.')
             ->group(function (): void {
-                Route::get('import/{endpoint}/template', [ImportBuilderController::class, 'downloadTemplate'])
-                    ->where('endpoint', '.+')
-                    ->name('import.template');
-                Route::post('import/{endpoint}', [ImportBuilderController::class, 'import'])
-                    ->where('endpoint', '.+')
-                    ->name('import.execute');
+                Route::middleware([ForceDatabaseConnection::class])
+                    ->group(function (): void {
+                        Route::get('import/{endpoint}/template', [ImportBuilderController::class, 'downloadTemplate'])
+                            ->where('endpoint', '.+')
+                            ->name('import.template');
+                        Route::post('import/{endpoint}', [ImportBuilderController::class, 'import'])
+                            ->where('endpoint', '.+')
+                            ->name('import.execute');
+                    });
                 Route::any('{dynamicPath}', [ApiController::class, 'handleRequest'])
                     ->where('dynamicPath', '.*')
                     ->name('dispatch')
