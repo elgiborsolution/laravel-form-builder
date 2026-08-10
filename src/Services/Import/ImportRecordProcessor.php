@@ -20,6 +20,9 @@ use Throwable;
 
 class ImportRecordProcessor
 {
+    /** @var array{message: string, errors: array<string, array<int, string>>}|null */
+    protected ?array $lastPersistenceFailure = null;
+
     public function __construct(
         protected ImportTemplateReader $templateReader,
         protected DynamicVariableParser $runtimeVariableParser,
@@ -31,6 +34,19 @@ class ImportRecordProcessor
     }
 
     public function process(ImportConfig $config, Request $request): array
+    {
+        return $this->processImport($config, $request);
+    }
+
+    /**
+     * Execute the complete import flow in a transaction which is always rolled back.
+     */
+    public function test(ImportConfig $config, Request $request): array
+    {
+        return $this->processImport($config, $request, true);
+    }
+
+    protected function processImport(ImportConfig $config, Request $request, bool $rollbackOnly = false): array
     {
         $uploadedFile = $request->file('file');
 
@@ -51,11 +67,22 @@ class ImportRecordProcessor
         $this->validateWorkbookCompatibility($config, $worksheets, $parentSheet);
 
         $dataset = $this->buildNormalizedImportDataset($config, $worksheets, $parentSheet);
+        // Keep source rows intact for the test report; hooks may mutate $dataset by reference.
+        $originalDataset = $dataset;
         $this->applyBeforeExecuteHook($config, $dataset, $request);
 
         // Keep the legacy single-sheet persistence behavior when no child worksheet is configured.
         if (! $this->usesSeparateChildWorksheets($config)) {
-            return $this->processSingleSheet($config, $request, $dataset['parent'], $connection, $connectionName);
+            return $this->processSingleSheet(
+                $config,
+                $request,
+                $dataset['parent'],
+                $connection,
+                $connectionName,
+                $rollbackOnly,
+                $originalDataset,
+                $parentSheet
+            );
         }
 
         $parentRows = $dataset['parent'];
@@ -77,13 +104,20 @@ class ImportRecordProcessor
                 $summary['success'] += $result['success'];
                 $summary['failed'] += $result['failed'];
                 foreach ($result['errors'] as $error) {
-                    $summary['errors'][] = $error;
+                    $summary['errors'][] = $this->withWorksheet($error, $parentSheet);
                 }
             }
 
             foreach ($config->childTables as $childIndex => $childTable) {
                 $childRows = $dataset['children'][$childIndex] ?? [];
-                $this->processChildWorksheet($config, $connection, $connectionName, $childTable, $childRows, $parentLookup, $request, $summary);
+                $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
+                $this->processChildWorksheet($config, $connection, $connectionName, $childTable, $childRows, $parentLookup, $request, $summary, $childSheet);
+            }
+
+            if ($rollbackOnly) {
+                $summary = $this->applyAfterExecuteHook($config, $request, $summary);
+                $connection->rollBack();
+                return $this->buildTestResult($originalDataset, $config, $parentSheet, $summary);
             }
 
             $connection->commit();
@@ -100,7 +134,10 @@ class ImportRecordProcessor
         Request $request,
         array $rows,
         ConnectionInterface $connection,
-        string $connectionName
+        string $connectionName,
+        bool $rollbackOnly = false,
+        array $originalDataset = [],
+        string $worksheet = ''
     ): array
     {
         $connection->beginTransaction();
@@ -111,15 +148,24 @@ class ImportRecordProcessor
                 $result = $this->processRow(
                     $config,
                     $connection,
+                    $connectionName,
                     $this->normalizeRowData((array) ($rowInfo['data'] ?? [])),
                     (int) ($rowInfo['row'] ?? 0),
-                    $request,
-                    $connectionName
+                    $request
                 );
                 $summary['success'] += $result['success'];
                 $summary['failed'] += $result['failed'];
-                $summary['errors'] = array_merge($summary['errors'], $result['errors']);
+                foreach ($result['errors'] as $error) {
+                    $summary['errors'][] = $this->withWorksheet($error, $worksheet);
+                }
             }
+
+            if ($rollbackOnly) {
+                $summary = $this->applyAfterExecuteHook($config, $request, $summary);
+                $connection->rollBack();
+                return $this->buildTestResult($originalDataset, $config, $worksheet, $summary);
+            }
+
             $connection->commit();
         } catch (Throwable $exception) {
             $connection->rollBack();
@@ -154,7 +200,7 @@ class ImportRecordProcessor
             $persisted = $this->upsertTableRow($connection, $connectionName, $parentTable, $mappedRow, $config->import_mode, null);
             if ($persisted === null) {
                 $result['failed']++;
-                $result['errors'][] = ['row' => $rowNumber, 'column' => $this->firstColumnName($mappedRow), 'message' => 'Failed to persist parent row.'];
+                $result['errors'][] = $this->persistenceFailure($rowNumber, $this->firstColumnName($mappedRow), 'Failed to persist parent row.');
                 continue;
             }
 
@@ -167,7 +213,7 @@ class ImportRecordProcessor
         return $result;
     }
 
-    protected function processChildWorksheet(ImportConfig $config, ConnectionInterface $connection, string $connectionName, ImportTable $childTable, array $rows, array $parentLookup, Request $request, array &$summary): void
+    protected function processChildWorksheet(ImportConfig $config, ConnectionInterface $connection, string $connectionName, ImportTable $childTable, array $rows, array $parentLookup, Request $request, array &$summary, string $worksheet = ''): void
     {
         $matchColumn = trim((string) ($childTable->child_match_column ?? ''))
             ?: trim((string) ($childTable->parent_match_column ?? ''));
@@ -183,6 +229,7 @@ class ImportRecordProcessor
                     'row' => $rowNumber,
                     'column' => $matchColumn,
                     'message' => 'Parent not found' . ($matchValue !== null ? ' for ' . $matchColumn . '=' . $matchValue . '.' : '.'),
+                    'worksheet' => $worksheet,
                 ];
                 continue;
             }
@@ -203,10 +250,12 @@ class ImportRecordProcessor
                     false
                 ));
             }
-            $result = $this->persistChildRows($connection, $connectionName, $childTable, $mappedRows, $group['parent'], $config->import_mode, $request, $rowNumbers[0] ?? 0);
+            $result = $this->persistChildRows($connection, $connectionName, $childTable, $mappedRows, $group['parent'], $config->import_mode, $request, $rowNumbers);
             $summary['success'] += $result['success'];
             $summary['failed'] += $result['failed'];
-            $summary['errors'] = array_merge($summary['errors'], $result['errors']);
+            foreach ($result['errors'] as $error) {
+                $summary['errors'][] = $this->withWorksheet($error, $worksheet);
+            }
         }
     }
 
@@ -244,11 +293,7 @@ class ImportRecordProcessor
 
             if ($parentPersisted === null) {
                 $result['failed']++;
-                $result['errors'][] = [
-                    'row' => $rowNumber,
-                    'column' => $this->firstColumnName($mappedParentRow),
-                    'message' => 'Failed to persist parent row.',
-                ];
+                $result['errors'][] = $this->persistenceFailure($rowNumber, $this->firstColumnName($mappedParentRow), 'Failed to persist parent row.');
                 continue;
             }
 
@@ -293,7 +338,7 @@ class ImportRecordProcessor
         array $parentRecord,
         string $importMode,
         Request $request,
-        int $rowNumber
+        int|array $rowNumber
     ): array {
         $result = [
             'success' => 0,
@@ -316,15 +361,14 @@ class ImportRecordProcessor
 
         $incomingIdentifiers = [];
         $lookupKey = $this->resolveLookupKey($table, $connectionName);
-        foreach ($normalizedRows as $childRow) {
+        foreach ($normalizedRows as $index => $childRow) {
+            $currentRowNumber = is_array($rowNumber)
+                ? (int) ($rowNumber[$index] ?? $rowNumber[0] ?? 0)
+                : $rowNumber;
             $persisted = $this->upsertTableRow($connection, $connectionName, $table, $childRow, $importMode, $lookupKey);
             if ($persisted === null) {
                 $result['failed']++;
-                $result['errors'][] = [
-                    'row' => $rowNumber,
-                    'column' => $this->firstColumnName($childRow),
-                    'message' => 'Failed to persist child row.',
-                ];
+                $result['errors'][] = $this->persistenceFailure($currentRowNumber, $this->firstColumnName($childRow), 'Failed to persist child row.');
                 continue;
             }
 
@@ -370,17 +414,23 @@ class ImportRecordProcessor
         string $importMode,
         ?string $lookupKey = null
     ): ?array {
+        $this->lastPersistenceFailure = null;
         $lookupKey = trim((string) ($lookupKey ?? $this->resolveLookupKey($table, $connectionName)));
         $payload = $this->normalizePersistedRow($row);
         $tableName = $this->normalizeTableName($connection, (string) $table->table_name);
 
         if ($tableName === '') {
+            $this->lastPersistenceFailure = ['message' => 'The configured table name is empty.', 'errors' => []];
             return null;
         }
 
         $rules = $this->buildValidationRules($tableName, $table, $payload, $lookupKey, $connectionName);
         $validator = Validator::make($payload, $rules);
         if ($validator->fails()) {
+            $this->lastPersistenceFailure = [
+                'message' => $validator->errors()->first(),
+                'errors' => $validator->errors()->toArray(),
+            ];
             return null;
         }
 
@@ -396,6 +446,7 @@ class ImportRecordProcessor
         $shouldInsert = $mode === 'INSERT' || ($mode === 'UPSERT' && $existing === null);
 
         if ($mode === 'UPDATE' && $existing === null) {
+            $this->lastPersistenceFailure = ['message' => 'No matching record was found for update.', 'errors' => []];
             return null;
         }
 
@@ -852,6 +903,84 @@ class ImportRecordProcessor
         }
 
         return $rows;
+    }
+
+    /** @param array<string, mixed> $error */
+    protected function withWorksheet(array $error, string $worksheet): array
+    {
+        if ($worksheet !== '' && empty($error['worksheet'])) {
+            $error['worksheet'] = $worksheet;
+        }
+
+        return $error;
+    }
+
+    /** @return array<string, mixed> */
+    protected function persistenceFailure(int $row, string $column, string $fallbackMessage): array
+    {
+        $failure = $this->lastPersistenceFailure;
+        $this->lastPersistenceFailure = null;
+
+        return array_filter([
+            'row' => $row,
+            'column' => $column,
+            'message' => $failure['message'] ?? $fallbackMessage,
+            'errors' => $failure['errors'] ?? null,
+        ], static fn ($value): bool => $value !== null && $value !== []);
+    }
+
+    /**
+     * Convert the normal processor summary into a source-row report without
+     * exposing mapped payloads or committing the transaction.
+     */
+    protected function buildTestResult(array $dataset, ImportConfig $config, string $parentSheet, array $summary): array
+    {
+        $errorsByRow = [];
+        foreach ((array) ($summary['errors'] ?? []) as $error) {
+            $sheet = (string) ($error['worksheet'] ?? $parentSheet);
+            $key = $sheet . ':' . (int) ($error['row'] ?? 0);
+            $errorsByRow[$key][] = $error;
+        }
+
+        $rows = [];
+        $appendRows = function (array $sourceRows, string $worksheet) use (&$rows, $errorsByRow): void {
+            foreach ($sourceRows as $rowInfo) {
+                $rowNumber = (int) ($rowInfo['row'] ?? 0);
+                $rowErrors = $errorsByRow[$worksheet . ':' . $rowNumber] ?? [];
+                $rows[] = [
+                    'worksheet' => $worksheet,
+                    'row' => $rowNumber,
+                    'data' => (array) ($rowInfo['data'] ?? []),
+                    'status' => $rowErrors === [] ? 'success' : 'failed',
+                    'reason' => $rowErrors[0]['message'] ?? null,
+                    'errors' => array_map(static function (array $error): array {
+                        return array_filter([
+                            'column' => $error['column'] ?? null,
+                            'message' => $error['message'] ?? null,
+                            'errors' => $error['errors'] ?? null,
+                        ], static fn ($value): bool => $value !== null && $value !== []);
+                    }, $rowErrors),
+                ];
+            }
+        };
+
+        $appendRows((array) ($dataset['parent'] ?? []), $parentSheet);
+        foreach ($config->childTables as $childIndex => $childTable) {
+            $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
+            if ($childSheet === $parentSheet && ! $this->usesSeparateChildWorksheets($config)) {
+                continue;
+            }
+            $appendRows((array) ($dataset['children'][$childIndex] ?? []), $childSheet);
+        }
+
+        $failed = count(array_filter($rows, static fn (array $row): bool => $row['status'] === 'failed'));
+
+        return [
+            'total' => count($rows),
+            'success' => count($rows) - $failed,
+            'failed' => $failed,
+            'rows' => $rows,
+        ];
     }
 
     protected function applyBeforeExecuteHook(ImportConfig $config, array &$data, Request $request): void

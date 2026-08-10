@@ -231,6 +231,9 @@ class DataSourcesServiceProvider extends ServiceProvider
                         Route::get('import/{endpoint}/template', [ImportBuilderController::class, 'downloadTemplate'])
                             ->where('endpoint', '.+')
                             ->name('import.template');
+                        Route::post('import/{endpoint}/test', [ImportBuilderController::class, 'test'])
+                            ->where('endpoint', '.+')
+                            ->name('import.test');
                         Route::post('import/{endpoint}', [ImportBuilderController::class, 'import'])
                             ->where('endpoint', '.+')
                             ->name('import.execute');

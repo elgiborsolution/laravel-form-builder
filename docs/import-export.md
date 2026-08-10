@@ -6,6 +6,7 @@
 - [Data Source Export](#data-source-export)
 - [Data API Export](#data-api-export)
 - [Import Format](#import-format)
+- [Import Builder Test Import](#import-builder-test-import)
 - [Database Scope Behavior](#database-scope-behavior)
 - [Best Practices](#best-practices)
 
@@ -98,6 +99,56 @@ The backend ignores any incoming `database_scope` value and sets it from the cur
 API Builder import accepts rows that match the saved configuration shape.
 
 The backend ignores any incoming `database_scope` value and sets it from the current request scope before save.
+
+## Import Builder Test Import
+
+Test an Import Builder workbook without committing any parent or child records:
+
+```http
+POST /api/import/{endpoint}/test
+Content-Type: multipart/form-data
+```
+
+Send the completed workbook in the `file` field. The endpoint uses the same
+request connection, template reader, mapping, validation, hooks, and
+parent/child processing as `POST /api/import/{endpoint}`, but always rolls the
+transaction back.
+
+Successful requests use the standard response envelope and return original
+normalized worksheet data for every processed source row:
+
+```json
+{
+  "success": true,
+  "data": {
+    "total": 2,
+    "success": 1,
+    "failed": 1,
+    "rows": [
+      {
+        "worksheet": "Customer",
+        "row": 2,
+        "data": {"code": "C001", "email": "bayu@example.test"},
+        "status": "success",
+        "reason": null,
+        "errors": []
+      },
+      {
+        "worksheet": "Customer",
+        "row": 3,
+        "data": {"code": "C002", "email": "invalid"},
+        "status": "failed",
+        "reason": "The email field must be a valid email address.",
+        "errors": [{"column": "email", "message": "The email field must be a valid email address."}]
+      }
+    ]
+  }
+}
+```
+
+`ApiHookException` keeps the same status code and response payload as API
+Builder. A hook exception stops the test before persistence, while normal row
+validation failures are reported alongside the other rows.
 
 ## Database Scope Behavior
 

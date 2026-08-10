@@ -223,6 +223,34 @@ class ImportBuilderController extends Controller
         return response()->json($summary, 200);
     }
 
+    /**
+     * Execute an import against the resolved request connection, then roll it
+     * back and return the original worksheet rows with their test status.
+     */
+    public function test(Request $request, string $endpoint): JsonResponse
+    {
+        $config = $this->resolver->findByEndpoint($endpoint);
+
+        if ($config === null) {
+            return response()->json(['message' => 'Import builder not found'], 404);
+        }
+
+        if (! $request->hasFile('file')) {
+            return response()->json(['message' => 'Import file is required.'], 422);
+        }
+
+        try {
+            $result = $this->processor->test($config, $request);
+        } catch (ApiHookException $exception) {
+            return response()->json(
+                $exception->toResponsePayload(),
+                $exception->getStatusCode()
+            );
+        }
+
+        return response()->json(['success' => true, 'data' => $result], 200);
+    }
+
     protected function validatePayload(Request $request, bool $isCreate, ?ImportConfig $config = null): array|JsonResponse
     {
         $payload = $this->normalizeIncomingPayload($request->all());
