@@ -2533,6 +2533,10 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       }
 
       if ($context === null) {
+          if ($this->hasEmptyOrMissingArrayObjectMapping($dataParams, $request, $flattenedParams)) {
+              return [];
+          }
+
           $nestedCollection = $this->detectLoopInsertCollection($dataParams, $request);
 
           if (is_array($nestedCollection) && $nestedCollection !== []) {
@@ -2649,6 +2653,55 @@ protected function isArrayContainerApiBuilderParamType(string $type): bool
       unset($row);
 
       return $rows;
+  }
+
+  /**
+   * A child mapping such as items.value represents rows from an array-object
+   * parameter. Do not fall back to the mapping text when that collection is
+   * empty or omitted; there are simply no child rows to persist.
+   */
+  protected function hasEmptyOrMissingArrayObjectMapping(
+      array $dataParams,
+      Request $request,
+      array $flattenedParams
+  ): bool {
+      foreach ($dataParams as $mapping) {
+          $sourceValue = $this->normalizeDataParamMapping($mapping)['value'] ?? null;
+
+          if (! is_string($sourceValue) || $this->isRuntimeVariableExpression($sourceValue)) {
+              continue;
+          }
+
+          $sourceValue = trim($sourceValue);
+          if ($sourceValue === '' || ! str_contains($sourceValue, '.')) {
+              continue;
+          }
+
+          $root = explode('.', $sourceValue)[0] ?? '';
+          if ($root === '') {
+              continue;
+          }
+
+          $candidate = data_get($request->all(), $root, self::DATA_BUILDER_MISSING);
+
+          if (is_array($candidate) && $candidate === []) {
+              return true;
+          }
+
+          if ($candidate === self::DATA_BUILDER_MISSING && $this->isDeclaredArrayObjectParameter($root, $flattenedParams)) {
+              return true;
+          }
+      }
+
+      return false;
+  }
+
+  protected function isDeclaredArrayObjectParameter(string $name, array $flattenedParams): bool
+  {
+      $definition = $flattenedParams[$name] ?? null;
+      $type = is_array($definition) ? ($definition['type'] ?? null) : null;
+
+      return $this->isArrayContainerApiBuilderParamType((string) $type);
   }
 
   protected function insertTableRows(

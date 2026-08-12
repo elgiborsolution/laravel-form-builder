@@ -506,6 +506,168 @@ class ApiControllerLoopInsertRegressionTest extends TestCase
         $this->assertSame(53, $controller->insertedPayloads[2]['user_id']);
     }
 
+    public function test_it_skips_child_inserts_when_an_array_object_mapping_is_empty(): void
+    {
+        $controller = $this->makeController();
+        $request = Request::create('/api/products', 'POST', [
+            'name' => 'example',
+            'price' => [],
+        ]);
+
+        $parentRows = $controller->exposeBuildMappedTableRows([
+            'code' => ['value' => 'name'],
+            'name' => ['value' => 'name'],
+        ], $request, []);
+        $childRows = $controller->exposeBuildMappedTableRows(
+            $this->priceChildMappings(),
+            $request,
+            $this->priceArrayObjectParams()
+        );
+        $connection = new FakeLoopInsertConnection();
+
+        $controller->exposePersistChildTableRows(
+            $connection,
+            $this->priceChildTableConfig(),
+            'es_product_prices',
+            $childRows,
+            [1],
+            null,
+            $request
+        );
+
+        $this->assertCount(1, $parentRows);
+        $this->assertSame('example', $parentRows[0]['code']);
+        $this->assertSame([], $childRows);
+        $this->assertSame(0, $connection->insertCount);
+        $this->assertSame([], $controller->insertedPayloads);
+    }
+
+    public function test_it_builds_one_child_row_from_one_array_object_item(): void
+    {
+        $controller = $this->makeController();
+        $request = Request::create('/api/products', 'POST', [
+            'name' => 'example',
+            'price' => [['nominal' => '10000', 'customer_type' => '1']],
+        ]);
+
+        $rows = $controller->exposeBuildMappedTableRows(
+            $this->priceChildMappings(),
+            $request,
+            $this->priceArrayObjectParams()
+        );
+        $connection = new FakeLoopInsertConnection();
+
+        $controller->exposePersistChildTableRows(
+            $connection,
+            $this->priceChildTableConfig(),
+            'es_product_prices',
+            $rows,
+            [1],
+            null,
+            $request
+        );
+
+        $this->assertCount(1, $rows);
+        $this->assertSame(1, $connection->insertCount);
+        $this->assertSame(5, $rows[0]['top_id']);
+        $this->assertSame('10000', $rows[0]['selling_price']);
+        $this->assertSame('1', $rows[0]['customer_type_id']);
+        $this->assertSame('10000', $controller->insertedPayloads[0]['selling_price']);
+        $this->assertSame('1', $controller->insertedPayloads[0]['customer_type_id']);
+    }
+
+    public function test_it_builds_one_child_row_per_array_object_item(): void
+    {
+        $controller = $this->makeController();
+        $request = Request::create('/api/products', 'POST', [
+            'name' => 'example',
+            'price' => [
+                ['nominal' => '10000', 'customer_type' => '1'],
+                ['nominal' => '20000', 'customer_type' => '2'],
+            ],
+        ]);
+
+        $rows = $controller->exposeBuildMappedTableRows(
+            $this->priceChildMappings(),
+            $request,
+            $this->priceArrayObjectParams()
+        );
+        $connection = new FakeLoopInsertConnection();
+
+        $controller->exposePersistChildTableRows(
+            $connection,
+            $this->priceChildTableConfig(),
+            'es_product_prices',
+            $rows,
+            [1],
+            null,
+            $request
+        );
+
+        $this->assertCount(2, $rows);
+        $this->assertSame(2, $connection->insertCount);
+        $this->assertSame(['10000', '20000'], array_column($rows, 'selling_price'));
+        $this->assertSame(['1', '2'], array_column($rows, 'customer_type_id'));
+        $this->assertSame(['10000', '20000'], array_column($controller->insertedPayloads, 'selling_price'));
+        $this->assertSame(['1', '2'], array_column($controller->insertedPayloads, 'customer_type_id'));
+    }
+
+    public function test_it_skips_child_rows_when_a_declared_array_object_parameter_is_missing(): void
+    {
+        $controller = $this->makeController();
+        $request = Request::create('/api/products', 'POST', ['name' => 'example']);
+
+        $parentRows = $controller->exposeBuildMappedTableRows([
+            'code' => ['value' => 'name'],
+            'name' => ['value' => 'name'],
+        ], $request, []);
+        $childRows = $controller->exposeBuildMappedTableRows(
+            $this->priceChildMappings(),
+            $request,
+            $this->priceArrayObjectParams()
+        );
+        $connection = new FakeLoopInsertConnection();
+
+        $controller->exposePersistChildTableRows(
+            $connection,
+            $this->priceChildTableConfig(),
+            'es_product_prices',
+            $childRows,
+            [1],
+            null,
+            $request
+        );
+
+        $this->assertCount(1, $parentRows);
+        $this->assertSame([], $childRows);
+        $this->assertSame(0, $connection->insertCount);
+    }
+
+    private function priceChildMappings(): array
+    {
+        return [
+            'top_id' => ['value' => '{{ auth.id }}'],
+            'selling_price' => ['value' => 'price.nominal'],
+            'customer_type_id' => ['value' => 'price.customer_type'],
+        ];
+    }
+
+    private function priceArrayObjectParams(): array
+    {
+        return ['price' => ['type' => 'array object', 'required' => false]];
+    }
+
+    private function priceChildTableConfig(): array
+    {
+        return [
+            'foreign_key' => 'product_id',
+            'child_update_key' => 'id',
+            'missing_child_strategy' => 'KEEP_EXISTING',
+            'table_name' => 'es_product_prices',
+            'data_params' => $this->priceChildMappings(),
+        ];
+    }
+
     private function makeController(): TestableLoopInsertApiController
     {
         return new TestableLoopInsertApiController(
