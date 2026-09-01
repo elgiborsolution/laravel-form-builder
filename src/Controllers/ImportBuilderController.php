@@ -34,7 +34,7 @@ class ImportBuilderController extends Controller
 
     public function index(Request $request): JsonResponse
     {
-        $query = ImportConfig::query()->with(['parentTable', 'childTables'])->orderBy('id');
+        $query = ImportConfig::query()->with(['parentTable', 'childTables', 'masterParents.children'])->orderBy('id');
 
         if (trim((string) $request->query('search', '')) !== '') {
             $query = $this->applySearchFilter($query, $request, [
@@ -91,21 +91,21 @@ class ImportBuilderController extends Controller
         $payload = array_merge($payload, $template['attributes']);
         $payload['template_metadata'] = $template['metadata'];
 
-        $config = ImportConfig::create($payload)->fresh(['parentTable', 'childTables']);
+        $config = ImportConfig::create($payload)->fresh(['parentTable', 'childTables', 'masterParents.children']);
         $this->syncRelations($config, $validated);
         $this->resolver->forget($config->endpoint);
 
         return response()->json([
             'status' => 201,
             'message' => 'Import builder created successfully',
-            'data' => $config->fresh(['parentTable', 'childTables']),
+            'data' => $config->fresh(['parentTable', 'childTables', 'masterParents.children']),
         ], 201);
     }
 
     public function show(Request $request, int|string $id): JsonResponse
     {
-        $config = ImportConfig::query()->with(['parentTable', 'childTables'])->find($id)
-            ?? ImportConfig::query()->with(['parentTable', 'childTables'])->where('code', $id)->first();
+        $config = ImportConfig::query()->with(['parentTable', 'childTables', 'masterParents.children'])->find($id)
+            ?? ImportConfig::query()->with(['parentTable', 'childTables', 'masterParents.children'])->where('code', $id)->first();
 
         if ($config === null) {
             return response()->json(['status' => 404, 'message' => 'Import builder not found'], 404);
@@ -139,9 +139,9 @@ class ImportBuilderController extends Controller
 
         $config->fill($payload);
         $config->save();
-        $config = $config->fresh(['parentTable', 'childTables']);
+        $config = $config->fresh(['parentTable', 'childTables', 'masterParents.children']);
         $this->syncRelations($config, $validated);
-        $config = $config->fresh(['parentTable', 'childTables']);
+        $config = $config->fresh(['parentTable', 'childTables', 'masterParents.children']);
 
         $this->resolver->forget($originalEndpoint);
         $this->resolver->forget($config->endpoint);
@@ -279,6 +279,27 @@ class ImportBuilderController extends Controller
             'middlewares.*' => ['nullable', 'string'],
             'before_execute_hook' => ['nullable', 'string'],
             'after_execute_hook' => ['nullable', 'string'],
+            'master_parents' => ['nullable', 'array'],
+            'master_parents.*.name' => ['nullable', 'string', 'max:255'],
+            'master_parents.*.table_name' => ['nullable', 'string'],
+            'master_parents.*.primary_key' => ['nullable', 'string'],
+            'master_parents.*.key_update_delete' => ['nullable', 'string'],
+            'master_parents.*.worksheet' => ['nullable', 'string', 'max:255'],
+            'master_parents.*.parent_match_column' => ['nullable', 'string', 'max:255'],
+            'master_parents.*.import_mode' => ['nullable', Rule::in(['INSERT', 'UPDATE', 'UPSERT'])],
+            'master_parents.*.use_soft_delete' => ['nullable', 'boolean'],
+            'master_parents.*.data_params' => ['nullable', 'array'],
+            'master_parents.*.children' => ['nullable', 'array'],
+            'master_parents.*.children.*.table_name' => ['nullable', 'string'],
+            'master_parents.*.children.*.foreign_key' => ['nullable', 'string'],
+            'master_parents.*.children.*.primary_key' => ['nullable', 'string'],
+            'master_parents.*.children.*.child_update_key' => ['nullable', 'string'],
+            'master_parents.*.children.*.worksheet' => ['nullable', 'string', 'max:255'],
+            'master_parents.*.children.*.parent_match_column' => ['nullable', 'string', 'max:255'],
+            'master_parents.*.children.*.child_match_column' => ['nullable', 'string', 'max:255'],
+            'master_parents.*.children.*.missing_child_strategy' => ['nullable', Rule::in(['KEEP_EXISTING', 'DELETE_MISSING'])],
+            'master_parents.*.children.*.use_soft_delete' => ['nullable', 'boolean'],
+            'master_parents.*.children.*.data_params' => ['nullable', 'array'],
             'parent_table' => ['nullable', 'array'],
             'parent_table.table_name' => ['nullable', 'string'],
             'parent_table.primary_key' => ['nullable', 'string'],
@@ -357,7 +378,7 @@ class ImportBuilderController extends Controller
             }
         }
 
-        foreach (['parent_table', 'child_tables', 'middlewares'] as $key) {
+        foreach (['master_parents', 'parent_table', 'child_tables', 'middlewares'] as $key) {
             if (! array_key_exists($key, $payload)) {
                 continue;
             }
@@ -448,11 +469,12 @@ class ImportBuilderController extends Controller
     ): void {
         /*
          * The complete normalized dataset is available by reference.
-         * $data['parent'] contains parent rows and $data['children'] contains
-         * each configured child worksheet's rows.
+         * $data['masters'] contains independent master groups. Each group has
+         * name, parent rows, and its own configured child worksheet rows.
+         * For one legacy master, parent and children aliases are also present.
          *
          * Example: normalize and modify parent rows:
-         * $parentRows =& $data['parent'];
+         * $parentRows =& $data['masters'][0]['parent'];
          * foreach ($parentRows as $index => &$rowInfo) {
          *     $row =& $rowInfo['data'];
          *     $row['name'] = trim((string) ($row['name'] ?? ''));
@@ -573,6 +595,44 @@ METHOD;
 
     protected function syncRelations(ImportConfig $config, array $payload): void
     {
+        if (array_key_exists('master_parents', $payload) && is_array($payload['master_parents'])) {
+            $config->importTables()->delete();
+
+            foreach ($payload['master_parents'] as $master) {
+                if (! is_array($master)) {
+                    continue;
+                }
+
+                $parentRecord = $config->masterParents()->create([
+                    'parent_id' => 0,
+                    'master_name' => $this->nullableString($master['name'] ?? null)
+                        ?? $this->nullableString($master['table_name'] ?? null),
+                    'import_mode' => strtoupper(trim((string) ($master['import_mode'] ?? ''))) ?: null,
+                    'table_name' => $master['table_name'] ?? '',
+                    'primary_key' => $master['primary_key'] ?? null,
+                    'key_update_delete' => $master['key_update_delete'] ?? null,
+                    'worksheet' => $master['worksheet'] ?? null,
+                    'parent_match_column' => $master['parent_match_column'] ?? null,
+                    'child_match_column' => null,
+                    'use_soft_delete' => (bool) ($master['use_soft_delete'] ?? false),
+                    'data_params' => $this->normalizeMappingDataParams($master['data_params'] ?? []),
+                ]);
+
+                foreach ((array) ($master['children'] ?? []) as $childTable) {
+                    if (! is_array($childTable)) {
+                        continue;
+                    }
+
+                    $parentRecord->children()->create(array_merge(
+                        ['import_config_id' => $config->id],
+                        $this->childTableAttributes($childTable)
+                    ));
+                }
+            }
+
+            return;
+        }
+
         $parentRecord = null;
         if (array_key_exists('parent_table', $payload) && is_array($payload['parent_table'])) {
             $parent = $payload['parent_table'];
@@ -599,21 +659,28 @@ METHOD;
                     continue;
                 }
 
-                $config->childTables()->create([
-                    'parent_id' => (int) ($parentRecord?->id ?? $config->parentTable?->id ?? 0),
-                    'table_name' => $childTable['table_name'] ?? '',
-                    'foreign_key' => $childTable['foreign_key'] ?? null,
-                    'primary_key' => $childTable['primary_key'] ?? null,
-                    'child_update_key' => $childTable['child_update_key'] ?? null,
-                    'worksheet' => $childTable['worksheet'] ?? null,
-                    'parent_match_column' => $childTable['parent_match_column'] ?? null,
-                    'child_match_column' => $childTable['child_match_column'] ?? null,
-                    'missing_child_strategy' => $childTable['missing_child_strategy'] ?? 'KEEP_EXISTING',
-                    'use_soft_delete' => (bool) ($childTable['use_soft_delete'] ?? false),
-                    'data_params' => $this->normalizeMappingDataParams($childTable['data_params'] ?? []),
-                ]);
+                $config->childTables()->create(array_merge(
+                    ['parent_id' => (int) ($parentRecord?->id ?? $config->parentTable?->id ?? 0)],
+                    $this->childTableAttributes($childTable)
+                ));
             }
         }
+    }
+
+    protected function childTableAttributes(array $childTable): array
+    {
+        return [
+            'table_name' => $childTable['table_name'] ?? '',
+            'foreign_key' => $childTable['foreign_key'] ?? null,
+            'primary_key' => $childTable['primary_key'] ?? null,
+            'child_update_key' => $childTable['child_update_key'] ?? null,
+            'worksheet' => $childTable['worksheet'] ?? null,
+            'parent_match_column' => $childTable['parent_match_column'] ?? null,
+            'child_match_column' => $childTable['child_match_column'] ?? null,
+            'missing_child_strategy' => $childTable['missing_child_strategy'] ?? 'KEEP_EXISTING',
+            'use_soft_delete' => (bool) ($childTable['use_soft_delete'] ?? false),
+            'data_params' => $this->normalizeMappingDataParams($childTable['data_params'] ?? []),
+        ];
     }
 
     protected function normalizeStringArray(mixed $value): ?array

@@ -40,6 +40,22 @@ class ImportConfig extends Model
         return $this->hasOne(ImportTable::class)->where('parent_id', '=', 0);
     }
 
+    /**
+     * All independent root tables for this import.  parentTable() remains for
+     * consumers of the legacy single-parent contract.
+     */
+    public function masterParents()
+    {
+        return $this->hasMany(ImportTable::class)
+            ->where('parent_id', '=', 0)
+            ->orderBy('id');
+    }
+
+    public function importTables()
+    {
+        return $this->hasMany(ImportTable::class);
+    }
+
     public function childTables()
     {
         return $this->hasMany(ImportTable::class)->where('parent_id', '!=', 0);

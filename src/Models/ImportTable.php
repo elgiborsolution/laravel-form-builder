@@ -14,6 +14,8 @@ class ImportTable extends Model
     protected $fillable = [
         'import_config_id',
         'parent_id',
+        'master_name',
+        'import_mode',
         'table_name',
         'data_params',
         'foreign_key',
@@ -35,5 +37,15 @@ class ImportTable extends Model
     public function importConfig()
     {
         return $this->belongsTo(ImportConfig::class);
+    }
+
+    public function children()
+    {
+        return $this->hasMany(self::class, 'parent_id')->orderBy('id');
+    }
+
+    public function parentTable()
+    {
+        return $this->belongsTo(self::class, 'parent_id');
     }
 }

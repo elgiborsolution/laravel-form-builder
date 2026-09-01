@@ -60,64 +60,63 @@ class ImportRecordProcessor
         $connectionName = $this->executionConnectionResolver->resolve($request);
         $connection = $this->executionConnectionResolver->connection($request);
 
-        $workbook = $this->templateReader->readAllRows($uploadedFile);
-        $worksheets = $workbook['worksheets'];
-        $parentSheet = $this->resolveParentWorksheet($config, $workbook['metadata'] ?? []);
+        $config->loadMissing('masterParents.children');
+        $masterParents = $config->masterParents->values()->all();
 
-        $this->validateWorkbookCompatibility($config, $worksheets, $parentSheet);
-
-        $dataset = $this->buildNormalizedImportDataset($config, $worksheets, $parentSheet);
-        // Keep source rows intact for the test report; hooks may mutate $dataset by reference.
-        $originalDataset = $dataset;
-        $this->applyBeforeExecuteHook($config, $dataset, $request);
-
-        // Keep the legacy single-sheet persistence behavior when no child worksheet is configured.
-        if (! $this->usesSeparateChildWorksheets($config)) {
-            return $this->processSingleSheet(
-                $config,
-                $request,
-                $dataset['parent'],
-                $connection,
-                $connectionName,
-                $rollbackOnly,
-                $originalDataset,
-                $parentSheet
-            );
+        if ($masterParents === []) {
+            throw ValidationException::withMessages([
+                'master_parents' => ['At least one master parent must be configured.'],
+            ]);
         }
 
-        $parentRows = $dataset['parent'];
-        $connection->beginTransaction();
+        $workbook = $this->templateReader->readAllRows($uploadedFile);
+        $worksheets = $workbook['worksheets'];
+        $this->validateWorkbookCompatibility($config, $worksheets, $masterParents);
 
-        $summary = [
-            'success' => 0,
-            'failed' => 0,
-            'errors' => [],
-        ];
+        $dataset = $this->buildNormalizedImportDataset($config, $worksheets, $masterParents);
+        // Keep source rows intact for the test report; hooks may mutate $dataset by reference.
+        $originalDataset = $dataset;
+
+        // Existing hooks receive the legacy keys for a single master, while
+        // new hooks can use data.masters for every independent parent group.
+        if (count($dataset['masters']) === 1) {
+            $dataset['parent'] =& $dataset['masters'][0]['parent'];
+            $dataset['children'] =& $dataset['masters'][0]['children'];
+        }
+        $this->applyBeforeExecuteHook($config, $dataset, $request);
+        unset($dataset['parent'], $dataset['children']);
+
+        $connection->beginTransaction();
+        $summary = ['success' => 0, 'failed' => 0, 'errors' => [], 'masters' => []];
 
         try {
-            $parentLookup = [];
-            foreach ($parentRows as $rowInfo) {
-                $rowNumber = (int) ($rowInfo['row'] ?? 0);
-                $rowData = $this->normalizeRowData((array) ($rowInfo['data'] ?? []));
-                $result = $this->processParentRow($config, $connection, $connectionName, $rowData, $rowNumber, $parentLookup);
+            foreach ($masterParents as $masterIndex => $parentTable) {
+                $masterDataset = (array) ($dataset['masters'][$masterIndex] ?? []);
+                $masterSummary = $this->processMasterParentAndChildren(
+                    $config,
+                    $parentTable,
+                    $parentTable->children->values()->all(),
+                    $masterDataset,
+                    $connection,
+                    $connectionName,
+                    $request
+                );
 
-                $summary['success'] += $result['success'];
-                $summary['failed'] += $result['failed'];
-                foreach ($result['errors'] as $error) {
-                    $summary['errors'][] = $this->withWorksheet($error, $parentSheet);
-                }
+                $summary['success'] += $masterSummary['success'];
+                $summary['failed'] += $masterSummary['failed'];
+                $summary['errors'] = array_merge($summary['errors'], $masterSummary['errors']);
+                $summary['masters'][] = [
+                    'name' => $this->masterName($parentTable),
+                    'table_name' => $parentTable->table_name,
+                    'success' => $masterSummary['success'],
+                    'failed' => $masterSummary['failed'],
+                ];
             }
 
-            foreach ($config->childTables as $childIndex => $childTable) {
-                $childRows = $dataset['children'][$childIndex] ?? [];
-                $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
-                $this->processChildWorksheet($config, $connection, $connectionName, $childTable, $childRows, $parentLookup, $request, $summary, $childSheet);
-            }
-
+            $summary = $this->applyAfterExecuteHook($config, $request, $summary);
             if ($rollbackOnly) {
-                $summary = $this->applyAfterExecuteHook($config, $request, $summary);
                 $connection->rollBack();
-                return $this->buildTestResult($originalDataset, $config, $parentSheet, $summary);
+                return $this->buildTestResult($originalDataset, $config, $summary);
             }
 
             $connection->commit();
@@ -126,7 +125,106 @@ class ImportRecordProcessor
             throw $exception;
         }
 
-        return $this->applyAfterExecuteHook($config, $request, $summary);
+        return $summary;
+    }
+
+    /**
+     * Reuses the original parent-to-child processor for one independent
+     * master.  No lookup or parent runtime context leaves this method.
+     */
+    protected function processMasterParentAndChildren(
+        ImportConfig $config,
+        ImportTable $parentTable,
+        array $childTables,
+        array $dataset,
+        ConnectionInterface $connection,
+        string $connectionName,
+        Request $request
+    ): array {
+        $parentSheet = trim((string) ($dataset['worksheet'] ?? ''))
+            ?: $this->resolveParentWorksheet($config, $parentTable, []);
+        $summary = ['success' => 0, 'failed' => 0, 'errors' => []];
+        $importMode = strtoupper(trim((string) ($parentTable->import_mode ?: $config->import_mode))) ?: 'UPSERT';
+
+        if (! $this->usesSeparateChildWorksheets($parentTable, $childTables)) {
+            foreach ((array) ($dataset['parent'] ?? []) as $rowInfo) {
+                $result = $this->processRow(
+                    $config,
+                    $connection,
+                    $connectionName,
+                    $this->normalizeRowData((array) ($rowInfo['data'] ?? [])),
+                    (int) ($rowInfo['row'] ?? 0),
+                    $request,
+                    $parentTable,
+                    $childTables,
+                    $importMode
+                );
+                $summary['success'] += $result['success'];
+                $summary['failed'] += $result['failed'];
+                foreach ($result['errors'] as $error) {
+                    $summary['errors'][] = $this->withWorksheet($error, $parentSheet);
+                }
+            }
+
+            return $this->tagMasterErrors($summary, $parentTable);
+        }
+
+        $parentLookup = [];
+        foreach ((array) ($dataset['parent'] ?? []) as $rowInfo) {
+            $rowNumber = (int) ($rowInfo['row'] ?? 0);
+            $rowData = $this->normalizeRowData((array) ($rowInfo['data'] ?? []));
+            $result = $this->processParentRow(
+                $config,
+                $connection,
+                $connectionName,
+                $rowData,
+                $rowNumber,
+                $parentLookup,
+                $parentTable,
+                $importMode
+            );
+            $summary['success'] += $result['success'];
+            $summary['failed'] += $result['failed'];
+            foreach ($result['errors'] as $error) {
+                $summary['errors'][] = $this->withWorksheet($error, $parentSheet);
+            }
+        }
+
+        foreach ($childTables as $childIndex => $childTable) {
+            $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
+            $this->processChildWorksheet(
+                $config,
+                $connection,
+                $connectionName,
+                $childTable,
+                (array) ($dataset['children'][$childIndex] ?? []),
+                $parentLookup,
+                $request,
+                $summary,
+                $childSheet,
+                $parentTable,
+                $importMode
+            );
+        }
+
+        return $this->tagMasterErrors($summary, $parentTable);
+    }
+
+    protected function masterName(ImportTable $parentTable): string
+    {
+        return trim((string) ($parentTable->master_name ?? ''))
+            ?: trim((string) ($parentTable->table_name ?? ''));
+    }
+
+    protected function tagMasterErrors(array $summary, ImportTable $parentTable): array
+    {
+        $name = $this->masterName($parentTable);
+        foreach ($summary['errors'] as &$error) {
+            $error['master'] = $name;
+        }
+        unset($error);
+
+        return $summary;
     }
 
     protected function processSingleSheet(
@@ -163,7 +261,7 @@ class ImportRecordProcessor
             if ($rollbackOnly) {
                 $summary = $this->applyAfterExecuteHook($config, $request, $summary);
                 $connection->rollBack();
-                return $this->buildTestResult($originalDataset, $config, $worksheet, $summary);
+                return $this->buildTestResult($originalDataset, $config, $summary);
             }
 
             $connection->commit();
@@ -175,10 +273,19 @@ class ImportRecordProcessor
         return $this->applyAfterExecuteHook($config, $request, $summary);
     }
 
-    protected function processParentRow(ImportConfig $config, ConnectionInterface $connection, string $connectionName, array $rowData, int $rowNumber, array &$parentLookup): array
+    protected function processParentRow(
+        ImportConfig $config,
+        ConnectionInterface $connection,
+        string $connectionName,
+        array $rowData,
+        int $rowNumber,
+        array &$parentLookup,
+        ?ImportTable $configuredParentTable = null,
+        ?string $importMode = null
+    ): array
     {
         $result = ['success' => 0, 'failed' => 0, 'errors' => []];
-        $parentTable = $config->parentTable;
+        $parentTable = $configuredParentTable ?? $config->parentTable;
         if ($parentTable === null) {
             return $result;
         }
@@ -197,7 +304,14 @@ class ImportRecordProcessor
             ];
         }
         foreach ($this->buildMappedRows($parentTable->data_params ?? [], $rowData, ['row' => $rowData], false) as $mappedRow) {
-            $persisted = $this->upsertTableRow($connection, $connectionName, $parentTable, $mappedRow, $config->import_mode, null);
+            $persisted = $this->upsertTableRow(
+                $connection,
+                $connectionName,
+                $parentTable,
+                $mappedRow,
+                $importMode ?: $config->import_mode,
+                null
+            );
             if ($persisted === null) {
                 $result['failed']++;
                 $result['errors'][] = $this->persistenceFailure($rowNumber, $this->firstColumnName($mappedRow), 'Failed to persist parent row.');
@@ -213,7 +327,19 @@ class ImportRecordProcessor
         return $result;
     }
 
-    protected function processChildWorksheet(ImportConfig $config, ConnectionInterface $connection, string $connectionName, ImportTable $childTable, array $rows, array $parentLookup, Request $request, array &$summary, string $worksheet = ''): void
+    protected function processChildWorksheet(
+        ImportConfig $config,
+        ConnectionInterface $connection,
+        string $connectionName,
+        ImportTable $childTable,
+        array $rows,
+        array $parentLookup,
+        Request $request,
+        array &$summary,
+        string $worksheet = '',
+        ?ImportTable $parentTable = null,
+        ?string $importMode = null
+    ): void
     {
         $matchColumn = trim((string) ($childTable->child_match_column ?? ''))
             ?: trim((string) ($childTable->parent_match_column ?? ''));
@@ -250,7 +376,17 @@ class ImportRecordProcessor
                     false
                 ));
             }
-            $result = $this->persistChildRows($connection, $connectionName, $childTable, $mappedRows, $group['parent'], $config->import_mode, $request, $rowNumbers);
+            $result = $this->persistChildRows(
+                $connection,
+                $connectionName,
+                $childTable,
+                $mappedRows,
+                $group['parent'],
+                $importMode ?: $config->import_mode,
+                $request,
+                $rowNumbers,
+                $parentTable
+            );
             $summary['success'] += $result['success'];
             $summary['failed'] += $result['failed'];
             foreach ($result['errors'] as $error) {
@@ -265,7 +401,10 @@ class ImportRecordProcessor
         string $connectionName,
         array $rowData,
         int $rowNumber,
-        Request $request
+        Request $request,
+        ?ImportTable $configuredParentTable = null,
+        ?array $configuredChildTables = null,
+        ?string $importMode = null
     ): array {
         $result = [
             'success' => 0,
@@ -273,7 +412,7 @@ class ImportRecordProcessor
             'errors' => [],
         ];
 
-        $parentTable = $config->parentTable;
+        $parentTable = $configuredParentTable ?? $config->parentTable;
 
         if ($parentTable === null) {
             return $result;
@@ -287,7 +426,7 @@ class ImportRecordProcessor
                 $connectionName,
                 $parentTable,
                 $mappedParentRow,
-                $config->import_mode,
+                $importMode ?: $parentTable->import_mode ?: $config->import_mode,
                 null
             );
 
@@ -299,7 +438,7 @@ class ImportRecordProcessor
 
             $result['success']++;
 
-            foreach ($config->childTables as $childTable) {
+            foreach ($configuredChildTables ?? $config->childTables->all() as $childTable) {
                 $childRows = $this->buildMappedRows(
                     $childTable->data_params ?? [],
                     $rowData,
@@ -316,9 +455,10 @@ class ImportRecordProcessor
                     $childTable,
                     $childRows,
                     $parentPersisted,
-                    $config->import_mode,
+                    $importMode ?: $parentTable->import_mode ?: $config->import_mode,
                     $request,
-                    $rowNumber
+                    $rowNumber,
+                    $parentTable
                 );
 
                 $result['success'] += $childResult['success'];
@@ -338,7 +478,8 @@ class ImportRecordProcessor
         array $parentRecord,
         string $importMode,
         Request $request,
-        int|array $rowNumber
+        int|array $rowNumber,
+        ?ImportTable $parentTable = null
     ): array {
         $result = [
             'success' => 0,
@@ -355,7 +496,7 @@ class ImportRecordProcessor
         foreach ($rows as $row) {
             // Child foreign keys normally differ from the parent primary-key name
             // (for example customer_id -> id), so resolve the parent key explicitly.
-            $row[$foreignKey] = $this->resolveForeignKeyValue($parentRecord, $table, $foreignKey);
+            $row[$foreignKey] = $this->resolveForeignKeyValue($parentRecord, $table, $foreignKey, $parentTable);
             $normalizedRows[] = $row;
         }
 
@@ -385,14 +526,14 @@ class ImportRecordProcessor
         ) {
             $tableName = $this->normalizeTableName($connection, (string) $table->table_name);
             $query = $connection->table($tableName)
-                ->where($foreignKey, $this->resolveForeignKeyValue($parentRecord, $table, $foreignKey));
+                ->where($foreignKey, $this->resolveForeignKeyValue($parentRecord, $table, $foreignKey, $parentTable));
 
             $existingIds = $query->pluck($lookupKey)->all();
             $missing = array_values(array_diff($existingIds, $incomingIdentifiers));
 
             if ($missing !== []) {
                 $deleteQuery = $connection->table($tableName)
-                    ->where($foreignKey, $this->resolveForeignKeyValue($parentRecord, $table, $foreignKey))
+                    ->where($foreignKey, $this->resolveForeignKeyValue($parentRecord, $table, $foreignKey, $parentTable))
                     ->whereIn($lookupKey, $missing);
 
                 if ($table->use_soft_delete && $this->tableHasDeletedAt($tableName, $connectionName)) {
@@ -794,22 +935,29 @@ class ImportRecordProcessor
         }
     }
 
-    protected function resolveForeignKeyValue(array $parentRecord, ImportTable $childTable, string $foreignKey): mixed
+    protected function resolveForeignKeyValue(
+        array $parentRecord,
+        ImportTable $childTable,
+        string $foreignKey,
+        ?ImportTable $parentTable = null
+    ): mixed
     {
         $direct = $this->resolveParentValue($parentRecord, $foreignKey);
         if ($direct !== null) {
             return $direct;
         }
 
-        $parentPrimaryKey = trim((string) ($childTable->importConfig?->parentTable?->primary_key ?? '')) ?: 'id';
+        $parentPrimaryKey = trim((string) ($parentTable?->primary_key ?? ''))
+            ?: trim((string) ($childTable->parentTable?->primary_key ?? ''))
+            ?: 'id';
         return $this->resolveParentValue($parentRecord, $parentPrimaryKey)
             ?? $this->resolveParentValue($parentRecord, 'id');
     }
 
-    protected function usesSeparateChildWorksheets(ImportConfig $config): bool
+    protected function usesSeparateChildWorksheets(ImportTable $parentTable, array $childTables): bool
     {
-        $parentSheet = trim((string) ($config->parentTable?->worksheet ?? ''));
-        foreach ($config->childTables as $childTable) {
+        $parentSheet = trim((string) ($parentTable->worksheet ?? ''));
+        foreach ($childTables as $childTable) {
             $childSheet = trim((string) ($childTable->worksheet ?? ''));
             if ($childSheet !== '' && $childSheet !== $parentSheet) {
                 return true;
@@ -819,9 +967,9 @@ class ImportRecordProcessor
         return false;
     }
 
-    protected function resolveParentWorksheet(ImportConfig $config, array $metadata): string
+    protected function resolveParentWorksheet(ImportConfig $config, ImportTable $parentTable, array $metadata): string
     {
-        $configured = trim((string) ($config->parentTable?->worksheet ?? ''));
+        $configured = trim((string) ($parentTable->worksheet ?? ''));
         if ($configured !== '') {
             return $configured;
         }
@@ -829,46 +977,56 @@ class ImportRecordProcessor
         return trim((string) ($metadata['selected_sheet'] ?? $this->resolveSelectedSheet($config) ?? 'Sheet1')) ?: 'Sheet1';
     }
 
-    protected function validateWorkbookCompatibility(ImportConfig $config, array $worksheets, string $parentSheet): void
+    protected function validateWorkbookCompatibility(ImportConfig $config, array $worksheets, array $masterParents): void
     {
-        if (! isset($worksheets[$parentSheet])) {
-            throw ValidationException::withMessages(['file' => ['Parent worksheet "' . $parentSheet . '" does not exist.']]);
-        }
-
-        $this->validateTemplateCompatibility($config, $worksheets[$parentSheet]['metadata'] ?? []);
         $storedWorksheets = (array) (($config->template_metadata ?? [])['worksheets'] ?? []);
-        $parentMatchColumn = trim((string) ($config->parentTable?->parent_match_column ?? ''));
-
-        if ($this->usesSeparateChildWorksheets($config) && $parentMatchColumn === '') {
-            throw ValidationException::withMessages(['parent_table.parent_match_column' => ['Parent Match Column is required for multi-worksheet imports.']]);
-        }
-
-        if ($parentMatchColumn !== '') {
-            $this->assertWorksheetHasColumn($worksheets[$parentSheet], $parentMatchColumn, 'Parent Match Column');
-        }
-
-        foreach ($config->childTables as $childTable) {
-            $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
-            if (! isset($worksheets[$childSheet])) {
-                throw ValidationException::withMessages(['file' => ['Child worksheet "' . $childSheet . '" does not exist.']]);
+        foreach ($masterParents as $masterIndex => $parentTable) {
+            $parentSheet = $this->resolveParentWorksheet($config, $parentTable, $config->template_metadata ?? []);
+            $masterPath = 'master_parents.' . $masterIndex;
+            if (! isset($worksheets[$parentSheet])) {
+                throw ValidationException::withMessages(['file' => ['Parent worksheet "' . $parentSheet . '" does not exist for master "' . $this->masterName($parentTable) . '".']]);
             }
 
-            $expectedHeaders = (array) ($storedWorksheets[$childSheet]['column_headers'] ?? []);
-            if ($expectedHeaders !== []) {
+            $expectedHeaders = (array) ($storedWorksheets[$parentSheet]['column_headers'] ?? []);
+            if ($expectedHeaders === [] && $masterIndex === 0) {
+                $expectedHeaders = (array) (($config->template_metadata ?? [])['column_headers'] ?? []);
+            }
+            $actualHeaders = (array) ($worksheets[$parentSheet]['metadata']['column_headers'] ?? []);
+            $missing = array_values(array_diff($expectedHeaders, $actualHeaders));
+            if ($missing !== []) {
+                throw ValidationException::withMessages(['file' => ['Template header mismatch in worksheet "' . $parentSheet . '": missing ' . implode(', ', $missing)]]);
+            }
+
+            $children = $parentTable->children->values()->all();
+            $parentMatchColumn = trim((string) ($parentTable->parent_match_column ?? ''));
+            if ($this->usesSeparateChildWorksheets($parentTable, $children) && $parentMatchColumn === '') {
+                throw ValidationException::withMessages([$masterPath . '.parent_match_column' => ['Parent Match Column is required for multi-worksheet imports.']]);
+            }
+            if ($parentMatchColumn !== '') {
+                $this->assertWorksheetHasColumn($worksheets[$parentSheet], $parentMatchColumn, 'Parent Match Column');
+            }
+
+            foreach ($children as $childIndex => $childTable) {
+                $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
+                if (! isset($worksheets[$childSheet])) {
+                    throw ValidationException::withMessages(['file' => ['Child worksheet "' . $childSheet . '" does not exist for master "' . $this->masterName($parentTable) . '".']]);
+                }
+
+                $expectedHeaders = (array) ($storedWorksheets[$childSheet]['column_headers'] ?? []);
                 $actualHeaders = (array) ($worksheets[$childSheet]['metadata']['column_headers'] ?? []);
                 $missing = array_values(array_diff($expectedHeaders, $actualHeaders));
                 if ($missing !== []) {
                     throw ValidationException::withMessages(['file' => ['Template header mismatch in worksheet "' . $childSheet . '": missing ' . implode(', ', $missing)]]);
                 }
-            }
 
-            if ($childSheet !== $parentSheet) {
-                $matchColumn = trim((string) ($childTable->child_match_column ?? ''))
-                    ?: trim((string) ($childTable->parent_match_column ?? ''));
-                if ($matchColumn === '') {
-                    throw ValidationException::withMessages(['child_tables' => ['Child Match Column is required for worksheet "' . $childSheet . '".']]);
+                if ($childSheet !== $parentSheet) {
+                    $matchColumn = trim((string) ($childTable->child_match_column ?? ''))
+                        ?: trim((string) ($childTable->parent_match_column ?? ''));
+                    if ($matchColumn === '') {
+                        throw ValidationException::withMessages([$masterPath . '.children.' . $childIndex . '.child_match_column' => ['Child Match Column is required for worksheet "' . $childSheet . '".']]);
+                    }
+                    $this->assertWorksheetHasColumn($worksheets[$childSheet], $matchColumn, 'Child Match Column');
                 }
-                $this->assertWorksheetHasColumn($worksheets[$childSheet], $matchColumn, 'Child Match Column');
             }
         }
     }
@@ -881,16 +1039,22 @@ class ImportRecordProcessor
         }
     }
 
-    protected function buildNormalizedImportDataset(ImportConfig $config, array $worksheets, string $parentSheet): array
+    protected function buildNormalizedImportDataset(ImportConfig $config, array $worksheets, array $masterParents): array
     {
-        $dataset = [
-            'parent' => $this->normalizeImportedRows($worksheets[$parentSheet]['rows'] ?? []),
-            'children' => [],
-        ];
-
-        foreach ($config->childTables as $childIndex => $childTable) {
-            $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
-            $dataset['children'][$childIndex] = $this->normalizeImportedRows($worksheets[$childSheet]['rows'] ?? []);
+        $dataset = ['masters' => []];
+        foreach ($masterParents as $parentTable) {
+            $parentSheet = $this->resolveParentWorksheet($config, $parentTable, $config->template_metadata ?? []);
+            $masterDataset = [
+                'name' => $this->masterName($parentTable),
+                'worksheet' => $parentSheet,
+                'parent' => $this->normalizeImportedRows($worksheets[$parentSheet]['rows'] ?? []),
+                'children' => [],
+            ];
+            foreach ($parentTable->children->values() as $childIndex => $childTable) {
+                $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
+                $masterDataset['children'][$childIndex] = $this->normalizeImportedRows($worksheets[$childSheet]['rows'] ?? []);
+            }
+            $dataset['masters'][] = $masterDataset;
         }
 
         return $dataset;
@@ -933,25 +1097,30 @@ class ImportRecordProcessor
      * Convert the normal processor summary into a source-row report without
      * exposing mapped payloads or committing the transaction.
      */
-    protected function buildTestResult(array $dataset, ImportConfig $config, string $parentSheet, array $summary): array
+    protected function buildTestResult(array $dataset, ImportConfig $config, array $summary): array
     {
         $errorsByRow = [];
         foreach ((array) ($summary['errors'] ?? []) as $error) {
-            $sheet = (string) ($error['worksheet'] ?? $parentSheet);
-            $key = $sheet . ':' . (int) ($error['row'] ?? 0);
+            $master = (string) ($error['master'] ?? '');
+            $sheet = (string) ($error['worksheet'] ?? '');
+            $key = $master . ':' . $sheet . ':' . (int) ($error['row'] ?? 0);
             $errorsByRow[$key][] = $error;
         }
 
         $rows = [];
-        $appendRows = function (array $sourceRows, string $worksheet) use (&$rows, $errorsByRow): void {
+        $masters = [];
+        $appendRows = function (array $sourceRows, string $master, string $worksheet) use (&$rows, $errorsByRow): array {
+            $result = ['success' => 0, 'failed' => 0];
             foreach ($sourceRows as $rowInfo) {
                 $rowNumber = (int) ($rowInfo['row'] ?? 0);
-                $rowErrors = $errorsByRow[$worksheet . ':' . $rowNumber] ?? [];
+                $rowErrors = $errorsByRow[$master . ':' . $worksheet . ':' . $rowNumber] ?? [];
+                $status = $rowErrors === [] ? 'success' : 'failed';
                 $rows[] = [
+                    'master' => $master,
                     'worksheet' => $worksheet,
                     'row' => $rowNumber,
                     'data' => (array) ($rowInfo['data'] ?? []),
-                    'status' => $rowErrors === [] ? 'success' : 'failed',
+                    'status' => $status,
                     'reason' => $rowErrors[0]['message'] ?? null,
                     'errors' => array_map(static function (array $error): array {
                         return array_filter([
@@ -961,16 +1130,33 @@ class ImportRecordProcessor
                         ], static fn ($value): bool => $value !== null && $value !== []);
                     }, $rowErrors),
                 ];
+                $result[$status]++;
             }
+            return $result;
         };
 
-        $appendRows((array) ($dataset['parent'] ?? []), $parentSheet);
-        foreach ($config->childTables as $childIndex => $childTable) {
-            $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
-            if ($childSheet === $parentSheet && ! $this->usesSeparateChildWorksheets($config)) {
+        foreach ((array) ($dataset['masters'] ?? []) as $masterIndex => $masterDataset) {
+            $parentTable = $config->masterParents->get($masterIndex);
+            if (! $parentTable instanceof ImportTable) {
                 continue;
             }
-            $appendRows((array) ($dataset['children'][$childIndex] ?? []), $childSheet);
+            $masterName = (string) ($masterDataset['name'] ?? $this->masterName($parentTable));
+            $parentSheet = (string) ($masterDataset['worksheet'] ?? $this->resolveParentWorksheet($config, $parentTable, []));
+            $counts = $appendRows((array) ($masterDataset['parent'] ?? []), $masterName, $parentSheet);
+            $children = $parentTable->children->values()->all();
+            if ($this->usesSeparateChildWorksheets($parentTable, $children)) {
+                foreach ($children as $childIndex => $childTable) {
+                    $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
+                    $childCounts = $appendRows((array) ($masterDataset['children'][$childIndex] ?? []), $masterName, $childSheet);
+                    $counts['success'] += $childCounts['success'];
+                    $counts['failed'] += $childCounts['failed'];
+                }
+            }
+            $masters[] = [
+                'name' => $masterName,
+                'success' => $counts['success'],
+                'failed' => $counts['failed'],
+            ];
         }
 
         $failed = count(array_filter($rows, static fn (array $row): bool => $row['status'] === 'failed'));
@@ -979,6 +1165,7 @@ class ImportRecordProcessor
             'total' => count($rows),
             'success' => count($rows) - $failed,
             'failed' => $failed,
+            'masters' => $masters,
             'rows' => $rows,
         ];
     }
@@ -999,17 +1186,14 @@ class ImportRecordProcessor
 
             // Preserve compatibility with older Import hooks that were called
             // once per worksheet instead of receiving the complete dataset.
-            foreach (['parent', 'children'] as $section) {
-                if ($section === 'parent') {
-                    $instance->handle($data['parent'], $config, $request);
-                    continue;
-                }
-
-                foreach ($data['children'] as &$rows) {
+            foreach ((array) ($data['masters'] ?? []) as &$master) {
+                $instance->handle($master['parent'], $config, $request);
+                foreach ($master['children'] as &$rows) {
                     $instance->handle($rows, $config, $request);
                 }
                 unset($rows);
             }
+            unset($master);
         }
     }
 
