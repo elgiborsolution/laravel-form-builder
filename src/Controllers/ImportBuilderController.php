@@ -5,6 +5,8 @@ namespace ESolution\DataSources\Controllers;
 use App\Http\Controllers\Controller;
 use ESolution\DataSources\Models\ImportConfig;
 use ESolution\DataSources\Models\ImportTable;
+use ESolution\DataSources\Models\ImportStagingBatch;
+use ESolution\DataSources\Models\ImportStagingRecord;
 use ESolution\DataSources\Services\Import\ImportRecordProcessor;
 use ESolution\DataSources\Services\Import\ImportTemplateReader;
 use ESolution\DataSources\Exceptions\ApiHookException;
@@ -18,6 +20,8 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
 
@@ -207,12 +211,28 @@ class ImportBuilderController extends Controller
             return response()->json(['message' => 'Import builder not found'], 404);
         }
 
-        if (! $request->hasFile('file')) {
-            return response()->json(['message' => 'Import file is required.'], 422);
+        $hasImportUuid = $request->exists('import_uuid');
+        $hasFile = $request->hasFile('file');
+        if ($hasImportUuid && $hasFile) {
+            return response()->json(['success' => false, 'message' => 'Provide either file for direct import or import_uuid for staged import finalization, not both.'], 422);
+        }
+        if (! $hasImportUuid && ! $hasFile) {
+            return response()->json(['success' => false, 'message' => 'Either file or import_uuid is required.'], 422);
         }
 
         try {
-            $summary = $this->processor->process($config, $request);
+            if (! $hasImportUuid) {
+                return response()->json($this->processor->process($config, $request), 200);
+            }
+            $uuid = trim((string) $request->input('import_uuid', ''));
+            if ($uuid === '') { return response()->json(['success' => false, 'message' => 'A valid import_uuid is required for final import.'], 422); }
+            // Fail fast for inaccessible/consumed UUIDs. The locked claim below
+            // remains authoritative for concurrent requests.
+            $batch = $this->stagingBatch($request, $config, $uuid);
+            if ($batch === null) { return response()->json(['message' => 'Staged import was not found.'], 404); }
+            if ($batch->status !== 'staged') { return response()->json(['message' => 'This staged import is already being processed.'], 409); }
+            $summary = $this->finalizeStagedBatch($request, $config, $uuid);
+            if ($summary === null) { return response()->json(['message' => 'This staged import was already finalized or is being processed.'], 409); }
         } catch (ApiHookException $exception) {
             return response()->json(
                 $exception->toResponsePayload(),
@@ -221,6 +241,137 @@ class ImportBuilderController extends Controller
         }
 
         return response()->json($summary, 200);
+    }
+
+    public function stage(Request $request, string $endpoint): JsonResponse
+    {
+        $config = $this->resolver->findByEndpoint($endpoint);
+        if ($config === null) { return response()->json(['message' => 'Import builder not found'], 404); }
+        if ($request->exists('import_uuid') || ! $request->hasFile('file')) {
+            return response()->json(['success' => false, 'message' => 'A file is required for staging and import_uuid is not accepted.'], 422);
+        }
+        try {
+            $report = $this->processor->stage($config, $request);
+            $uuid = (string) Str::uuid();
+            $batch = ImportStagingBatch::create([
+                'import_uuid' => $uuid, 'import_config_id' => $config->id, 'user_id' => $request->user()?->getAuthIdentifier(),
+                'tenant_key' => trim((string) $request->header('X-Tenant', '')) ?: null,
+                'connection_name' => (string) $request->attributes->get('datasources.connection_name', ''), 'status' => 'staged',
+                'total' => $report['total'], 'success_count' => $report['success'], 'failed_count' => $report['failed'],
+                'dataset' => $this->successfulStagingDataset((array) ($report['staging_dataset'] ?? []), (array) ($report['rows'] ?? [])),
+            ]);
+            foreach ((array) ($report['rows'] ?? []) as $order => $row) {
+                ImportStagingRecord::create([
+                    'import_uuid' => $uuid, 'import_config_id' => $config->id, 'master_name' => $row['master'] ?? null,
+                    'table_name' => $this->stagingTableName($config, $row), 'row_no' => (int) ($row['row'] ?? 0),
+                    'parent_row_key' => $this->stagingParentRowKey($config, $row), 'payload' => $row['data'] ?? [],
+                    'status' => $row['status'] ?? 'failed', 'errors' => $row['errors'] ?? null, 'execution_order' => $order,
+                ]);
+            }
+            return response()->json(['success' => true, 'data' => ['import_uuid' => $batch->import_uuid, 'total' => $batch->total, 'success' => $batch->success_count, 'failed' => $batch->failed_count]]);
+        } catch (ApiHookException $exception) { return response()->json($exception->toResponsePayload(), $exception->getStatusCode()); }
+    }
+
+    public function temporary(Request $request, string $endpoint, string $importUuid): JsonResponse
+    {
+        $config = $this->resolver->findByEndpoint($endpoint);
+        if ($config === null) { return response()->json(['message' => 'Import builder not found'], 404); }
+        $batch = $this->stagingBatch($request, $config, $importUuid);
+        if ($batch === null) { return response()->json(['message' => 'Staged import was not found.'], 404); }
+        $perPage = min(max((int) $request->query('per_page', 20), 1), 100);
+        $records = ImportStagingRecord::query()->where('import_uuid', $batch->import_uuid)->orderBy('execution_order');
+        if (in_array($request->query('status'), ['success', 'failed'], true)) { $records->where('status', $request->query('status')); }
+        if ($request->filled('table')) { $records->where('table_name', $request->query('table')); }
+        return response()->json(['success' => true, 'data' => ['import_uuid' => $batch->import_uuid, 'total' => $batch->total, 'success' => $batch->success_count, 'failed' => $batch->failed_count, 'records' => $records->paginate($perPage)]]);
+    }
+
+    protected function stagingBatch(Request $request, ImportConfig $config, string $uuid): ?ImportStagingBatch
+    {
+        $query = ImportStagingBatch::query()->where('import_uuid', $uuid)->where('import_config_id', $config->id)
+            ->where('tenant_key', trim((string) $request->header('X-Tenant', '')) ?: null);
+        if ($request->user() !== null) { $query->where('user_id', $request->user()->getAuthIdentifier()); }
+        return $query->first();
+    }
+
+    /**
+     * Claim the batch with a row lock and keep that lock until the target-table
+     * transaction and staging cleanup have both completed.
+     */
+    protected function finalizeStagedBatch(Request $request, ImportConfig $config, string $uuid): ?array
+    {
+        $connectionName = (string) $request->attributes->get('datasources.connection_name', '');
+        return DB::connection($connectionName)->transaction(function () use ($request, $config, $uuid): ?array {
+            $query = ImportStagingBatch::query()
+                ->where('import_uuid', $uuid)
+                ->where('import_config_id', $config->id)
+                ->where('tenant_key', trim((string) $request->header('X-Tenant', '')) ?: null)
+                ->lockForUpdate();
+            if ($request->user() !== null) { $query->where('user_id', $request->user()->getAuthIdentifier()); }
+            $batch = $query->first();
+            if ($batch === null || $batch->status !== 'staged') { return null; }
+
+            $batch->update(['status' => 'processing']);
+            $summary = $this->processor->finalize($config, $request, (array) $batch->dataset);
+            if ((int) ($summary['failed'] ?? 0) > 0) {
+                throw ValidationException::withMessages([
+                    'import_uuid' => ['Final import failed. Staged data was retained for retry.'],
+                ]);
+            }
+
+            // This runs in the same outer transaction. If persistence or cleanup
+            // fails, rollback restores the batch to staged for a safe retry.
+            $batch->records()->delete();
+            $batch->delete();
+            return $summary;
+        });
+    }
+
+    protected function stagingTableName(ImportConfig $config, array $row): ?string
+    {
+        $master = (string) ($row['master'] ?? ''); $worksheet = (string) ($row['worksheet'] ?? '');
+        $parent = $config->masterParents->first(fn (ImportTable $table) => $this->masterNameForStaging($table) === $master);
+        if (! $parent instanceof ImportTable) { return null; }
+        if ((string) $parent->worksheet === $worksheet || $worksheet === '') { return $parent->table_name; }
+        return $parent->children->first(fn (ImportTable $table) => (string) $table->worksheet === $worksheet)?->table_name ?? $parent->table_name;
+    }
+
+    protected function masterNameForStaging(ImportTable $table): string { return trim((string) $table->master_name) ?: trim((string) $table->table_name); }
+
+    /** Logical relationship identity only. Never store a rollback-generated database ID. */
+    protected function stagingParentRowKey(ImportConfig $config, array $row): ?string
+    {
+        $masterName = (string) ($row['master'] ?? ''); $worksheet = (string) ($row['worksheet'] ?? ''); $payload = (array) ($row['data'] ?? []);
+        $parent = $config->masterParents->first(fn (ImportTable $table) => $this->masterNameForStaging($table) === $masterName);
+        if (! $parent instanceof ImportTable) { return null; }
+        $matchColumn = (string) $parent->parent_match_column;
+        if ((string) $parent->worksheet !== $worksheet) {
+            $child = $parent->children->first(fn (ImportTable $table) => (string) $table->worksheet === $worksheet);
+            $matchColumn = (string) ($child?->child_match_column ?: $child?->parent_match_column ?: $matchColumn);
+        }
+        $matchValue = $payload[$matchColumn] ?? null;
+        return $matchColumn !== '' && $matchValue !== null && $matchValue !== '' ? $masterName . '|' . (string) $matchValue : null;
+    }
+
+    protected function successfulStagingDataset(array $dataset, array $records): array
+    {
+        $successful = [];
+        foreach ($records as $record) {
+            if (($record['status'] ?? null) === 'success') {
+                $successful[(string) ($record['master'] ?? '') . '|' . (string) ($record['worksheet'] ?? '') . '|' . (int) ($record['row'] ?? 0)] = true;
+            }
+        }
+        foreach ((array) ($dataset['masters'] ?? []) as $masterIndex => $master) {
+            $filter = static function (array $rows, string $masterName, string $worksheet) use ($successful): array {
+                return array_values(array_filter($rows, static fn (array $row): bool => isset($successful[$masterName . '|' . $worksheet . '|' . (int) ($row['row'] ?? 0)])));
+            };
+            $masterName = (string) ($master['name'] ?? ''); $worksheet = (string) ($master['worksheet'] ?? '');
+            $dataset['masters'][$masterIndex]['parent'] = $filter((array) ($master['parent'] ?? []), $masterName, $worksheet);
+            foreach ((array) ($master['children'] ?? []) as $childIndex => $children) {
+                $childWorksheet = (string) ($master['child_worksheets'][$childIndex] ?? $worksheet);
+                $dataset['masters'][$masterIndex]['children'][$childIndex] = $filter((array) $children, $masterName, $childWorksheet);
+            }
+        }
+        return $dataset;
     }
 
     /**
@@ -277,6 +428,12 @@ class ImportBuilderController extends Controller
             'after_execute_hook_path' => ['nullable', 'string', 'max:255'],
             'middlewares' => ['nullable', 'array'],
             'middlewares.*' => ['nullable', 'string'],
+            'custom_parameters' => ['nullable', 'array'],
+            'custom_parameters.*.name' => ['required', 'string', 'max:100', 'regex:/^[A-Za-z_][A-Za-z0-9_]*$/'],
+            'custom_parameters.*.type' => ['required', Rule::in(['string', 'integer', 'decimal', 'float', 'boolean', 'date', 'datetime'])],
+            'custom_parameters.*.required' => ['nullable', 'boolean'],
+            'custom_parameters.*.default' => ['nullable'],
+            'custom_parameters.*.validation_rules' => ['nullable', 'string', 'max:1000'],
             'before_execute_hook' => ['nullable', 'string'],
             'after_execute_hook' => ['nullable', 'string'],
             'master_parents' => ['nullable', 'array'],
@@ -332,7 +489,45 @@ class ImportBuilderController extends Controller
             ], 422);
         }
 
+        $parameterNames = array_map(
+            static fn (array $parameter): string => strtolower(trim((string) ($parameter['name'] ?? ''))),
+            (array) ($payload['custom_parameters'] ?? [])
+        );
+        if (count($parameterNames) !== count(array_unique($parameterNames))
+            || array_intersect($parameterNames, ['file', 'template_file', '_method']) !== []) {
+            return response()->json([
+                'status' => 422,
+                'message' => 'Custom parameter names must be unique and cannot use reserved request fields.',
+                'errors' => ['custom_parameters' => ['Duplicate or reserved custom parameter name.']],
+            ], 422);
+        }
+
+        if (($isCreate || array_key_exists('master_parents', $payload) || array_key_exists('parent_table', $payload) || array_key_exists('child_tables', $payload))
+            && ! $this->hasWorksheetBackedTable($payload)) {
+            return response()->json([
+                'status' => 422,
+                'message' => 'At least one table must use a worksheet. If your configuration does not require an Excel/CSV worksheet, use API Builder instead.',
+                'errors' => ['master_parents' => ['At least one master parent or child table must use a worksheet.']],
+            ], 422);
+        }
+
         return $validator->validated();
+    }
+
+    protected function hasWorksheetBackedTable(array $payload): bool
+    {
+        foreach ((array) ($payload['master_parents'] ?? []) as $master) {
+            if (! is_array($master)) { continue; }
+            if (trim((string) ($master['worksheet'] ?? '')) !== '') { return true; }
+            foreach ((array) ($master['children'] ?? []) as $child) {
+                if (is_array($child) && trim((string) ($child['worksheet'] ?? '')) !== '') { return true; }
+            }
+        }
+        if (trim((string) (($payload['parent_table'] ?? [])['worksheet'] ?? '')) !== '') { return true; }
+        foreach ((array) ($payload['child_tables'] ?? []) as $child) {
+            if (is_array($child) && trim((string) ($child['worksheet'] ?? '')) !== '') { return true; }
+        }
+        return false;
     }
 
     protected function normalizePayload(array $payload, bool $isCreate): array
@@ -360,6 +555,9 @@ class ImportBuilderController extends Controller
         if ($isCreate || array_key_exists('middlewares', $payload)) {
             $normalized['middlewares'] = $this->normalizeStringArray($payload['middlewares'] ?? null);
         }
+        if ($isCreate || array_key_exists('custom_parameters', $payload)) {
+            $normalized['custom_parameters'] = $this->normalizeCustomParameters($payload['custom_parameters'] ?? []);
+        }
         if ($isCreate || array_key_exists('before_execute_hook', $payload)) {
             $normalized['before_execute_hook'] = $this->nullableString($payload['before_execute_hook'] ?? null);
         }
@@ -378,7 +576,7 @@ class ImportBuilderController extends Controller
             }
         }
 
-        foreach (['master_parents', 'parent_table', 'child_tables', 'middlewares'] as $key) {
+        foreach (['master_parents', 'parent_table', 'child_tables', 'middlewares', 'custom_parameters'] as $key) {
             if (! array_key_exists($key, $payload)) {
                 continue;
             }
@@ -692,6 +890,23 @@ METHOD;
         $normalized = array_values(array_filter(array_map(static fn ($item) => trim((string) $item), $value), static fn ($item) => $item !== ''));
 
         return $normalized === [] ? null : $normalized;
+    }
+
+    protected function normalizeCustomParameters(mixed $value): array
+    {
+        if (! is_array($value)) {
+            return [];
+        }
+
+        return array_values(array_map(static function (array $parameter): array {
+            return [
+                'name' => trim((string) ($parameter['name'] ?? '')),
+                'type' => strtolower(trim((string) ($parameter['type'] ?? 'string'))),
+                'required' => (bool) ($parameter['required'] ?? false),
+                'default' => $parameter['default'] ?? null,
+                'validation_rules' => trim((string) ($parameter['validation_rules'] ?? '')),
+            ];
+        }, array_filter($value, 'is_array')));
     }
 
     protected function normalizeMappingDataParams(mixed $value): array

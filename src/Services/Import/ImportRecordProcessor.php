@@ -12,6 +12,7 @@ use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use Illuminate\Database\ConnectionInterface;
 use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
@@ -22,6 +23,12 @@ class ImportRecordProcessor
 {
     /** @var array{message: string, errors: array<string, array<int, string>>}|null */
     protected ?array $lastPersistenceFailure = null;
+
+    /** @var array<string, mixed> */
+    protected array $customParameterValues = [];
+
+    /** Final replay uses the already-validated staged dataset. */
+    protected bool $skipPersistenceValidation = false;
 
     public function __construct(
         protected ImportTemplateReader $templateReader,
@@ -46,7 +53,37 @@ class ImportRecordProcessor
         return $this->processImport($config, $request, true);
     }
 
-    protected function processImport(ImportConfig $config, Request $request, bool $rollbackOnly = false): array
+    /** Build, validate, and execute the existing flow in a rollback-only transaction. */
+    public function stage(ImportConfig $config, Request $request): array
+    {
+        return $this->processImport($config, $request, true, true);
+    }
+
+    /** Persist a dataset prepared during staging without parsing the workbook again. */
+    public function finalize(ImportConfig $config, Request $request, array $dataset): array
+    {
+        $connectionName = $this->executionConnectionResolver->resolve($request);
+        $connection = $this->executionConnectionResolver->connection($request);
+        $config->loadMissing('masterParents.children');
+        $this->customParameterValues = (array) ($dataset['custom_parameters'] ?? []);
+        $this->skipPersistenceValidation = true;
+        $connection->beginTransaction();
+        $summary = ['success' => 0, 'failed' => 0, 'errors' => [], 'masters' => []];
+        try {
+            foreach ($config->masterParents->values() as $index => $parentTable) {
+                $masterSummary = $this->processMasterParentAndChildren($config, $parentTable, $parentTable->children->values()->all(), (array) ($dataset['masters'][$index] ?? []), $connection, $connectionName, $request);
+                $summary['success'] += $masterSummary['success']; $summary['failed'] += $masterSummary['failed'];
+                $summary['errors'] = array_merge($summary['errors'], $masterSummary['errors']);
+                $summary['masters'][] = ['name' => $this->masterName($parentTable), 'table_name' => $parentTable->table_name, 'success' => $masterSummary['success'], 'failed' => $masterSummary['failed']];
+            }
+            $summary = $this->applyAfterExecuteHook($config, $request, $summary);
+            $connection->commit();
+            return $summary;
+        } catch (Throwable $exception) { $connection->rollBack(); throw $exception; }
+        finally { $this->skipPersistenceValidation = false; }
+    }
+
+    protected function processImport(ImportConfig $config, Request $request, bool $rollbackOnly = false, bool $includeDataset = false): array
     {
         $uploadedFile = $request->file('file');
 
@@ -69,11 +106,14 @@ class ImportRecordProcessor
             ]);
         }
 
+        $this->customParameterValues = $this->resolveCustomParameters($config, $request);
+
         $workbook = $this->templateReader->readAllRows($uploadedFile);
         $worksheets = $workbook['worksheets'];
         $this->validateWorkbookCompatibility($config, $worksheets, $masterParents);
 
         $dataset = $this->buildNormalizedImportDataset($config, $worksheets, $masterParents);
+        $dataset['custom_parameters'] = $this->customParameterValues;
         // Keep source rows intact for the test report; hooks may mutate $dataset by reference.
         $originalDataset = $dataset;
 
@@ -113,10 +153,16 @@ class ImportRecordProcessor
                 ];
             }
 
-            $summary = $this->applyAfterExecuteHook($config, $request, $summary);
+            // Staging runs Before Execute against the prepared dataset. After
+            // Execute is deferred until the staged rows are actually committed.
+            if (! $includeDataset) {
+                $summary = $this->applyAfterExecuteHook($config, $request, $summary);
+            }
             if ($rollbackOnly) {
                 $connection->rollBack();
-                return $this->buildTestResult($originalDataset, $config, $summary);
+                $result = $this->buildTestResult($originalDataset, $config, $summary);
+                if ($includeDataset) { $result['staging_dataset'] = $dataset; }
+                return $result;
             }
 
             $connection->commit();
@@ -321,6 +367,8 @@ class ImportRecordProcessor
             $result['success']++;
             if ($matchColumn !== '' && $matchValue !== null && $matchValue !== '') {
                 $parentLookup[(string) $matchValue] = $persisted;
+            } elseif (trim((string) ($parentTable->worksheet ?? '')) === '') {
+                $parentLookup['__single_parent__'] = $persisted;
             }
         }
 
@@ -348,7 +396,9 @@ class ImportRecordProcessor
             $rowNumber = (int) ($rowInfo['row'] ?? 0);
             $rowData = $this->normalizeRowData((array) ($rowInfo['data'] ?? []));
             $matchValue = $rowData[$matchColumn] ?? null;
-            $parent = $matchColumn !== '' && $matchValue !== null ? ($parentLookup[(string) $matchValue] ?? null) : null;
+            $parent = $matchColumn !== '' && $matchValue !== null
+                ? ($parentLookup[(string) $matchValue] ?? null)
+                : ($parentLookup['__single_parent__'] ?? null);
             if ($parent === null) {
                 $summary['failed']++;
                 $summary['errors'][] = [
@@ -565,14 +615,16 @@ class ImportRecordProcessor
             return null;
         }
 
-        $rules = $this->buildValidationRules($tableName, $table, $payload, $lookupKey, $connectionName);
-        $validator = Validator::make($payload, $rules);
-        if ($validator->fails()) {
-            $this->lastPersistenceFailure = [
-                'message' => $validator->errors()->first(),
-                'errors' => $validator->errors()->toArray(),
-            ];
-            return null;
+        if (! $this->skipPersistenceValidation) {
+            $rules = $this->buildValidationRules($tableName, $table, $payload, $lookupKey, $connectionName);
+            $validator = Validator::make($payload, $rules);
+            if ($validator->fails()) {
+                $this->lastPersistenceFailure = [
+                    'message' => $validator->errors()->first(),
+                    'errors' => $validator->errors()->toArray(),
+                ];
+                return null;
+            }
         }
 
         $existing = null;
@@ -630,23 +682,28 @@ class ImportRecordProcessor
             }
 
             $fieldRules = [];
-            if (! empty($descriptor['required'])) {
-                $fieldRules[] = 'required';
-            } else {
-                $fieldRules[] = 'nullable';
-            }
+            // Request custom parameters are cast and validated once in
+            // resolveCustomParameters(). Mapping-level rules must not override
+            // that authoritative definition.
+            if (strtolower(trim((string) ($descriptor['source_type'] ?? ''))) !== 'custom_parameter') {
+                if (! empty($descriptor['required'])) {
+                    $fieldRules[] = 'required';
+                } else {
+                    $fieldRules[] = 'nullable';
+                }
 
-            $type = strtolower(trim((string) ($descriptor['type'] ?? '')));
-            if (in_array($type, ['numeric', 'integer'], true)) {
-                $fieldRules[] = 'numeric';
-            } elseif ($type === 'email') {
-                $fieldRules[] = 'email';
-            } elseif ($type === 'date') {
-                $fieldRules[] = 'date';
-            }
+                $type = strtolower(trim((string) ($descriptor['type'] ?? '')));
+                if (in_array($type, ['numeric', 'integer'], true)) {
+                    $fieldRules[] = 'numeric';
+                } elseif ($type === 'email') {
+                    $fieldRules[] = 'email';
+                } elseif ($type === 'date') {
+                    $fieldRules[] = 'date';
+                }
 
-            if (! empty($descriptor['validation_rules']) && is_string($descriptor['validation_rules'])) {
-                $fieldRules = array_merge($fieldRules, array_filter(array_map('trim', explode('|', $descriptor['validation_rules']))));
+                if (! empty($descriptor['validation_rules']) && is_string($descriptor['validation_rules'])) {
+                    $fieldRules = array_merge($fieldRules, array_filter(array_map('trim', explode('|', $descriptor['validation_rules']))));
+                }
             }
 
             if (! empty($descriptor['unique'])) {
@@ -679,7 +736,7 @@ class ImportRecordProcessor
                 continue;
             }
 
-            $resolved = $this->resolveMappedValue($descriptor['value'] ?? null, $rowData, $context);
+            $resolved = $this->resolveDescriptorValue($descriptor, $rowData, $context);
             $resolved = $this->normalizeImportedValue($resolved);
 
             if ($allowLoopInsert && ($descriptor['array_handling'] ?? 'RAW_VALUE') === 'LOOP_INSERT' && is_array($resolved)) {
@@ -750,6 +807,17 @@ class ImportRecordProcessor
         }
 
         return $value;
+    }
+
+    protected function resolveDescriptorValue(array $descriptor, array $rowData, array $context): mixed
+    {
+        $sourceType = strtolower(trim((string) ($descriptor['source_type'] ?? '')));
+        if ($sourceType === 'custom_parameter') {
+            $name = trim((string) ($descriptor['custom_parameter'] ?? $descriptor['value'] ?? ''));
+            return $this->customParameterValues[$name] ?? null;
+        }
+
+        return $this->resolveMappedValue($descriptor['value'] ?? null, $rowData, $context);
     }
 
     protected function resolveRuntimeVariables(array $row): array
@@ -831,10 +899,106 @@ class ImportRecordProcessor
             'unique' => (bool) ($mapping['unique'] ?? false),
             'type' => $mapping['type'] ?? null,
             'validation_rules' => $mapping['validation_rules'] ?? $mapping['rules'] ?? null,
+            'source_type' => $mapping['source_type'] ?? $mapping['sourceType'] ?? null,
+            'custom_parameter' => $mapping['custom_parameter'] ?? $mapping['customParameter'] ?? null,
             'array_handling' => strtoupper((string) ($mapping['array_handling'] ?? $mapping['arrayHandling'] ?? 'RAW_VALUE')) === 'LOOP_INSERT'
                 ? 'LOOP_INSERT'
                 : 'RAW_VALUE',
         ];
+    }
+
+    /** @return array<string, mixed> */
+    protected function resolveCustomParameters(ImportConfig $config, Request $request): array
+    {
+        $definitions = is_array($config->custom_parameters ?? null) ? $config->custom_parameters : [];
+        if ($definitions === []) {
+            return [];
+        }
+
+        $input = [];
+        $rules = [];
+        foreach ($definitions as $definition) {
+            if (! is_array($definition)) {
+                continue;
+            }
+            $name = trim((string) ($definition['name'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $value = $request->input($name);
+            if (strtolower(trim((string) ($definition['type'] ?? ''))) === 'boolean' && is_string($value)) {
+                $value = match (strtolower(trim($value))) {
+                    'true', '1' => true,
+                    'false', '0' => false,
+                    default => $value,
+                };
+            }
+            if (($value === null || $value === '') && array_key_exists('default', $definition)) {
+                $value = $definition['default'];
+                if (strtolower(trim((string) ($definition['type'] ?? ''))) === 'boolean' && is_string($value)) {
+                    $value = match (strtolower(trim($value))) {
+                        'true', '1' => true,
+                        'false', '0' => false,
+                        default => $value,
+                    };
+                }
+            }
+            $input[$name] = $value;
+            $rules[$name] = $this->customParameterRules($definition);
+        }
+
+        $validator = Validator::make($input, $rules);
+        if ($validator->fails()) {
+            throw ValidationException::withMessages($validator->errors()->toArray());
+        }
+
+        $values = [];
+        foreach ($definitions as $definition) {
+            if (! is_array($definition)) {
+                continue;
+            }
+            $name = trim((string) ($definition['name'] ?? ''));
+            if ($name !== '') {
+                $values[$name] = $this->castCustomParameterValue($input[$name] ?? null, (string) ($definition['type'] ?? 'string'));
+            }
+        }
+
+        return $values;
+    }
+
+    /** @return array<int, mixed> */
+    protected function customParameterRules(array $definition): array
+    {
+        $rules = [! empty($definition['required']) ? 'required' : 'nullable'];
+        $type = strtolower(trim((string) ($definition['type'] ?? 'string')));
+        $rules[] = match ($type) {
+            'integer' => 'integer',
+            'decimal', 'float' => 'numeric',
+            'boolean' => 'boolean',
+            'date', 'datetime' => 'date',
+            default => 'string',
+        };
+        if (! empty($definition['validation_rules']) && is_string($definition['validation_rules'])) {
+            $rules = array_merge($rules, array_filter(array_map('trim', explode('|', $definition['validation_rules']))));
+        }
+
+        return $rules;
+    }
+
+    protected function castCustomParameterValue(mixed $value, string $type): mixed
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        return match (strtolower(trim($type))) {
+            'integer' => (int) $value,
+            'decimal', 'float' => (float) $value,
+            'boolean' => in_array(strtolower((string) $value), ['1', 'true'], true),
+            'date' => Carbon::parse($value)->toDateString(),
+            'datetime' => Carbon::parse($value)->toDateTimeString(),
+            default => (string) $value,
+        };
     }
 
     protected function resolveLookupKey(ImportTable $table, ?string $connectionName = null): string
@@ -981,30 +1145,29 @@ class ImportRecordProcessor
     {
         $storedWorksheets = (array) (($config->template_metadata ?? [])['worksheets'] ?? []);
         foreach ($masterParents as $masterIndex => $parentTable) {
-            $parentSheet = $this->resolveParentWorksheet($config, $parentTable, $config->template_metadata ?? []);
+            $configuredParentSheet = trim((string) ($parentTable->worksheet ?? ''));
+            $parentSheet = $configuredParentSheet !== ''
+                ? $this->resolveParentWorksheet($config, $parentTable, $config->template_metadata ?? [])
+                : '';
             $masterPath = 'master_parents.' . $masterIndex;
-            if (! isset($worksheets[$parentSheet])) {
+            if ($parentSheet !== '' && ! isset($worksheets[$parentSheet])) {
                 throw ValidationException::withMessages(['file' => ['Parent worksheet "' . $parentSheet . '" does not exist for master "' . $this->masterName($parentTable) . '".']]);
             }
 
-            $expectedHeaders = (array) ($storedWorksheets[$parentSheet]['column_headers'] ?? []);
-            if ($expectedHeaders === [] && $masterIndex === 0) {
-                $expectedHeaders = (array) (($config->template_metadata ?? [])['column_headers'] ?? []);
-            }
-            $actualHeaders = (array) ($worksheets[$parentSheet]['metadata']['column_headers'] ?? []);
-            $missing = array_values(array_diff($expectedHeaders, $actualHeaders));
-            if ($missing !== []) {
-                throw ValidationException::withMessages(['file' => ['Template header mismatch in worksheet "' . $parentSheet . '": missing ' . implode(', ', $missing)]]);
+            if ($parentSheet !== '') {
+                $expectedHeaders = (array) ($storedWorksheets[$parentSheet]['column_headers'] ?? []);
+                if ($expectedHeaders === [] && $masterIndex === 0) {
+                    $expectedHeaders = (array) (($config->template_metadata ?? [])['column_headers'] ?? []);
+                }
+                $actualHeaders = (array) ($worksheets[$parentSheet]['metadata']['column_headers'] ?? []);
+                $missing = array_values(array_diff($expectedHeaders, $actualHeaders));
+                if ($missing !== []) {
+                    throw ValidationException::withMessages(['file' => ['Template header mismatch in worksheet "' . $parentSheet . '": missing ' . implode(', ', $missing)]]);
+                }
             }
 
             $children = $parentTable->children->values()->all();
             $parentMatchColumn = trim((string) ($parentTable->parent_match_column ?? ''));
-            if ($this->usesSeparateChildWorksheets($parentTable, $children) && $parentMatchColumn === '') {
-                throw ValidationException::withMessages([$masterPath . '.parent_match_column' => ['Parent Match Column is required for multi-worksheet imports.']]);
-            }
-            if ($parentMatchColumn !== '') {
-                $this->assertWorksheetHasColumn($worksheets[$parentSheet], $parentMatchColumn, 'Parent Match Column');
-            }
 
             foreach ($children as $childIndex => $childTable) {
                 $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
@@ -1019,13 +1182,17 @@ class ImportRecordProcessor
                     throw ValidationException::withMessages(['file' => ['Template header mismatch in worksheet "' . $childSheet . '": missing ' . implode(', ', $missing)]]);
                 }
 
-                if ($childSheet !== $parentSheet) {
+                $usesWorksheetMatching = trim((string) ($parentTable->worksheet ?? '')) !== ''
+                    && trim((string) ($childTable->worksheet ?? '')) !== '';
+                if ($usesWorksheetMatching && $parentMatchColumn !== '') {
+                    $this->assertWorksheetHasColumn($worksheets[$parentSheet], $parentMatchColumn, 'Parent Match Column');
+                }
+                if ($usesWorksheetMatching && $childSheet !== $parentSheet) {
                     $matchColumn = trim((string) ($childTable->child_match_column ?? ''))
                         ?: trim((string) ($childTable->parent_match_column ?? ''));
-                    if ($matchColumn === '') {
-                        throw ValidationException::withMessages([$masterPath . '.children.' . $childIndex . '.child_match_column' => ['Child Match Column is required for worksheet "' . $childSheet . '".']]);
+                    if ($matchColumn !== '') {
+                        $this->assertWorksheetHasColumn($worksheets[$childSheet], $matchColumn, 'Child Match Column');
                     }
-                    $this->assertWorksheetHasColumn($worksheets[$childSheet], $matchColumn, 'Child Match Column');
                 }
             }
         }
@@ -1043,16 +1210,18 @@ class ImportRecordProcessor
     {
         $dataset = ['masters' => []];
         foreach ($masterParents as $parentTable) {
-            $parentSheet = $this->resolveParentWorksheet($config, $parentTable, $config->template_metadata ?? []);
+            $parentSheet = trim((string) ($parentTable->worksheet ?? ''));
             $masterDataset = [
                 'name' => $this->masterName($parentTable),
                 'worksheet' => $parentSheet,
-                'parent' => $this->normalizeImportedRows($worksheets[$parentSheet]['rows'] ?? []),
+                'parent' => $parentSheet !== '' ? $this->normalizeImportedRows($worksheets[$parentSheet]['rows'] ?? []) : [['row' => 0, 'data' => []]],
                 'children' => [],
+                'child_worksheets' => [],
             ];
             foreach ($parentTable->children->values() as $childIndex => $childTable) {
                 $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
                 $masterDataset['children'][$childIndex] = $this->normalizeImportedRows($worksheets[$childSheet]['rows'] ?? []);
+                $masterDataset['child_worksheets'][$childIndex] = $childSheet;
             }
             $dataset['masters'][] = $masterDataset;
         }

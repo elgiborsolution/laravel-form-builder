@@ -27,12 +27,14 @@ class ImportConfig extends Model
         'template_original_name',
         'template_type',
         'template_metadata',
+        'custom_parameters',
     ];
 
     protected $casts = [
         'middlewares' => 'array',
         'template_metadata' => 'array',
         'enabled' => 'boolean',
+        'custom_parameters' => 'array',
     ];
 
     public function parentTable()
