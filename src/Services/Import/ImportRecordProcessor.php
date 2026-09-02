@@ -3,6 +3,8 @@
 namespace ESolution\DataSources\Services\Import;
 
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
+use ESolution\DataSources\Exceptions\ImportHookException;
+use ESolution\DataSources\Exceptions\ImportRowValidationException;
 use ESolution\DataSources\Contracts\ImportBeforeExecuteHookInterface;
 use ESolution\DataSources\Models\ImportConfig;
 use ESolution\DataSources\Models\ImportTable;
@@ -21,6 +23,9 @@ use Throwable;
 
 class ImportRecordProcessor
 {
+    /** A long physical gap marks the end of a worksheet's tabular data region. */
+    protected const DATA_REGION_MAX_EMPTY_ROWS = 25;
+
     /** @var array{message: string, errors: array<string, array<int, string>>}|null */
     protected ?array $lastPersistenceFailure = null;
 
@@ -29,6 +34,9 @@ class ImportRecordProcessor
 
     /** Final replay uses the already-validated staged dataset. */
     protected bool $skipPersistenceValidation = false;
+
+    /** Stage treats a worksheet-free parent as a request-level prerequisite. */
+    protected bool $failFastNonWorksheetParent = false;
 
     public function __construct(
         protected ImportTemplateReader $templateReader,
@@ -70,13 +78,22 @@ class ImportRecordProcessor
         $connection->beginTransaction();
         $summary = ['success' => 0, 'failed' => 0, 'errors' => [], 'masters' => []];
         try {
+            $this->applyBeforeFinalHook($config, $dataset, $request);
+            if (! empty($dataset['prepared'])) {
+                $summary = $this->finalizePreparedDataset($config, $request, $dataset, $connection, $connectionName);
+                $summary = $this->applyAfterFinalHook($config, $request, $summary);
+                $connection->commit();
+
+                return $summary;
+            }
+
             foreach ($config->masterParents->values() as $index => $parentTable) {
                 $masterSummary = $this->processMasterParentAndChildren($config, $parentTable, $parentTable->children->values()->all(), (array) ($dataset['masters'][$index] ?? []), $connection, $connectionName, $request);
                 $summary['success'] += $masterSummary['success']; $summary['failed'] += $masterSummary['failed'];
                 $summary['errors'] = array_merge($summary['errors'], $masterSummary['errors']);
                 $summary['masters'][] = ['name' => $this->masterName($parentTable), 'table_name' => $parentTable->table_name, 'success' => $masterSummary['success'], 'failed' => $masterSummary['failed']];
             }
-            $summary = $this->applyAfterExecuteHook($config, $request, $summary);
+            $summary = $this->applyAfterFinalHook($config, $request, $summary);
             $connection->commit();
             return $summary;
         } catch (Throwable $exception) { $connection->rollBack(); throw $exception; }
@@ -85,6 +102,7 @@ class ImportRecordProcessor
 
     protected function processImport(ImportConfig $config, Request $request, bool $rollbackOnly = false, bool $includeDataset = false): array
     {
+        $this->failFastNonWorksheetParent = false;
         $uploadedFile = $request->file('file');
 
         if ($uploadedFile === null) {
@@ -123,9 +141,27 @@ class ImportRecordProcessor
             $dataset['parent'] =& $dataset['masters'][0]['parent'];
             $dataset['children'] =& $dataset['masters'][0]['children'];
         }
-        $this->applyBeforeExecuteHook($config, $dataset, $request);
+        if ($includeDataset) {
+            $this->applyBeforeStageHook($config, $dataset, $request);
+        } else {
+            // Direct and legacy test imports retain the original shared hooks.
+            $this->applyBeforeExecuteHook($config, $dataset, $request);
+        }
         unset($dataset['parent'], $dataset['children']);
 
+        if ($includeDataset) {
+            // Staging must only read target tables. Prepare the final payload,
+            // validate it, and resolve parent context without calling the
+            // persistence engine or opening a target-table transaction.
+            $dataset = $this->prepareStagingDataset($dataset, $masterParents, $connection, $connectionName);
+            $summary = $this->summarizeStagingDataset($dataset, $masterParents);
+            $result = $this->buildTestResult($originalDataset, $config, $summary);
+            $result['staging_dataset'] = $dataset;
+
+            return $result;
+        }
+
+        $this->failFastNonWorksheetParent = false;
         $connection->beginTransaction();
         $summary = ['success' => 0, 'failed' => 0, 'errors' => [], 'masters' => []];
 
@@ -169,6 +205,8 @@ class ImportRecordProcessor
         } catch (Throwable $exception) {
             $connection->rollBack();
             throw $exception;
+        } finally {
+            $this->failFastNonWorksheetParent = false;
         }
 
         return $summary;
@@ -187,8 +225,10 @@ class ImportRecordProcessor
         string $connectionName,
         Request $request
     ): array {
-        $parentSheet = trim((string) ($dataset['worksheet'] ?? ''))
-            ?: $this->resolveParentWorksheet($config, $parentTable, []);
+        $parentSheet = trim((string) ($dataset['worksheet'] ?? ''));
+        if ($parentSheet === '' && trim((string) ($parentTable->worksheet ?? '')) !== '') {
+            $parentSheet = $this->resolveParentWorksheet($config, $parentTable, []);
+        }
         $summary = ['success' => 0, 'failed' => 0, 'errors' => []];
         $importMode = strtoupper(trim((string) ($parentTable->import_mode ?: $config->import_mode))) ?: 'UPSERT';
 
@@ -236,6 +276,13 @@ class ImportRecordProcessor
             }
         }
 
+        if ($this->failFastNonWorksheetParent && $parentSheet === '' && $summary['failed'] > 0) {
+            $firstError = (array) ($summary['errors'][0] ?? []);
+            $column = (string) ($firstError['column'] ?? 'import');
+            $message = (string) ($firstError['message'] ?? 'The non-worksheet parent record is invalid.');
+            throw ValidationException::withMessages([$column => [$message]]);
+        }
+
         foreach ($childTables as $childIndex => $childTable) {
             $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
             $this->processChildWorksheet(
@@ -254,6 +301,323 @@ class ImportRecordProcessor
         }
 
         return $this->tagMasterErrors($summary, $parentTable);
+    }
+
+    /**
+     * Resolve mappings once for a staged batch. Raw worksheet data remains in
+     * `data`; `mapped_payload` is the immutable target payload used on final
+     * replay. Auto-increment relationships intentionally remain metadata only.
+     */
+    protected function prepareStagingDataset(
+        array $dataset,
+        array $masterParents,
+        ConnectionInterface $connection,
+        string $connectionName
+    ): array
+    {
+        foreach ($masterParents as $masterIndex => $parentTable) {
+            $masterName = $this->masterName($parentTable);
+            $parentContexts = [];
+            $importMode = strtoupper(trim((string) ($parentTable->import_mode ?: 'UPSERT'))) ?: 'UPSERT';
+            $parentWorksheet = (string) ($dataset['masters'][$masterIndex]['worksheet'] ?? '');
+            foreach ((array) ($dataset['masters'][$masterIndex]['parent'] ?? []) as $rowIndex => $rowInfo) {
+                $rowData = $this->normalizeRowData((array) ($rowInfo['data'] ?? []));
+                $rowNumber = (int) ($rowInfo['row'] ?? 0);
+                $payload = $this->buildMappedRows($parentTable->data_params ?? [], $rowData, ['row' => $rowData], false)[0] ?? [];
+                $parentKey = $this->stagingParentRowKey($masterName, $parentTable, $rowData, $rowNumber);
+                if (! empty($rowInfo['stage_errors'])) {
+                    $dataset['masters'][$masterIndex]['parent'][$rowIndex]['mapped_payload'] = $payload;
+                    $dataset['masters'][$masterIndex]['parent'][$rowIndex]['parent_row_key'] = $parentKey;
+                    continue;
+                }
+                $plan = $this->planStagedTableRow($connection, $connectionName, $parentTable, $payload, $importMode);
+                if ($plan === null) {
+                    $dataset['masters'][$masterIndex]['parent'][$rowIndex]['stage_errors'] = [
+                        $this->persistenceFailure($rowNumber, $this->firstColumnName($payload), 'Failed to prepare parent row.'),
+                    ];
+                    $dataset['masters'][$masterIndex]['parent'][$rowIndex]['mapped_payload'] = $payload;
+                    $dataset['masters'][$masterIndex]['parent'][$rowIndex]['parent_row_key'] = $parentKey;
+                    continue;
+                }
+
+                $dataset['masters'][$masterIndex]['parent'][$rowIndex]['mapped_payload'] = $plan['payload'];
+                $dataset['masters'][$masterIndex]['parent'][$rowIndex]['parent_row_key'] = $parentKey;
+                $dataset['masters'][$masterIndex]['parent'][$rowIndex]['stage_operation'] = $plan['operation'];
+                $parentContexts[$parentKey] = $plan['context'];
+            }
+
+            foreach ($parentTable->children->values() as $childIndex => $childTable) {
+                foreach ((array) ($dataset['masters'][$masterIndex]['children'][$childIndex] ?? []) as $rowIndex => $rowInfo) {
+                    $rowData = $this->normalizeRowData((array) ($rowInfo['data'] ?? []));
+                    $rowNumber = (int) ($rowInfo['row'] ?? 0);
+                    $parentKey = $this->stagingChildParentRowKey($masterName, $parentTable, $childTable, $rowData, $rowNumber);
+                    if (! empty($rowInfo['stage_errors'])) {
+                        $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['parent_row_key'] = $parentKey;
+                        continue;
+                    }
+                    if (! isset($parentContexts[$parentKey])) {
+                        $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['stage_errors'] = [[
+                            'row' => $rowNumber,
+                            'column' => (string) ($childTable->foreign_key ?? ''),
+                            'message' => 'Parent record is invalid or unavailable.',
+                        ]];
+                        $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['parent_row_key'] = $parentKey;
+                        continue;
+                    }
+
+                    // Supplying null keys prevents unresolved {{ parent.* }}
+                    // markers when the parent uses an auto-increment key.
+                    $parentContext = array_merge(['id' => null, 'uuid' => null], (array) $parentContexts[$parentKey]);
+                    $payload = $this->buildMappedRows(
+                        $childTable->data_params ?? [],
+                        $rowData,
+                        ['row' => $rowData, 'parent' => $parentContext],
+                        false
+                    )[0] ?? [];
+                    $foreignKey = trim((string) ($childTable->foreign_key ?? ''));
+                    if ($foreignKey !== '') {
+                        $foreignValue = $this->resolveForeignKeyValue($parentContext, $childTable, $foreignKey, $parentTable);
+                        if ($foreignValue === null) {
+                            unset($payload[$foreignKey]);
+                        } else {
+                            $payload[$foreignKey] = $foreignValue;
+                        }
+                    }
+                    $plan = $this->planStagedTableRow($connection, $connectionName, $childTable, $payload, $importMode);
+                    if ($plan === null) {
+                        $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['stage_errors'] = [
+                            $this->persistenceFailure($rowNumber, $this->firstColumnName($payload), 'Failed to prepare child row.'),
+                        ];
+                        $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['mapped_payload'] = $payload;
+                        $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['parent_row_key'] = $parentKey;
+                        continue;
+                    }
+
+                    $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['mapped_payload'] = $plan['payload'];
+                    $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['parent_row_key'] = $parentKey;
+                    $dataset['masters'][$masterIndex]['children'][$childIndex][$rowIndex]['stage_operation'] = $plan['operation'];
+                }
+            }
+        }
+
+        $dataset['prepared'] = true;
+
+        return $dataset;
+    }
+
+    /**
+     * Plan a target operation for staging. This deliberately performs SELECT
+     * and Validator work only: no insert, update, delete, or transaction is
+     * opened against the target table.
+     *
+     * @return array{payload:array<string, mixed>, context:array<string, mixed>, operation:string}|null
+     */
+    protected function planStagedTableRow(
+        ConnectionInterface $connection,
+        string $connectionName,
+        ImportTable $table,
+        array $row,
+        string $importMode
+    ): ?array {
+        $this->lastPersistenceFailure = null;
+        $payload = $this->normalizePersistedRow($row);
+        $tableName = $this->normalizeTableName($connection, (string) $table->table_name);
+        if ($tableName === '') {
+            $this->lastPersistenceFailure = ['message' => 'The configured table name is empty.', 'errors' => []];
+            return null;
+        }
+
+        $lookupKey = trim((string) $this->resolveLookupKey($table, $connectionName));
+        $existing = null;
+        if ($lookupKey !== '' && array_key_exists($lookupKey, $payload) && $payload[$lookupKey] !== null && $payload[$lookupKey] !== '') {
+            $existing = $connection->table($tableName)->where($lookupKey, $payload[$lookupKey])->first();
+        }
+
+        $mode = strtoupper(trim($importMode));
+        if ($mode === 'UPDATE' && $existing === null) {
+            $this->lastPersistenceFailure = ['message' => 'No matching record was found for update.', 'errors' => []];
+            return null;
+        }
+
+        $operation = $mode === 'UPDATE' || ($mode === 'UPSERT' && $existing !== null) ? 'UPDATE' : 'INSERT';
+        $primaryKey = trim((string) ($table->primary_key ?: $this->resolveTablePrimaryKeyName($table->table_name, $connectionName)));
+        $existingValues = $existing !== null ? (array) $existing : [];
+        if ($existing !== null && $primaryKey !== '' && array_key_exists($primaryKey, $existingValues)) {
+            // Existing UPSERT/UPDATE rows retain their real primary key even
+            // when a mapping contains a generated value such as uuid.random.
+            $payload[$primaryKey] = $existingValues[$primaryKey];
+        }
+
+        $ignoreValue = $operation === 'UPDATE' && $primaryKey !== ''
+            ? ($existingValues[$primaryKey] ?? null)
+            : null;
+        $rules = $this->buildValidationRules($tableName, $table, $payload, $connectionName, $primaryKey, $ignoreValue);
+        $validator = Validator::make($payload, $rules);
+        if ($validator->fails()) {
+            $this->lastPersistenceFailure = [
+                'message' => $validator->errors()->first(),
+                'errors' => $validator->errors()->toArray(),
+            ];
+            return null;
+        }
+
+        return [
+            'payload' => $payload,
+            'context' => array_merge($existingValues, $payload),
+            'operation' => $operation,
+        ];
+    }
+
+    protected function summarizeStagingDataset(array $dataset, array $masterParents): array
+    {
+        $summary = ['success' => 0, 'failed' => 0, 'errors' => [], 'masters' => []];
+        foreach ($masterParents as $masterIndex => $parentTable) {
+            $masterSummary = ['success' => 0, 'failed' => 0, 'errors' => []];
+            $master = (array) ($dataset['masters'][$masterIndex] ?? []);
+            $masterName = $this->masterName($parentTable);
+            $parentWorksheet = (string) ($master['worksheet'] ?? '');
+
+            $append = function (array $rows, string $worksheet) use (&$masterSummary, $masterName): void {
+                foreach ($rows as $rowInfo) {
+                    $rowErrors = (array) ($rowInfo['stage_errors'] ?? []);
+                    if ($rowErrors === []) {
+                        $masterSummary['success']++;
+                        continue;
+                    }
+                    $masterSummary['failed']++;
+                    foreach ($rowErrors as $error) {
+                        $error['master'] = $masterName;
+                        $masterSummary['errors'][] = $this->withWorksheet((array) $error, $worksheet);
+                    }
+                }
+            };
+
+            $append((array) ($master['parent'] ?? []), $parentWorksheet);
+            foreach ($parentTable->children->values() as $childIndex => $childTable) {
+                $childWorksheet = (string) ($master['child_worksheets'][$childIndex] ?? $parentWorksheet);
+                $append((array) ($master['children'][$childIndex] ?? []), $childWorksheet);
+            }
+
+            $summary['success'] += $masterSummary['success'];
+            $summary['failed'] += $masterSummary['failed'];
+            $summary['errors'] = array_merge($summary['errors'], $masterSummary['errors']);
+            $summary['masters'][] = [
+                'name' => $masterName,
+                'table_name' => $parentTable->table_name,
+                'success' => $masterSummary['success'],
+                'failed' => $masterSummary['failed'],
+            ];
+        }
+
+        return $summary;
+    }
+
+    protected function stagingParentRowKey(string $masterName, ImportTable $parentTable, array $rowData, int $rowNumber): string
+    {
+        if (trim((string) ($parentTable->worksheet ?? '')) === '') {
+            return $masterName . '|__single_parent__';
+        }
+
+        $matchColumn = trim((string) ($parentTable->parent_match_column ?? ''));
+        $matchValue = $matchColumn !== '' ? ($rowData[$matchColumn] ?? null) : null;
+
+        return $matchValue !== null && $matchValue !== ''
+            ? $masterName . '|' . (string) $matchValue
+            : $masterName . '|row:' . $rowNumber;
+    }
+
+    protected function stagingChildParentRowKey(string $masterName, ImportTable $parentTable, ImportTable $childTable, array $rowData, int $rowNumber): string
+    {
+        $matchColumn = trim((string) ($childTable->child_match_column ?? ''))
+            ?: trim((string) ($childTable->parent_match_column ?? ''));
+        $matchValue = $matchColumn !== '' ? ($rowData[$matchColumn] ?? null) : null;
+        if ($matchValue !== null && $matchValue !== '') {
+            return $masterName . '|' . (string) $matchValue;
+        }
+
+        if (trim((string) ($parentTable->worksheet ?? '')) === '') {
+            return $masterName . '|__single_parent__';
+        }
+
+        return $masterName . '|row:' . $rowNumber;
+    }
+
+    /** Persist staged mapped_payload values without rerunning source mapping. */
+    protected function finalizePreparedDataset(ImportConfig $config, Request $request, array $dataset, ConnectionInterface $connection, string $connectionName): array
+    {
+        $summary = ['success' => 0, 'failed' => 0, 'errors' => [], 'masters' => []];
+        foreach ($config->masterParents->values() as $masterIndex => $parentTable) {
+            $master = (array) ($dataset['masters'][$masterIndex] ?? []);
+            $masterSummary = ['success' => 0, 'failed' => 0, 'errors' => []];
+            $parentRecords = [];
+            $importMode = strtoupper(trim((string) ($parentTable->import_mode ?: $config->import_mode))) ?: 'UPSERT';
+
+            foreach ((array) ($master['parent'] ?? []) as $rowInfo) {
+                $payload = (array) ($rowInfo['mapped_payload'] ?? []);
+                $rowNumber = (int) ($rowInfo['row'] ?? 0);
+                // A staged UPSERT has already chosen INSERT or UPDATE using a
+                // read-only lookup. Preserve that decision at commit time so a
+                // staged UPDATE can never fall through to an INSERT.
+                $plannedOperation = strtoupper(trim((string) ($rowInfo['stage_operation'] ?? '')));
+                $persistenceMode = in_array($plannedOperation, ['INSERT', 'UPDATE'], true)
+                    ? $plannedOperation
+                    : $importMode;
+                $persisted = $this->upsertTableRow($connection, $connectionName, $parentTable, $payload, $persistenceMode, null);
+                if ($persisted === null) {
+                    $masterSummary['failed']++;
+                    $masterSummary['errors'][] = $this->withWorksheet($this->persistenceFailure($rowNumber, $this->firstColumnName($payload), 'Failed to persist parent row.'), (string) ($master['worksheet'] ?? ''));
+                    continue;
+                }
+                $masterSummary['success']++;
+                $parentRecords[(string) ($rowInfo['parent_row_key'] ?? '')] = $persisted;
+            }
+
+            foreach ($parentTable->children->values() as $childIndex => $childTable) {
+                $groups = [];
+                foreach ((array) ($master['children'][$childIndex] ?? []) as $rowInfo) {
+                    $parentKey = (string) ($rowInfo['parent_row_key'] ?? '');
+                    if (! isset($parentRecords[$parentKey])) {
+                        $masterSummary['failed']++;
+                        $masterSummary['errors'][] = $this->withWorksheet([
+                            'row' => (int) ($rowInfo['row'] ?? 0),
+                            'column' => (string) ($childTable->foreign_key ?? ''),
+                            'message' => 'Parent not found for staged child row.',
+                        ], (string) ($master['child_worksheets'][$childIndex] ?? $master['worksheet'] ?? ''));
+                        continue;
+                    }
+                    $groups[$parentKey]['parent'] = $parentRecords[$parentKey];
+                    $groups[$parentKey]['rows'][] = (array) ($rowInfo['mapped_payload'] ?? []);
+                    $groups[$parentKey]['row_numbers'][] = (int) ($rowInfo['row'] ?? 0);
+                }
+
+                foreach ($groups as $group) {
+                    $result = $this->persistChildRows(
+                        $connection,
+                        $connectionName,
+                        $childTable,
+                        $group['rows'],
+                        $group['parent'],
+                        $importMode,
+                        $request,
+                        $group['row_numbers'],
+                        $parentTable
+                    );
+                    $masterSummary['success'] += $result['success'];
+                    $masterSummary['failed'] += $result['failed'];
+                    foreach ($result['errors'] as $error) {
+                        $masterSummary['errors'][] = $this->withWorksheet($error, (string) ($master['child_worksheets'][$childIndex] ?? $master['worksheet'] ?? ''));
+                    }
+                }
+            }
+
+            $masterSummary = $this->tagMasterErrors($masterSummary, $parentTable);
+            $summary['success'] += $masterSummary['success'];
+            $summary['failed'] += $masterSummary['failed'];
+            $summary['errors'] = array_merge($summary['errors'], $masterSummary['errors']);
+            $summary['masters'][] = ['name' => $this->masterName($parentTable), 'table_name' => $parentTable->table_name, 'success' => $masterSummary['success'], 'failed' => $masterSummary['failed']];
+        }
+
+        return $summary;
     }
 
     protected function masterName(ImportTable $parentTable): string
@@ -615,18 +979,6 @@ class ImportRecordProcessor
             return null;
         }
 
-        if (! $this->skipPersistenceValidation) {
-            $rules = $this->buildValidationRules($tableName, $table, $payload, $lookupKey, $connectionName);
-            $validator = Validator::make($payload, $rules);
-            if ($validator->fails()) {
-                $this->lastPersistenceFailure = [
-                    'message' => $validator->errors()->first(),
-                    'errors' => $validator->errors()->toArray(),
-                ];
-                return null;
-            }
-        }
-
         $existing = null;
         if ($lookupKey !== '' && array_key_exists($lookupKey, $payload) && $payload[$lookupKey] !== null && $payload[$lookupKey] !== '') {
             $existing = $connection->table($tableName)
@@ -641,6 +993,22 @@ class ImportRecordProcessor
         if ($mode === 'UPDATE' && $existing === null) {
             $this->lastPersistenceFailure = ['message' => 'No matching record was found for update.', 'errors' => []];
             return null;
+        }
+
+        if (! $this->skipPersistenceValidation) {
+            $ignoreColumn = trim((string) ($table->primary_key ?: $this->resolveTablePrimaryKeyName($table->table_name, $connectionName)));
+            $ignoreValue = $shouldUpdate && $existing !== null && $ignoreColumn !== ''
+                ? data_get((array) $existing, $ignoreColumn)
+                : null;
+            $rules = $this->buildValidationRules($tableName, $table, $payload, $connectionName, $ignoreColumn, $ignoreValue);
+            $validator = Validator::make($payload, $rules);
+            if ($validator->fails()) {
+                $this->lastPersistenceFailure = [
+                    'message' => $validator->errors()->first(),
+                    'errors' => $validator->errors()->toArray(),
+                ];
+                return null;
+            }
         }
 
         if ($shouldUpdate && $existing !== null) {
@@ -669,7 +1037,7 @@ class ImportRecordProcessor
         return null;
     }
 
-    protected function buildValidationRules(string $tableName, ImportTable $table, array $payload, string $lookupKey, string $connectionName): array
+    protected function buildValidationRules(string $tableName, ImportTable $table, array $payload, string $connectionName, ?string $ignoreColumn = null, mixed $ignoreValue = null): array
     {
         $rules = [];
         $definitions = is_array($table->data_params ?? null) ? $table->data_params : [];
@@ -707,9 +1075,14 @@ class ImportRecordProcessor
             }
 
             if (! empty($descriptor['unique'])) {
-                $unique = Rule::unique($tableName, $targetColumn)->on($connectionName);
-                if ($lookupKey !== '' && array_key_exists($lookupKey, $payload) && $payload[$lookupKey] !== null && $payload[$lookupKey] !== '') {
-                    $unique = $unique->ignore($payload[$lookupKey], $lookupKey);
+                // Laravel's Unique rule selects a connection through the table
+                // identifier; it does not support an ->on() method.
+                $validationTable = $connectionName !== ''
+                    ? $connectionName . '.' . $tableName
+                    : $tableName;
+                $unique = Rule::unique($validationTable, $targetColumn);
+                if ($ignoreColumn !== null && $ignoreColumn !== '' && $ignoreValue !== null && $ignoreValue !== '') {
+                    $unique = $unique->ignore($ignoreValue, $ignoreColumn);
                 }
                 $fieldRules[] = $unique;
             }
@@ -895,8 +1268,8 @@ class ImportRecordProcessor
         return [
             'column' => $column ?? ($mapping['column'] ?? null),
             'value' => $mapping['value'] ?? $mapping['path'] ?? $mapping['source'] ?? null,
-            'required' => (bool) ($mapping['required'] ?? false),
-            'unique' => (bool) ($mapping['unique'] ?? false),
+            'required' => filter_var($mapping['required'] ?? false, FILTER_VALIDATE_BOOLEAN),
+            'unique' => filter_var($mapping['unique'] ?? false, FILTER_VALIDATE_BOOLEAN),
             'type' => $mapping['type'] ?? null,
             'validation_rules' => $mapping['validation_rules'] ?? $mapping['rules'] ?? null,
             'source_type' => $mapping['source_type'] ?? $mapping['sourceType'] ?? null,
@@ -1214,13 +1587,23 @@ class ImportRecordProcessor
             $masterDataset = [
                 'name' => $this->masterName($parentTable),
                 'worksheet' => $parentSheet,
-                'parent' => $parentSheet !== '' ? $this->normalizeImportedRows($worksheets[$parentSheet]['rows'] ?? []) : [['row' => 0, 'data' => []]],
+                'parent' => $parentSheet !== ''
+                    ? $this->filterWorksheetRowsForMappings(
+                        $this->normalizeImportedRows($worksheets[$parentSheet]['rows'] ?? []),
+                        (array) ($parentTable->data_params ?? [])
+                    )
+                    : [['row' => 0, 'data' => []]],
                 'children' => [],
                 'child_worksheets' => [],
             ];
             foreach ($parentTable->children->values() as $childIndex => $childTable) {
                 $childSheet = trim((string) ($childTable->worksheet ?? '')) ?: $parentSheet;
-                $masterDataset['children'][$childIndex] = $this->normalizeImportedRows($worksheets[$childSheet]['rows'] ?? []);
+                $masterDataset['children'][$childIndex] = $childSheet !== ''
+                    ? $this->filterWorksheetRowsForMappings(
+                        $this->normalizeImportedRows($worksheets[$childSheet]['rows'] ?? []),
+                        (array) ($childTable->data_params ?? [])
+                    )
+                    : [];
                 $masterDataset['child_worksheets'][$childIndex] = $childSheet;
             }
             $dataset['masters'][] = $masterDataset;
@@ -1236,6 +1619,92 @@ class ImportRecordProcessor
         }
 
         return $rows;
+    }
+
+    /**
+     * A worksheet's used range can include formatting and footer notes well
+     * beyond its table. Classify rows before validation/persistence using only
+     * this table's mapped headers and its physical data region.
+     */
+    protected function filterWorksheetRowsForMappings(array $rows, array $dataParams): array
+    {
+        $sources = [];
+        $requiredSources = [];
+        foreach ($dataParams as $column => $mapping) {
+            $descriptor = $this->normalizeMappingDescriptor($mapping, is_string($column) ? $column : null);
+            $sourceType = strtolower(trim((string) ($descriptor['source_type'] ?? '')));
+            if (in_array($sourceType, ['custom_parameter', 'runtime_variable'], true)) {
+                continue;
+            }
+            $source = trim((string) ($descriptor['value'] ?? ''));
+            if ($source !== '' && preg_match('/^\{\{\s*[^}]+?\s*\}\}$/', $source) !== 1) {
+                $sources[] = $source;
+                if ((bool) ($descriptor['required'] ?? false)) {
+                    $requiredSources[] = $source;
+                }
+            }
+        }
+        $sources = array_values(array_unique($sources));
+        $requiredSources = array_values(array_unique($requiredSources));
+        if ($sources === []) {
+            return [];
+        }
+
+        $valueForSource = static function (array $data, string $source): mixed {
+            // Excel headers are literal labels and may contain dots, which
+            // data_get would otherwise interpret as nested-path syntax.
+            return array_key_exists($source, $data)
+                ? $data[$source]
+                : data_get($data, $source);
+        };
+        $hasValue = static fn (mixed $value): bool => $value !== null && $value !== '';
+        $minimumRequiredValues = count($requiredSources) > 1 ? 2 : count($requiredSources);
+        $classifiedRows = [];
+        $dataRegionStarted = false;
+        $lastCandidateRow = null;
+
+        foreach ($rows as $rowInfo) {
+            $data = (array) ($rowInfo['data'] ?? []);
+            $mappedValues = 0;
+            foreach ($sources as $source) {
+                if ($hasValue($valueForSource($data, $source))) {
+                    $mappedValues++;
+                }
+            }
+            if ($mappedValues === 0) {
+                continue;
+            }
+
+            $rowNumber = (int) ($rowInfo['row'] ?? 0);
+            if ($dataRegionStarted && $lastCandidateRow !== null
+                && $rowNumber > ($lastCandidateRow + self::DATA_REGION_MAX_EMPTY_ROWS + 1)) {
+                // A footer cannot restart a completed data region after a long
+                // blank/formatted range in the worksheet's used range.
+                break;
+            }
+
+            $requiredValues = 0;
+            foreach ($requiredSources as $source) {
+                if ($hasValue($valueForSource($data, $source))) {
+                    $requiredValues++;
+                }
+            }
+
+            if (! $dataRegionStarted) {
+                // A single value such as a footer label is not enough to begin
+                // a multi-column required data table. Once the region starts,
+                // incomplete rows remain so the existing validators report them.
+                if ($minimumRequiredValues > 0 && $requiredValues < $minimumRequiredValues) {
+                    continue;
+                }
+                $dataRegionStarted = true;
+            }
+
+            $classifiedRows[] = $rowInfo;
+            $lastCandidateRow = $rowNumber;
+        }
+
+        return $classifiedRows;
     }
 
     /** @param array<string, mixed> $error */
@@ -1369,17 +1838,118 @@ class ImportRecordProcessor
     protected function applyAfterExecuteHook(ImportConfig $config, Request $request, array $summary): array
     {
         $hook = trim((string) ($config->after_execute_hook ?? ''));
+        return $this->applyAfterHook($hook, $config, $request, $summary);
+    }
+
+    /** Run only for POST /api/import/{code}/stage before staging data is prepared. */
+    protected function applyBeforeStageHook(ImportConfig $config, array &$data, Request $request): void
+    {
+        try {
+            $this->applyBeforeHook(trim((string) ($config->before_stage_hook ?? '')), $config, $data, $request);
+        } catch (ImportRowValidationException $exception) {
+            $this->applyRowValidationException($data, $exception);
+        }
+    }
+
+    /** Run only while a staged batch is being committed to target tables. */
+    protected function applyBeforeFinalHook(ImportConfig $config, array &$data, Request $request): void
+    {
+        $this->applyBeforeHook(trim((string) ($config->before_final_hook ?? '')), $config, $data, $request);
+    }
+
+    /**
+     * Invoked by the controller after staging records have been written. The
+     * result includes import_uuid, summary, and the prepared staging dataset.
+     */
+    public function applyAfterStageHook(ImportConfig $config, Request $request, array $result): array
+    {
+        return $this->applyAfterHook(trim((string) ($config->after_stage_hook ?? '')), $config, $request, $result);
+    }
+
+    /** Run only after staged records have been persisted successfully. */
+    protected function applyAfterFinalHook(ImportConfig $config, Request $request, array $summary): array
+    {
+        return $this->applyAfterHook(trim((string) ($config->after_final_hook ?? '')), $config, $request, $summary);
+    }
+
+    protected function applyBeforeHook(string $hook, ImportConfig $config, array &$data, Request $request): void
+    {
         if ($hook === '' || ! class_exists($hook)) {
-            return $summary;
+            return;
+        }
+
+        $instance = app($hook);
+        if ($instance instanceof ImportBeforeExecuteHookInterface) {
+            $instance->handle($data, $config, $request);
+            return;
+        }
+
+        throw new \LogicException('Import before hook must implement ' . ImportBeforeExecuteHookInterface::class . '.');
+    }
+
+    /** Convert a hook row exception into the same row-level error shape as validation. */
+    protected function applyRowValidationException(array &$data, ImportRowValidationException $exception): void
+    {
+        $masterIndex = $exception->getMasterIndex();
+        $type = $exception->getType();
+        $childIndex = $exception->getChildIndex();
+        $rowIndex = $exception->getRowIndex();
+
+        if (
+            ! isset($data['masters'][$masterIndex])
+            || ($type === 'child' && ($childIndex === null || ! isset($data['masters'][$masterIndex]['children'][$childIndex])))
+            || ($type === 'parent' && ! isset($data['masters'][$masterIndex]['parent']))
+        ) {
+            throw new ImportHookException(422, 'Import row validation target could not be resolved.', [
+                'master_index' => $masterIndex,
+                'type' => $type,
+                'child_index' => $childIndex,
+                'row_index' => $rowIndex,
+            ]);
+        }
+
+        if ($type === 'parent') {
+            $rows =& $data['masters'][$masterIndex]['parent'];
+        } else {
+            $rows =& $data['masters'][$masterIndex]['children'][$childIndex];
+        }
+        if (! array_key_exists($rowIndex, $rows)) {
+            throw new ImportHookException(422, 'Import row validation target could not be resolved.', [
+                'master_index' => $masterIndex,
+                'type' => $type,
+                'child_index' => $childIndex,
+                'row_index' => $rowIndex,
+            ]);
+        }
+
+        $rowNumber = (int) ($rows[$rowIndex]['row'] ?? 0);
+        $stageErrors = [];
+        foreach ($exception->getErrors() as $column => $messages) {
+            $messages = is_array($messages) ? array_values($messages) : [(string) $messages];
+            $message = (string) ($messages[0] ?? 'The row is invalid.');
+            $stageErrors[] = [
+                'row' => $rowNumber,
+                'column' => (string) $column,
+                'message' => $message,
+                'errors' => [(string) $column => $messages],
+            ];
+        }
+        $rows[$rowIndex]['stage_errors'] = array_merge((array) ($rows[$rowIndex]['stage_errors'] ?? []), $stageErrors);
+    }
+
+    protected function applyAfterHook(string $hook, ImportConfig $config, Request $request, array $data): array
+    {
+        if ($hook === '' || ! class_exists($hook)) {
+            return $data;
         }
 
         $instance = app($hook);
         if (method_exists($instance, 'handle')) {
-            $result = $instance->handle($request, $config, $summary);
-            return is_array($result) ? $result : $summary;
+            $result = $instance->handle($request, $config, $data);
+            return is_array($result) ? $result : $data;
         }
 
-        return $summary;
+        return $data;
     }
 
     protected function resolveSelectedSheet(ImportConfig $config): ?string

@@ -9,9 +9,12 @@ use ESolution\DataSources\Models\ImportStagingBatch;
 use ESolution\DataSources\Models\ImportStagingRecord;
 use ESolution\DataSources\Services\Import\ImportRecordProcessor;
 use ESolution\DataSources\Services\Import\ImportTemplateReader;
-use ESolution\DataSources\Exceptions\ApiHookException;
+use ESolution\DataSources\Exceptions\ImportHookException;
+use ESolution\DataSources\Exceptions\ImportRowValidationException;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use ESolution\DataSources\Support\ExecutionConnectionResolver;
 use ESolution\DataSources\Support\ImportConfigResolver;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -24,6 +27,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\Validation\ValidationException;
+use Throwable;
 
 class ImportBuilderController extends Controller
 {
@@ -32,8 +36,42 @@ class ImportBuilderController extends Controller
     public function __construct(
         protected ImportConfigResolver $resolver,
         protected ImportTemplateReader $templateReader,
-        protected ImportRecordProcessor $processor
+        protected ImportRecordProcessor $processor,
+        protected ?DatabaseMetadataProvider $databaseMetadataProvider = null,
+        protected ?ExecutionConnectionResolver $executionConnectionResolver = null
     ) {
+        $this->databaseMetadataProvider ??= new DatabaseMetadataProvider();
+        $this->executionConnectionResolver ??= new ExecutionConnectionResolver();
+    }
+
+    protected function importResponse(bool $success, string $message, mixed $data = null, int $status = 200): JsonResponse
+    {
+        return response()->json([
+            'success' => $success,
+            'message' => $message,
+            'data' => $data,
+        ], $status);
+    }
+
+    protected function importValidationResponse(ValidationException $exception): JsonResponse
+    {
+        $errors = $exception->errors();
+        $firstMessage = null;
+        foreach ($errors as $messages) {
+            $firstMessage = $messages[0] ?? null;
+            if ($firstMessage !== null) {
+                break;
+            }
+        }
+
+        return $this->importResponse(false, $firstMessage ?: 'The request is invalid.', ['errors' => $errors], 422);
+    }
+
+    protected function importHookResponse(ImportHookException $exception): JsonResponse
+    {
+        $data = $exception->getData();
+
+        return $this->importResponse(false, $exception->getMessage(), $data === [] ? null : $data, $exception->getStatusCode());
     }
 
     public function index(Request $request): JsonResponse
@@ -55,30 +93,36 @@ class ImportBuilderController extends Controller
             $query->where('enabled', filter_var($enabled, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE) ?? false);
         }
 
-        return response()->json($query->paginate((int) $request->query('per_page', 10) ?: 10));
+        return $this->importResponse(true, 'Import builders retrieved successfully.', $query->paginate((int) $request->query('per_page', 10) ?: 10));
     }
 
     public function defaults(): JsonResponse
     {
-        return response()->json([
-            'data' => [
-                'default_middlewares' => [],
-                'import_mode_options' => ['INSERT', 'UPDATE', 'UPSERT'],
-            ],
+        return $this->importResponse(true, 'Import builder defaults retrieved successfully.', [
+            'default_middlewares' => [],
+            'import_mode_options' => ['INSERT', 'UPDATE', 'UPSERT'],
         ]);
     }
 
     public function preview(Request $request): JsonResponse
     {
-        $validated = Validator::make($request->all(), [
+        $validator = Validator::make($request->all(), [
             'template_file' => ['required', 'file', 'mimes:xlsx,csv'],
-        ])->validate();
-
-        $analysis = $this->templateReader->analyze($request->file('template_file'));
-
-        return response()->json([
-            'data' => $analysis['metadata'],
         ]);
+        if ($validator->fails()) {
+            return $this->importResponse(false, $validator->errors()->first(), ['errors' => $validator->errors()->toArray()], 422);
+        }
+
+        try {
+            $analysis = $this->templateReader->analyze($request->file('template_file'));
+        } catch (ValidationException $exception) {
+            return $this->importValidationResponse($exception);
+        } catch (Throwable $exception) {
+            report($exception);
+            return $this->importResponse(false, 'Unable to analyze the template.', ['errors' => [['message' => $exception->getMessage()]]], 500);
+        }
+
+        return $this->importResponse(true, 'Template preview generated successfully.', $analysis['metadata']);
     }
 
     public function store(Request $request): JsonResponse
@@ -99,11 +143,7 @@ class ImportBuilderController extends Controller
         $this->syncRelations($config, $validated);
         $this->resolver->forget($config->endpoint);
 
-        return response()->json([
-            'status' => 201,
-            'message' => 'Import builder created successfully',
-            'data' => $config->fresh(['parentTable', 'childTables', 'masterParents.children']),
-        ], 201);
+        return $this->importResponse(true, 'Import builder created successfully.', $config->fresh(['parentTable', 'childTables', 'masterParents.children']), 201);
     }
 
     public function show(Request $request, int|string $id): JsonResponse
@@ -112,17 +152,17 @@ class ImportBuilderController extends Controller
             ?? ImportConfig::query()->with(['parentTable', 'childTables', 'masterParents.children'])->where('code', $id)->first();
 
         if ($config === null) {
-            return response()->json(['status' => 404, 'message' => 'Import builder not found'], 404);
+            return $this->importResponse(false, 'Import builder not found.', null, 404);
         }
 
-        return response()->json(['status' => 200, 'data' => $config], 200);
+        return $this->importResponse(true, 'Import builder retrieved successfully.', $config);
     }
 
     public function update(Request $request, int|string $id): JsonResponse
     {
         $config = ImportConfig::query()->find($id);
         if ($config === null) {
-            return response()->json(['status' => 404, 'message' => 'Import builder not found'], 404);
+            return $this->importResponse(false, 'Import builder not found.', null, 404);
         }
 
         $validated = $this->validatePayload($request, false, $config);
@@ -150,11 +190,7 @@ class ImportBuilderController extends Controller
         $this->resolver->forget($originalEndpoint);
         $this->resolver->forget($config->endpoint);
 
-        return response()->json([
-            'status' => 200,
-            'message' => 'Import builder updated successfully',
-            'data' => $config,
-        ], 200);
+        return $this->importResponse(true, 'Import builder updated successfully.', $config);
     }
 
     public function destroy(Request $request, int|string $id): JsonResponse
@@ -162,28 +198,32 @@ class ImportBuilderController extends Controller
         $config = ImportConfig::query()->find($id);
 
         if ($config === null) {
-            return response()->json(['status' => 404, 'message' => 'Import builder not found'], 404);
+            return $this->importResponse(false, 'Import builder not found.', null, 404);
         }
 
         $this->resolver->forget($config->endpoint);
         $config->delete();
 
-        return response()->json(['status' => 200, 'message' => 'Import builder deleted successfully', 'data' => []], 200);
+        return $this->importResponse(true, 'Import builder deleted successfully.', []);
     }
 
     public function updateStatus(Request $request, int|string $id): JsonResponse
     {
         $config = ImportConfig::query()->find($id);
         if ($config === null) {
-            return response()->json(['status' => 404, 'message' => 'Import builder not found'], 404);
+            return $this->importResponse(false, 'Import builder not found.', null, 404);
         }
 
         $payload = $this->normalizeIncomingPayload($request->all());
-        $validated = Validator::make($payload, ['enabled' => ['required', 'boolean']])->validate();
+        $validator = Validator::make($payload, ['enabled' => ['required', 'boolean']]);
+        if ($validator->fails()) {
+            return $this->importResponse(false, $validator->errors()->first(), ['errors' => $validator->errors()->toArray()], 422);
+        }
+        $validated = $validator->validated();
         $config->update(['enabled' => (bool) $validated['enabled']]);
         $this->resolver->forget($config->endpoint);
 
-        return response()->json(['status' => 200, 'message' => 'Status updated successfully', 'data' => $config->fresh()], 200);
+        return $this->importResponse(true, 'Status updated successfully.', $config->fresh());
     }
 
     public function downloadTemplate(Request $request, string $endpoint)
@@ -208,81 +248,170 @@ class ImportBuilderController extends Controller
         $config = $this->resolver->findByEndpoint($endpoint);
 
         if ($config === null) {
-            return response()->json(['message' => 'Import builder not found'], 404);
+            return $this->importResponse(false, 'Import builder not found.', null, 404);
         }
 
         $hasImportUuid = $request->exists('import_uuid');
         $hasFile = $request->hasFile('file');
         if ($hasImportUuid && $hasFile) {
-            return response()->json(['success' => false, 'message' => 'Provide either file for direct import or import_uuid for staged import finalization, not both.'], 422);
+            return $this->importResponse(false, 'Provide either file for direct import or import_uuid for staged import finalization, not both.', null, 422);
         }
         if (! $hasImportUuid && ! $hasFile) {
-            return response()->json(['success' => false, 'message' => 'Either file or import_uuid is required.'], 422);
+            return $this->importResponse(false, 'Either file or import_uuid is required.', null, 422);
         }
 
         try {
             if (! $hasImportUuid) {
-                return response()->json($this->processor->process($config, $request), 200);
+                return $this->importResponse(true, 'Import completed successfully.', $this->processor->process($config, $request));
             }
             $uuid = trim((string) $request->input('import_uuid', ''));
-            if ($uuid === '') { return response()->json(['success' => false, 'message' => 'A valid import_uuid is required for final import.'], 422); }
+            if ($uuid === '') { return $this->importResponse(false, 'A valid import_uuid is required for final import.', null, 422); }
             // Fail fast for inaccessible/consumed UUIDs. The locked claim below
             // remains authoritative for concurrent requests.
             $batch = $this->stagingBatch($request, $config, $uuid);
-            if ($batch === null) { return response()->json(['message' => 'Staged import was not found.'], 404); }
-            if ($batch->status !== 'staged') { return response()->json(['message' => 'This staged import is already being processed.'], 409); }
+            if ($batch === null) { return $this->importResponse(false, 'Import staging batch not found.', null, 404); }
+            if ($batch->status !== 'staged') { return $this->importResponse(false, 'This import batch is already being processed or has already been finalized.', null, 409); }
             $summary = $this->finalizeStagedBatch($request, $config, $uuid);
-            if ($summary === null) { return response()->json(['message' => 'This staged import was already finalized or is being processed.'], 409); }
-        } catch (ApiHookException $exception) {
-            return response()->json(
-                $exception->toResponsePayload(),
-                $exception->getStatusCode()
-            );
+            if ($summary === null) { return $this->importResponse(false, 'This import batch is already being processed or has already been finalized.', null, 409); }
+        } catch (ImportHookException $exception) {
+            return $this->importHookResponse($exception);
+        } catch (ValidationException $exception) {
+            return $this->importValidationResponse($exception);
+        } catch (Throwable $exception) {
+            report($exception);
+            return $this->importResponse(false, 'Import failed.', ['errors' => [['message' => $exception->getMessage()]]], 500);
         }
 
-        return response()->json($summary, 200);
+        return $this->importResponse(true, 'Import completed successfully.', $summary);
     }
 
     public function stage(Request $request, string $endpoint): JsonResponse
     {
         $config = $this->resolver->findByEndpoint($endpoint);
-        if ($config === null) { return response()->json(['message' => 'Import builder not found'], 404); }
-        if ($request->exists('import_uuid') || ! $request->hasFile('file')) {
-            return response()->json(['success' => false, 'message' => 'A file is required for staging and import_uuid is not accepted.'], 422);
+        if ($config === null) { return $this->importResponse(false, 'Import builder not found.', null, 404); }
+        if (! $request->hasFile('file')) {
+            return $this->importResponse(false, 'The file field is required for staging.', null, 422);
         }
-        try {
-            $report = $this->processor->stage($config, $request);
-            $uuid = (string) Str::uuid();
-            $batch = ImportStagingBatch::create([
-                'import_uuid' => $uuid, 'import_config_id' => $config->id, 'user_id' => $request->user()?->getAuthIdentifier(),
-                'tenant_key' => trim((string) $request->header('X-Tenant', '')) ?: null,
-                'connection_name' => (string) $request->attributes->get('datasources.connection_name', ''), 'status' => 'staged',
-                'total' => $report['total'], 'success_count' => $report['success'], 'failed_count' => $report['failed'],
-                'dataset' => $this->successfulStagingDataset((array) ($report['staging_dataset'] ?? []), (array) ($report['rows'] ?? [])),
-            ]);
-            foreach ((array) ($report['rows'] ?? []) as $order => $row) {
-                ImportStagingRecord::create([
-                    'import_uuid' => $uuid, 'import_config_id' => $config->id, 'master_name' => $row['master'] ?? null,
-                    'table_name' => $this->stagingTableName($config, $row), 'row_no' => (int) ($row['row'] ?? 0),
-                    'parent_row_key' => $this->stagingParentRowKey($config, $row), 'payload' => $row['data'] ?? [],
-                    'status' => $row['status'] ?? 'failed', 'errors' => $row['errors'] ?? null, 'execution_order' => $order,
-                ]);
+
+        $replaceExisting = $request->exists('import_uuid');
+        $uuid = trim((string) $request->input('import_uuid', ''));
+        if ($replaceExisting && $uuid === '') {
+            return $this->importResponse(false, 'A valid import_uuid is required to replace staged data.', null, 422);
+        }
+
+        // Fail early before reading the workbook when the supplied UUID is not
+        // accessible or cannot be replaced. The locked check below remains
+        // authoritative if finalization starts concurrently.
+        if ($replaceExisting) {
+            $existingBatch = $this->stagingBatch($request, $config, $uuid);
+            if ($existingBatch === null) {
+                return $this->importResponse(false, 'Import staging batch not found.', null, 404);
             }
-            return response()->json(['success' => true, 'data' => ['import_uuid' => $batch->import_uuid, 'total' => $batch->total, 'success' => $batch->success_count, 'failed' => $batch->failed_count]]);
-        } catch (ApiHookException $exception) { return response()->json($exception->toResponsePayload(), $exception->getStatusCode()); }
+            if ($existingBatch->status !== 'staged') {
+                return $this->importResponse(false, 'This import batch is already being processed or has already been finalized.', null, 409);
+            }
+        } else {
+            $uuid = (string) Str::uuid();
+        }
+
+        try {
+            // The processor validates and prepares data only. It must complete
+            // before an existing batch is touched, so a bad replacement leaves
+            // the previous staging records intact.
+            $report = $this->processor->stage($config, $request);
+            $stagingRows = $this->finalizeStagingRowStatuses($config, (array) ($report['rows'] ?? []));
+            $connectionName = (string) $request->attributes->get('datasources.connection_name', '');
+            $stageResult = DB::connection($connectionName)->transaction(function () use ($config, $request, $report, $stagingRows, $uuid, $replaceExisting): ?array {
+                $dataset = $this->successfulStagingDataset((array) ($report['staging_dataset'] ?? []), $stagingRows);
+                if ($replaceExisting) {
+                    $query = ImportStagingBatch::query()
+                        ->where('import_uuid', $uuid)
+                        ->where('import_config_id', $config->id)
+                        ->where('tenant_key', trim((string) $request->header('X-Tenant', '')) ?: null)
+                        ->lockForUpdate();
+                    if ($request->user() !== null) { $query->where('user_id', $request->user()->getAuthIdentifier()); }
+                    $batch = $query->first();
+                    if ($batch === null || $batch->status !== 'staged') {
+                        return null;
+                    }
+
+                    // Delete only after the replacement has been fully prepared.
+                    // Any record write or hook failure rolls this transaction back.
+                    $batch->records()->delete();
+                    $batch->update([
+                        'connection_name' => (string) $request->attributes->get('datasources.connection_name', ''),
+                        'status' => 'staged', 'total' => 0, 'success_count' => 0, 'failed_count' => 0,
+                        'dataset' => $dataset,
+                    ]);
+                } else {
+                    $batch = ImportStagingBatch::create([
+                        'import_uuid' => $uuid, 'import_config_id' => $config->id, 'user_id' => $request->user()?->getAuthIdentifier(),
+                        'tenant_key' => trim((string) $request->header('X-Tenant', '')) ?: null,
+                        'connection_name' => (string) $request->attributes->get('datasources.connection_name', ''), 'status' => 'staged',
+                        'total' => 0, 'success_count' => 0, 'failed_count' => 0, 'dataset' => $dataset,
+                    ]);
+                }
+                foreach ($stagingRows as $order => $row) {
+                    $prepared = $this->stagingPreparedRow((array) ($report['staging_dataset'] ?? []), $row);
+                    ImportStagingRecord::create([
+                        'import_uuid' => $uuid, 'import_config_id' => $config->id, 'master_name' => $row['master'] ?? null,
+                        'table_name' => $this->stagingTableName($config, $row), 'row_no' => (int) ($row['row'] ?? 0),
+                        'parent_row_key' => $prepared['parent_row_key'] ?? $this->stagingParentRowKey($config, $row),
+                        'payload' => $row['data'] ?? [], 'mapped_payload' => $prepared['mapped_payload'] ?? null,
+                        'status' => $row['status'] ?? 'failed', 'errors' => $row['errors'] ?? null, 'execution_order' => $order,
+                    ]);
+                }
+                $finalCounts = ImportStagingRecord::query()
+                    ->where('import_uuid', $uuid)
+                    ->selectRaw('status, COUNT(*) as total')
+                    ->groupBy('status')
+                    ->pluck('total', 'status');
+                $batch->update([
+                    'total' => $finalCounts->sum(),
+                    'success_count' => (int) ($finalCounts['success'] ?? 0),
+                    'failed_count' => (int) ($finalCounts['failed'] ?? 0),
+                ]);
+                $batch->refresh();
+
+                return $this->processor->applyAfterStageHook($config, $request, [
+                    'import_uuid' => $batch->import_uuid,
+                    'total' => $batch->total,
+                    'success' => $batch->success_count,
+                    'failed' => $batch->failed_count,
+                    'staging_dataset' => $batch->dataset,
+                ]);
+            });
+            if ($stageResult === null) {
+                return $this->importResponse(false, 'This import batch is already being processed or has already been finalized.', null, 409);
+            }
+            return $this->importResponse(true, 'Import data staged successfully.', $stageResult);
+        } catch (ImportHookException $exception) { return $this->importHookResponse($exception); }
+        catch (ImportRowValidationException $exception) {
+            return $this->importResponse(false, 'Import row validation exceptions are supported only by Before Stage hooks.', [
+                'master_index' => $exception->getMasterIndex(), 'type' => $exception->getType(),
+                'child_index' => $exception->getChildIndex(), 'row_index' => $exception->getRowIndex(),
+                'errors' => $exception->getErrors(),
+            ], 422);
+        }
+        catch (ValidationException $exception) {
+            $errors = $exception->errors();
+            $message = collect($errors)->flatten()->first() ?: 'The staged import is invalid.';
+            return $this->importResponse(false, $message, null, 422);
+        }
+        catch (Throwable $exception) { report($exception); return $this->importResponse(false, 'Import staging failed.', ['errors' => [['message' => $exception->getMessage()]]], 500); }
     }
 
     public function temporary(Request $request, string $endpoint, string $importUuid): JsonResponse
     {
         $config = $this->resolver->findByEndpoint($endpoint);
-        if ($config === null) { return response()->json(['message' => 'Import builder not found'], 404); }
+        if ($config === null) { return $this->importResponse(false, 'Import builder not found.', null, 404); }
         $batch = $this->stagingBatch($request, $config, $importUuid);
-        if ($batch === null) { return response()->json(['message' => 'Staged import was not found.'], 404); }
+        if ($batch === null) { return $this->importResponse(false, 'Import staging batch not found.', null, 404); }
         $perPage = min(max((int) $request->query('per_page', 20), 1), 100);
         $records = ImportStagingRecord::query()->where('import_uuid', $batch->import_uuid)->orderBy('execution_order');
         if (in_array($request->query('status'), ['success', 'failed'], true)) { $records->where('status', $request->query('status')); }
-        if ($request->filled('table')) { $records->where('table_name', $request->query('table')); }
-        return response()->json(['success' => true, 'data' => ['import_uuid' => $batch->import_uuid, 'total' => $batch->total, 'success' => $batch->success_count, 'failed' => $batch->failed_count, 'records' => $records->paginate($perPage)]]);
+        if ($request->filled('table_name')) { $records->where('table_name', $request->query('table_name')); }
+        return $this->importResponse(true, 'Temporary import data retrieved successfully.', ['import_uuid' => $batch->import_uuid, 'total' => $batch->total, 'success' => $batch->success_count, 'failed' => $batch->failed_count, 'records' => $records->paginate($perPage)]);
     }
 
     protected function stagingBatch(Request $request, ImportConfig $config, string $uuid): ?ImportStagingBatch
@@ -352,6 +481,87 @@ class ImportBuilderController extends Controller
         return $matchColumn !== '' && $matchValue !== null && $matchValue !== '' ? $masterName . '|' . (string) $matchValue : null;
     }
 
+    /**
+     * Finalize source-row statuses before saving the batch. A child may never
+     * remain successful when its worksheet match points to a failed parent.
+     */
+    protected function finalizeStagingRowStatuses(ImportConfig $config, array $rows): array
+    {
+        $config->loadMissing('masterParents.children');
+        foreach ($config->masterParents as $parent) {
+            $masterName = $this->masterNameForStaging($parent);
+            $parentSheet = (string) ($parent->worksheet ?? '');
+            $parentMatchColumn = trim((string) ($parent->parent_match_column ?? ''));
+            $failedParents = [];
+            foreach ($rows as $row) {
+                if (($row['master'] ?? '') !== $masterName || (string) ($row['worksheet'] ?? '') !== $parentSheet || ($row['status'] ?? '') !== 'failed') {
+                    continue;
+                }
+                $value = $parentMatchColumn !== '' ? (($row['data'] ?? [])[$parentMatchColumn] ?? null) : null;
+                if ($value !== null && $value !== '') { $failedParents[(string) $value] = true; }
+            }
+
+            foreach ($parent->children as $child) {
+                $childSheet = (string) ($child->worksheet ?? $parentSheet);
+                // Single-sheet reports contain the parent source row once; they
+                // do not create an independently addressable child staging row.
+                if ($childSheet === $parentSheet) { continue; }
+                $matchColumn = trim((string) ($child->child_match_column ?? ''))
+                    ?: trim((string) ($child->parent_match_column ?? ''))
+                    ?: $parentMatchColumn;
+                if ($matchColumn === '' || $failedParents === []) { continue; }
+                foreach ($rows as &$row) {
+                    if (($row['master'] ?? '') !== $masterName || (string) ($row['worksheet'] ?? '') !== $childSheet) {
+                        continue;
+                    }
+                    $value = ($row['data'] ?? [])[$matchColumn] ?? null;
+                    if ($value === null || $value === '' || ! isset($failedParents[(string) $value])) { continue; }
+                    $row['status'] = 'failed';
+                    $row['reason'] = 'Parent record is invalid or unavailable.';
+                    $row['errors'] = [[
+                        'column' => $matchColumn,
+                        'message' => 'Parent record is invalid or unavailable.',
+                    ]];
+                }
+                unset($row);
+            }
+        }
+
+        return $rows;
+    }
+
+    /** Locate the processor's prepared target payload for the staging preview. */
+    protected function stagingPreparedRow(array $dataset, array $record): array
+    {
+        $masterName = (string) ($record['master'] ?? '');
+        $worksheet = (string) ($record['worksheet'] ?? '');
+        $rowNumber = (int) ($record['row'] ?? 0);
+        foreach ((array) ($dataset['masters'] ?? []) as $master) {
+            if ((string) ($master['name'] ?? '') !== $masterName) {
+                continue;
+            }
+            $collections = [[(array) ($master['parent'] ?? []), (string) ($master['worksheet'] ?? '')]];
+            foreach ((array) ($master['children'] ?? []) as $index => $rows) {
+                $collections[] = [(array) $rows, (string) ($master['child_worksheets'][$index] ?? $master['worksheet'] ?? '')];
+            }
+            foreach ($collections as [$rows, $rowWorksheet]) {
+                if ($rowWorksheet !== $worksheet) {
+                    continue;
+                }
+                foreach ($rows as $row) {
+                    if ((int) ($row['row'] ?? 0) === $rowNumber) {
+                        return [
+                            'mapped_payload' => (array) ($row['mapped_payload'] ?? []),
+                            'parent_row_key' => $row['parent_row_key'] ?? null,
+                        ];
+                    }
+                }
+            }
+        }
+
+        return [];
+    }
+
     protected function successfulStagingDataset(array $dataset, array $records): array
     {
         $successful = [];
@@ -383,23 +593,25 @@ class ImportBuilderController extends Controller
         $config = $this->resolver->findByEndpoint($endpoint);
 
         if ($config === null) {
-            return response()->json(['message' => 'Import builder not found'], 404);
+            return $this->importResponse(false, 'Import builder not found.', null, 404);
         }
 
         if (! $request->hasFile('file')) {
-            return response()->json(['message' => 'Import file is required.'], 422);
+            return $this->importResponse(false, 'The file field is required.', null, 422);
         }
 
         try {
             $result = $this->processor->test($config, $request);
-        } catch (ApiHookException $exception) {
-            return response()->json(
-                $exception->toResponsePayload(),
-                $exception->getStatusCode()
-            );
+        } catch (ImportHookException $exception) {
+            return $this->importHookResponse($exception);
+        } catch (ValidationException $exception) {
+            return $this->importValidationResponse($exception);
+        } catch (Throwable $exception) {
+            report($exception);
+            return $this->importResponse(false, 'Import test failed.', ['errors' => [['message' => $exception->getMessage()]]], 500);
         }
 
-        return response()->json(['success' => true, 'data' => $result], 200);
+        return $this->importResponse(true, 'Import test completed successfully.', $result);
     }
 
     protected function validatePayload(Request $request, bool $isCreate, ?ImportConfig $config = null): array|JsonResponse
@@ -426,6 +638,14 @@ class ImportBuilderController extends Controller
             'before_execute_hook_path' => ['nullable', 'string', 'max:255'],
             'generate_after_execute_hook' => ['nullable', 'boolean'],
             'after_execute_hook_path' => ['nullable', 'string', 'max:255'],
+            'generate_before_stage_hook' => ['nullable', 'boolean'],
+            'before_stage_hook_path' => ['nullable', 'string', 'max:255'],
+            'generate_after_stage_hook' => ['nullable', 'boolean'],
+            'after_stage_hook_path' => ['nullable', 'string', 'max:255'],
+            'generate_before_final_hook' => ['nullable', 'boolean'],
+            'before_final_hook_path' => ['nullable', 'string', 'max:255'],
+            'generate_after_final_hook' => ['nullable', 'boolean'],
+            'after_final_hook_path' => ['nullable', 'string', 'max:255'],
             'middlewares' => ['nullable', 'array'],
             'middlewares.*' => ['nullable', 'string'],
             'custom_parameters' => ['nullable', 'array'],
@@ -436,6 +656,10 @@ class ImportBuilderController extends Controller
             'custom_parameters.*.validation_rules' => ['nullable', 'string', 'max:1000'],
             'before_execute_hook' => ['nullable', 'string'],
             'after_execute_hook' => ['nullable', 'string'],
+            'before_stage_hook' => ['nullable', 'string'],
+            'after_stage_hook' => ['nullable', 'string'],
+            'before_final_hook' => ['nullable', 'string'],
+            'after_final_hook' => ['nullable', 'string'],
             'master_parents' => ['nullable', 'array'],
             'master_parents.*.name' => ['nullable', 'string', 'max:255'],
             'master_parents.*.table_name' => ['nullable', 'string'],
@@ -482,11 +706,7 @@ class ImportBuilderController extends Controller
         $validator = Validator::make($payload, $rules);
 
         if ($validator->fails()) {
-            return response()->json([
-                'status' => 422,
-                'message' => $validator->errors()->first(),
-                'errors' => $validator->errors()->toArray(),
-            ], 422);
+            return $this->importResponse(false, $validator->errors()->first(), ['errors' => $validator->errors()->toArray()], 422);
         }
 
         $parameterNames = array_map(
@@ -495,23 +715,349 @@ class ImportBuilderController extends Controller
         );
         if (count($parameterNames) !== count(array_unique($parameterNames))
             || array_intersect($parameterNames, ['file', 'template_file', '_method']) !== []) {
-            return response()->json([
-                'status' => 422,
-                'message' => 'Custom parameter names must be unique and cannot use reserved request fields.',
-                'errors' => ['custom_parameters' => ['Duplicate or reserved custom parameter name.']],
-            ], 422);
+            return $this->importResponse(false, 'Custom parameter names must be unique and cannot use reserved request fields.', ['errors' => ['custom_parameters' => ['Duplicate or reserved custom parameter name.']]], 422);
         }
 
         if (($isCreate || array_key_exists('master_parents', $payload) || array_key_exists('parent_table', $payload) || array_key_exists('child_tables', $payload))
             && ! $this->hasWorksheetBackedTable($payload)) {
-            return response()->json([
-                'status' => 422,
-                'message' => 'At least one table must use a worksheet. If your configuration does not require an Excel/CSV worksheet, use API Builder instead.',
-                'errors' => ['master_parents' => ['At least one master parent or child table must use a worksheet.']],
-            ], 422);
+            return $this->importResponse(false, 'At least one table must use a worksheet. If your configuration does not require an Excel/CSV worksheet, use API Builder instead.', ['errors' => ['master_parents' => ['At least one master parent or child table must use a worksheet.']]], 422);
+        }
+
+        $insertModeErrors = $this->validateInsertModeLookupKeys($payload, $config);
+        if ($insertModeErrors !== []) {
+            return $this->importResponse(false, 'Import Builder configuration is invalid.', ['errors' => $insertModeErrors], 422);
+        }
+
+        $uniqueErrors = $this->validateDatabaseUniqueMappings($payload, $request, $config);
+        if ($uniqueErrors !== []) {
+            return $this->importResponse(false, 'Import Builder configuration is invalid.', ['errors' => $uniqueErrors], 422);
+        }
+
+        $requiredColumnErrors = $this->validateRequiredDatabaseMappings($payload, $request, $config);
+        if ($requiredColumnErrors !== []) {
+            return $this->importResponse(false, 'Import Builder configuration is invalid.', ['errors' => $requiredColumnErrors], 422);
         }
 
         return $validator->validated();
+    }
+
+    /** @return array<string, array<int, string>> */
+    protected function validateInsertModeLookupKeys(array $payload, ?ImportConfig $existingConfig = null): array
+    {
+        $masters = (array) ($payload['master_parents'] ?? []);
+        if ($masters === [] && $existingConfig !== null) {
+            $existingConfig->loadMissing('masterParents');
+            $masters = $existingConfig->masterParents->map(fn (ImportTable $table): array => $table->only(['import_mode', 'key_update_delete']))->all();
+        }
+        if ($masters === [] && is_array($payload['parent_table'] ?? null)) {
+            $masters = [[
+                'import_mode' => $payload['import_mode'] ?? null,
+                'key_update_delete' => $payload['parent_table']['key_update_delete'] ?? null,
+            ]];
+        }
+
+        $errors = [];
+        foreach ($masters as $index => $master) {
+            if (! is_array($master)) { continue; }
+            if (strtoupper(trim((string) ($master['import_mode'] ?? $payload['import_mode'] ?? ''))) !== 'INSERT') { continue; }
+            if (trim((string) ($master['key_update_delete'] ?? '')) !== '') {
+                $key = count($masters) === 1 ? 'update_delete_key' : 'master_parents.' . $index . '.update_delete_key';
+                $errors[$key][] = 'Update/Delete Key must be empty when Import Mode is INSERT.';
+            }
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Enforce mapping flags only for database indexes that are truly unique on
+     * one column. Composite indexes intentionally do not imply per-column
+     * uniqueness.
+     *
+     * @return array<string, array<int, string>>
+     */
+    protected function validateDatabaseUniqueMappings(array $payload, Request $request, ?ImportConfig $existingConfig = null): array
+    {
+        $tables = [];
+        $masters = (array) ($payload['master_parents'] ?? []);
+        if ($masters !== []) {
+            foreach ($masters as $master) {
+                if (! is_array($master)) { continue; }
+                $tables[] = $master;
+                $masterMode = strtoupper(trim((string) ($master['import_mode'] ?? $payload['import_mode'] ?? 'UPSERT')));
+                foreach ((array) ($master['children'] ?? []) as $child) {
+                    if (is_array($child)) {
+                        $child['_import_mode'] = $masterMode;
+                        $tables[] = $child;
+                    }
+                }
+            }
+        } else {
+            $legacyMode = strtoupper(trim((string) ($payload['import_mode'] ?? 'UPSERT')));
+            if (is_array($payload['parent_table'] ?? null)) { $tables[] = $payload['parent_table']; }
+            foreach ((array) ($payload['child_tables'] ?? []) as $child) {
+                if (is_array($child)) {
+                    $child['_import_mode'] = $legacyMode;
+                    $tables[] = $child;
+                }
+            }
+        }
+
+        if ($tables === [] && $existingConfig !== null) {
+            $existingConfig->loadMissing('masterParents.children', 'parentTable', 'childTables');
+            $existingMasters = $existingConfig->masterParents->values();
+            if ($existingMasters->isNotEmpty()) {
+                foreach ($existingMasters as $master) {
+                    $tables[] = $master->only(['table_name', 'data_params', 'import_mode']);
+                    foreach ($master->children as $child) {
+                        $childTable = $child->only(['table_name', 'data_params']);
+                        $childTable['_import_mode'] = $master->import_mode ?? $existingConfig->import_mode;
+                        $tables[] = $childTable;
+                    }
+                }
+            } elseif ($existingConfig->parentTable !== null) {
+                $tables[] = $existingConfig->parentTable->only(['table_name', 'data_params', 'import_mode']);
+                foreach ($existingConfig->childTables as $child) {
+                    $childTable = $child->only(['table_name', 'data_params']);
+                    $childTable['_import_mode'] = $existingConfig->import_mode;
+                    $tables[] = $childTable;
+                }
+            }
+        }
+
+        $connectionName = $this->executionConnectionResolver?->resolve($request);
+        $errors = [];
+        foreach ($tables as $table) {
+            $tableName = trim((string) ($table['table_name'] ?? ''));
+            if ($tableName === '') { continue; }
+            $importMode = strtoupper(trim((string) ($table['_import_mode'] ?? $table['import_mode'] ?? $payload['import_mode'] ?? 'UPSERT')));
+            if ($importMode !== 'INSERT') { continue; }
+
+            try {
+                $uniqueColumns = $this->singleColumnUniqueColumns($this->databaseMetadataProvider?->listIndexes($tableName, $connectionName) ?? []);
+            } catch (Throwable $exception) {
+                $errors[$tableName][] = 'Unable to inspect UNIQUE constraints for table \'' . $tableName . '\'.';
+                continue;
+            }
+
+            foreach ((array) ($table['data_params'] ?? []) as $key => $mapping) {
+                $column = trim((string) (is_array($mapping) ? ($mapping['column'] ?? $key) : $key));
+                if ($column === '' || ! isset($uniqueColumns[$column])) { continue; }
+                $isUnique = is_array($mapping) && filter_var($mapping['unique'] ?? false, FILTER_VALIDATE_BOOLEAN);
+                if (! $isUnique) {
+                    $errors[$column][] = "Column '{$column}' is UNIQUE in table '{$tableName}'. Enable Unique for this mapping.";
+                }
+            }
+        }
+
+        return $errors;
+    }
+
+    /** @param array<int, array<string, mixed>> $indexes @return array<string, true> */
+    protected function singleColumnUniqueColumns(array $indexes): array
+    {
+        $grouped = [];
+        foreach ($indexes as $index) {
+            if (empty($index['unique']) || ! empty($index['primary'])) { continue; }
+            $name = trim((string) ($index['name'] ?? ''));
+            $column = trim((string) ($index['column'] ?? ''));
+            if ($name !== '' && $column !== '') { $grouped[$name][] = $column; }
+        }
+
+        $columns = [];
+        foreach ($grouped as $indexColumns) {
+            if (count($indexColumns) === 1) { $columns[$indexColumns[0]] = true; }
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Required target columns must be covered before an INSERT or UPSERT can
+     * reach the import pipeline. UPDATE does not create a new database row.
+     *
+     * @return array<string, array<int, string>>
+     */
+    protected function validateRequiredDatabaseMappings(array $payload, Request $request, ?ImportConfig $existingConfig = null): array
+    {
+        $tables = $this->configuredImportTables($payload, $existingConfig);
+        $connectionName = $this->executionConnectionResolver?->resolve($request);
+        $errors = [];
+        $columnsByTable = [];
+
+        foreach ($tables as $table) {
+            $tableName = trim((string) ($table['table_name'] ?? ''));
+            $importMode = strtoupper(trim((string) ($table['import_mode'] ?? 'UPSERT')));
+            if ($tableName === '' || ! in_array($importMode, ['INSERT', 'UPSERT'], true)) {
+                continue;
+            }
+
+            $tableCacheKey = strtolower($tableName);
+            if (! array_key_exists($tableCacheKey, $columnsByTable)) {
+                try {
+                    $columnsByTable[$tableCacheKey] = $this->databaseMetadataProvider?->listColumns($tableName, $connectionName) ?? [];
+                } catch (Throwable $exception) {
+                    $columnsByTable[$tableCacheKey] = null;
+                }
+            }
+            $columns = $columnsByTable[$tableCacheKey];
+            if ($columns === null) {
+                $errors[$table['error_key']][] = "Unable to inspect required database columns for table '{$tableName}'.";
+                continue;
+            }
+
+            $mappedColumns = $this->mappedDatabaseColumns((array) ($table['data_params'] ?? []));
+            $automaticallyProvided = trim((string) ($table['foreign_key'] ?? ''));
+
+            foreach ($columns as $column) {
+                if (! is_array($column) || ! $this->isRequiredInsertColumn($column)) {
+                    continue;
+                }
+
+                $columnName = trim((string) ($column['name'] ?? ''));
+                if ($columnName === '' || isset($mappedColumns[strtolower($columnName)])) {
+                    continue;
+                }
+
+                // Child foreign keys are populated from the resolved parent
+                // context and must not require a duplicate mapping row.
+                if ($automaticallyProvided !== '' && strcasecmp($automaticallyProvided, $columnName) === 0) {
+                    continue;
+                }
+
+                $errors[$table['error_key']][] = "Required database column '{$columnName}' in table '{$tableName}' must be mapped.";
+            }
+        }
+
+        return $errors;
+    }
+
+    /**
+     * @return array<int, array{table_name:string, import_mode:string, data_params:array<mixed>, foreign_key:?string, error_key:string}>
+     */
+    protected function configuredImportTables(array $payload, ?ImportConfig $existingConfig = null): array
+    {
+        $tables = [];
+        $masters = (array) ($payload['master_parents'] ?? []);
+
+        if ($masters !== []) {
+            foreach ($masters as $masterIndex => $master) {
+                if (! is_array($master)) {
+                    continue;
+                }
+
+                $mode = strtoupper(trim((string) ($master['import_mode'] ?? $payload['import_mode'] ?? 'UPSERT')));
+                $tables[] = [
+                    'table_name' => (string) ($master['table_name'] ?? ''),
+                    'import_mode' => $mode,
+                    'data_params' => (array) ($master['data_params'] ?? []),
+                    'foreign_key' => null,
+                    'error_key' => 'masters.' . $masterIndex . '.mappings',
+                ];
+                foreach ((array) ($master['children'] ?? []) as $childIndex => $child) {
+                    if (! is_array($child)) {
+                        continue;
+                    }
+                    $tables[] = [
+                        'table_name' => (string) ($child['table_name'] ?? ''),
+                        'import_mode' => $mode,
+                        'data_params' => (array) ($child['data_params'] ?? []),
+                        'foreign_key' => $this->nullableString($child['foreign_key'] ?? null),
+                        'error_key' => 'masters.' . $masterIndex . '.children.' . $childIndex . '.mappings',
+                    ];
+                }
+            }
+
+            return $tables;
+        }
+
+        $mode = strtoupper(trim((string) ($payload['import_mode'] ?? $existingConfig?->import_mode ?? 'UPSERT')));
+        if (is_array($payload['parent_table'] ?? null)) {
+            $parent = $payload['parent_table'];
+            $tables[] = [
+                'table_name' => (string) ($parent['table_name'] ?? ''),
+                'import_mode' => $mode,
+                'data_params' => (array) ($parent['data_params'] ?? []),
+                'foreign_key' => null,
+                'error_key' => 'parent_table.mappings',
+            ];
+        }
+        foreach ((array) ($payload['child_tables'] ?? []) as $childIndex => $child) {
+            if (! is_array($child)) {
+                continue;
+            }
+            $tables[] = [
+                'table_name' => (string) ($child['table_name'] ?? ''),
+                'import_mode' => $mode,
+                'data_params' => (array) ($child['data_params'] ?? []),
+                'foreign_key' => $this->nullableString($child['foreign_key'] ?? null),
+                'error_key' => 'child_tables.' . $childIndex . '.mappings',
+            ];
+        }
+
+        if ($tables !== [] || $existingConfig === null) {
+            return $tables;
+        }
+
+        $existingConfig->loadMissing('masterParents.children', 'parentTable', 'childTables');
+        foreach ($existingConfig->masterParents as $masterIndex => $master) {
+            $masterMode = strtoupper(trim((string) ($master->import_mode ?: $existingConfig->import_mode ?: 'UPSERT')));
+            $tables[] = [
+                'table_name' => (string) $master->table_name,
+                'import_mode' => $masterMode,
+                'data_params' => (array) $master->data_params,
+                'foreign_key' => null,
+                'error_key' => 'masters.' . $masterIndex . '.mappings',
+            ];
+            foreach ($master->children as $childIndex => $child) {
+                $tables[] = [
+                    'table_name' => (string) $child->table_name,
+                    'import_mode' => $masterMode,
+                    'data_params' => (array) $child->data_params,
+                    'foreign_key' => $this->nullableString($child->foreign_key),
+                    'error_key' => 'masters.' . $masterIndex . '.children.' . $childIndex . '.mappings',
+                ];
+            }
+        }
+
+        return $tables;
+    }
+
+    /** @return array<string, true> */
+    protected function mappedDatabaseColumns(array $mappings): array
+    {
+        $mapped = [];
+        foreach ($mappings as $key => $mapping) {
+            $column = is_array($mapping) ? ($mapping['column'] ?? $key) : $key;
+            $source = is_array($mapping)
+                ? ($mapping['value'] ?? $mapping['path'] ?? $mapping['source'] ?? null)
+                : $mapping;
+            $column = trim((string) $column);
+            if ($column === '' || ! $this->hasMappingSource($source)) {
+                continue;
+            }
+            $mapped[strtolower($column)] = true;
+        }
+
+        return $mapped;
+    }
+
+    protected function hasMappingSource(mixed $source): bool
+    {
+        return $source !== null && (! is_string($source) || trim($source) !== '');
+    }
+
+    /** @param array<string, mixed> $column */
+    protected function isRequiredInsertColumn(array $column): bool
+    {
+        if (! empty($column['nullable']) || array_key_exists('default', $column) && $column['default'] !== null) {
+            return false;
+        }
+
+        $extra = strtolower(trim((string) ($column['extra'] ?? '')));
+        return ! str_contains($extra, 'auto_increment')
+            && ! str_contains($extra, 'identity')
+            && ! str_contains($extra, 'generated');
     }
 
     protected function hasWorksheetBackedTable(array $payload): bool
@@ -564,13 +1110,23 @@ class ImportBuilderController extends Controller
         if ($isCreate || array_key_exists('after_execute_hook', $payload)) {
             $normalized['after_execute_hook'] = $this->nullableString($payload['after_execute_hook'] ?? null);
         }
+        foreach (['before_stage_hook', 'after_stage_hook', 'before_final_hook', 'after_final_hook'] as $hookKey) {
+            if ($isCreate || array_key_exists($hookKey, $payload)) {
+                $normalized[$hookKey] = $this->nullableString($payload[$hookKey] ?? null);
+            }
+        }
 
         return $normalized;
     }
 
     protected function normalizeIncomingPayload(array $payload): array
     {
-        foreach (['enabled', 'generate_before_execute_hook', 'generate_after_execute_hook'] as $booleanKey) {
+        foreach ([
+            'enabled',
+            'generate_before_execute_hook', 'generate_after_execute_hook',
+            'generate_before_stage_hook', 'generate_after_stage_hook',
+            'generate_before_final_hook', 'generate_after_final_hook',
+        ] as $booleanKey) {
             if (array_key_exists($booleanKey, $payload)) {
                 $payload[$booleanKey] = $this->normalizeBooleanValue($payload[$booleanKey]);
             }
@@ -594,10 +1150,20 @@ class ImportBuilderController extends Controller
 
     protected function prepareHookPayload(array $payload, bool $isCreate, ?ImportConfig $config = null): array
     {
-        foreach (['before', 'after'] as $type) {
-            $generateKey = 'generate_' . $type . '_execute_hook';
-            $pathKey = $type . '_execute_hook_path';
-            $legacyKey = $type . '_execute_hook';
+        $hooks = [
+            ['type' => 'before', 'generate' => 'generate_before_execute_hook', 'path' => 'before_execute_hook_path', 'config' => 'before_execute_hook'],
+            ['type' => 'after', 'generate' => 'generate_after_execute_hook', 'path' => 'after_execute_hook_path', 'config' => 'after_execute_hook'],
+            ['type' => 'before_stage', 'generate' => 'generate_before_stage_hook', 'path' => 'before_stage_hook_path', 'config' => 'before_stage_hook'],
+            ['type' => 'after_stage', 'generate' => 'generate_after_stage_hook', 'path' => 'after_stage_hook_path', 'config' => 'after_stage_hook'],
+            ['type' => 'before_final', 'generate' => 'generate_before_final_hook', 'path' => 'before_final_hook_path', 'config' => 'before_final_hook'],
+            ['type' => 'after_final', 'generate' => 'generate_after_final_hook', 'path' => 'after_final_hook_path', 'config' => 'after_final_hook'],
+        ];
+
+        foreach ($hooks as $hook) {
+            $type = $hook['type'];
+            $generateKey = $hook['generate'];
+            $pathKey = $hook['path'];
+            $configKey = $hook['config'];
 
             if (! $isCreate && ! array_key_exists($generateKey, $payload)) {
                 continue;
@@ -605,7 +1171,7 @@ class ImportBuilderController extends Controller
 
             $generate = (bool) ($payload[$generateKey] ?? false);
             if (! $generate) {
-                $payload[$legacyKey] = null;
+                $payload[$configKey] = null;
                 continue;
             }
 
@@ -620,7 +1186,7 @@ class ImportBuilderController extends Controller
                 ]);
             }
 
-            $payload[$legacyKey] = $hookClass;
+            $payload[$configKey] = $hookClass;
             $payload[$pathKey] = $hookClass;
         }
 
@@ -631,7 +1197,14 @@ class ImportBuilderController extends Controller
     {
         $cleanCode = preg_replace('/[^A-Za-z0-9]/', ' ', $code);
         $cleanCode = str_replace(' ', '', ucwords((string) $cleanCode));
-        $prefix = $type === 'before' ? 'BeforeExecute' : 'AfterExecute';
+        $prefix = match ($type) {
+            'before_stage' => 'BeforeStage',
+            'after_stage' => 'AfterStage',
+            'before_final' => 'BeforeFinal',
+            'after_final' => 'AfterFinal',
+            'before' => 'BeforeExecute',
+            default => 'AfterExecute',
+        };
 
         return 'App\\Hooks\\Import\\' . $prefix . $cleanCode . 'Hook';
     }
@@ -645,7 +1218,14 @@ class ImportBuilderController extends Controller
 
         if ($className === '' || ! preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $className)) {
             throw ValidationException::withMessages([
-                $type . '_execute_hook_path' => ['Generated hook path is invalid.'],
+                match ($type) {
+                    'before_stage' => 'before_stage_hook_path',
+                    'after_stage' => 'after_stage_hook_path',
+                    'before_final' => 'before_final_hook_path',
+                    'after_final' => 'after_final_hook_path',
+                    'before' => 'before_execute_hook_path',
+                    default => 'after_execute_hook_path',
+                } => ['Generated hook path is invalid.'],
             ]);
         }
 
@@ -655,10 +1235,11 @@ class ImportBuilderController extends Controller
         }
 
         File::ensureDirectoryExists(dirname($classPath));
-        $interface = $type === 'before'
+        $isBeforeHook = str_starts_with($type, 'before');
+        $interface = $isBeforeHook
             ? 'ImportBeforeExecuteHookInterface'
             : 'ImportAfterExecuteHookInterface';
-        $method = $type === 'before'
+        $method = $isBeforeHook
             ? <<<'METHOD'
     public function handle(
         array &$data,
@@ -699,16 +1280,33 @@ class ImportBuilderController extends Controller
          *     ]);
          * }
          *
-         * Example: return a custom import error with row context:
-         * throw new ApiHookException(
+         * Example: stop the whole import request with a custom response:
+         * throw new ImportHookException(
          *     409,
          *     'Data import tidak valid',
          *     [
-         *         'row' => 12,
-         *         'column' => 'email',
-         *         'reason' => 'Email sudah digunakan',
+         *         'reason' => 'Master tidak ditemukan',
          *     ],
          * );
+         *
+         * Before Stage only: reject one worksheet row and keep staging the
+         * remaining rows. This row error is saved in the staging batch:
+         * $childRows =& $data['masters'][0]['children'][0];
+         * foreach ($childRows as $index => &$rowInfo) {
+         *     $row =& $rowInfo['data'];
+         *     if (($row['Kode Barang *'] ?? null) === 'YGP.0001') {
+         *         throw new ImportRowValidationException(
+         *             masterIndex: 0,
+         *             type: 'child',
+         *             childIndex: 0,
+         *             rowIndex: $index,
+         *             errors: [
+         *                 'kode_barang' => ['Kode barang busuk.'],
+         *             ],
+         *         );
+         *     }
+         * }
+         * unset($row);
          */
     }
 METHOD
@@ -728,13 +1326,21 @@ METHOD
             'summary' => $data,
         ]);
 
+        /*
+         * ImportHookException also aborts After Stage/After Final processing.
+         * The surrounding staging/final transaction is rolled back:
+         * throw new ImportHookException(409, 'Import result cannot be completed.', [
+         *     'reason' => 'Audit requirement failed',
+         * ]);
+         */
+
         // Add audit fields or append additional summary data here.
         return $data;
     }
 METHOD;
-        $imports = $type === 'before'
-            ? "use ESolution\\DataSources\\Contracts\\{$interface};\nuse ESolution\\DataSources\\Exceptions\\ApiHookException;\nuse Illuminate\\Validation\\ValidationException;"
-            : "use ESolution\\DataSources\\Contracts\\{$interface};\nuse Illuminate\\Support\\Facades\\Log;";
+        $imports = $isBeforeHook
+            ? "use ESolution\\DataSources\\Contracts\\{$interface};\nuse ESolution\\DataSources\\Exceptions\\ImportHookException;\nuse ESolution\\DataSources\\Exceptions\\ImportRowValidationException;\nuse Illuminate\\Validation\\ValidationException;"
+            : "use ESolution\\DataSources\\Contracts\\{$interface};\nuse ESolution\\DataSources\\Exceptions\\ImportHookException;\nuse Illuminate\\Support\\Facades\\Log;";
 
         $content = "<?php\n\nnamespace App\\Hooks\\Import;\n\nuse ESolution\\DataSources\\Models\\ImportConfig;\nuse Illuminate\\Http\\Request;\n{$imports}\n\nclass {$className} implements {$interface}\n{\n{$method}}\n";
         File::put($classPath, $content);

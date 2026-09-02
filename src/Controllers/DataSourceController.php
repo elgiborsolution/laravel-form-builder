@@ -1400,11 +1400,30 @@ class DataSourceController extends Controller
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
         $columnList = $this->databaseMetadataProvider->listColumns((string) $table, $connectionName);
         $hasDeletedAt = $this->tableHasColumn((string) $table, 'deleted_at', $connectionName, $columnList);
+        $indexes = $this->databaseMetadataProvider->listIndexes((string) $table, $connectionName);
+        $groupedIndexes = [];
+        foreach ($indexes as $index) {
+          if (empty($index['unique']) || ! empty($index['primary'])) {
+            continue;
+          }
+          $indexName = trim((string) ($index['name'] ?? ''));
+          $columnName = trim((string) ($index['column'] ?? ''));
+          if ($indexName !== '' && $columnName !== '') {
+            $groupedIndexes[$indexName][] = $columnName;
+          }
+        }
+        $singleColumnUniqueColumns = [];
+        foreach ($groupedIndexes as $indexColumns) {
+          if (count($indexColumns) === 1) {
+            $singleColumnUniqueColumns[] = $indexColumns[0];
+          }
+        }
 
         return response()->json([
           'data' => $columnList,
           'meta' => [
             'has_deleted_at' => $hasDeletedAt,
+            'single_column_unique_columns' => $singleColumnUniqueColumns,
           ],
         ]);
       } catch (\Exception $e) {
