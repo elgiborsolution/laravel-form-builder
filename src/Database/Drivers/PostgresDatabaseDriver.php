@@ -68,6 +68,8 @@ class PostgresDatabaseDriver implements DatabaseDriver
                     c.is_nullable AS is_nullable,
                     c.column_default AS column_default,
                     c.udt_name AS udt_name,
+                    c.is_identity AS is_identity,
+                    c.is_generated AS is_generated,
                     c.ordinal_position AS ordinal_position
              FROM information_schema.columns c
              WHERE c.table_catalog = current_database()
@@ -91,6 +93,14 @@ class PostgresDatabaseDriver implements DatabaseDriver
                 $key = 'MUL';
             }
 
+            $extra = [];
+            if (strtoupper((string) ($row->is_identity ?? 'NO')) === 'YES') {
+                $extra[] = 'identity';
+            }
+            if (strtoupper((string) ($row->is_generated ?? 'NEVER')) !== 'NEVER') {
+                $extra[] = 'generated';
+            }
+
             return [
                 'name' => $name,
                 'type' => (string) $row->data_type,
@@ -99,7 +109,7 @@ class PostgresDatabaseDriver implements DatabaseDriver
                 'key' => $key,
                 'primary' => isset($primaryColumns[$name]),
                 'foreign' => isset($foreignColumns[$name]),
-                'extra' => '',
+                'extra' => implode(' ', $extra),
             ];
         }, $rows));
     }

@@ -19,7 +19,7 @@ class ImportConfigResolver
             self::cacheKey($endpoint),
             now()->addSeconds((int) config('datasources.cache.dynamic_api_ttl', 60)),
             static fn (): ?ImportConfig => ImportConfig::query()
-                ->with(['parentTable', 'childTables'])
+                ->with(['parentTable', 'childTables', 'masterParents.children'])
                 ->where('enabled', true)
                 ->where('endpoint', $endpoint)
                 ->first()

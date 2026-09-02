@@ -234,6 +234,12 @@ class DataSourcesServiceProvider extends ServiceProvider
                         Route::post('import/{endpoint}/test', [ImportBuilderController::class, 'test'])
                             ->where('endpoint', '.+')
                             ->name('import.test');
+                        Route::get('import/{endpoint}/temporary/{importUuid}', [ImportBuilderController::class, 'temporary'])
+                            ->where('endpoint', '.+')
+                            ->name('import.temporary');
+                        Route::post('import/{endpoint}/stage', [ImportBuilderController::class, 'stage'])
+                            ->where('endpoint', '.+')
+                            ->name('import.stage');
                         Route::post('import/{endpoint}', [ImportBuilderController::class, 'import'])
                             ->where('endpoint', '.+')
                             ->name('import.execute');

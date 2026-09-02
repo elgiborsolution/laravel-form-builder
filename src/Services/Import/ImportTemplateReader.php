@@ -281,7 +281,14 @@ class ImportTemplateReader
                 $maxIndex = max($maxIndex, $index);
             }
 
-            if ($maxIndex >= 0) {
+            $hasCellValue = array_filter($current, static fn ($value): bool => trim((string) $value) !== '') !== [];
+            if ($maxIndex >= 0 && $hasCellValue) {
+                ksort($current);
+                // Preserve Excel column positions when a row has gaps (for
+                // example a value only in column C).
+                for ($columnIndex = 0; $columnIndex <= $maxIndex; $columnIndex++) {
+                    $current[$columnIndex] = $current[$columnIndex] ?? '';
+                }
                 ksort($current);
                 $rows[] = [
                     'row' => $rowNumber > 0 ? $rowNumber : count($rows) + 1,
@@ -383,18 +390,29 @@ class ImportTemplateReader
         $headerRowIndex = null;
         $headerValues = [];
 
-        foreach ($rows as $index => $rowInfo) {
+        // Scan the initial portion of each sheet. A report title is commonly
+        // one merged/non-empty cell, while a tabular header has several cells.
+        $fallback = null;
+        foreach (array_slice($rows, 0, 50, true) as $index => $rowInfo) {
             $row = (array) ($rowInfo['values'] ?? []);
             $normalized = array_values(array_map(static fn ($value) => trim((string) $value), $row));
-            $hasValue = array_filter($normalized, static fn ($value) => $value !== '');
-            if ($hasValue !== []) {
+            $nonEmpty = array_values(array_filter($normalized, static fn ($value) => $value !== ''));
+            if ($nonEmpty === []) {
+                continue;
+            }
+            $fallback ??= [$index, $normalized];
+            if (count($nonEmpty) >= 2) {
                 $headerRowIndex = $index;
                 $headerValues = $normalized;
                 break;
             }
         }
 
-        $headerRow = $headerRowIndex !== null ? $headerRowIndex + 1 : 1;
+        if ($headerRowIndex === null && $fallback !== null) {
+            [$headerRowIndex, $headerValues] = $fallback;
+        }
+
+        $headerRow = $headerRowIndex !== null ? (int) ($rows[$headerRowIndex]['row'] ?? ($headerRowIndex + 1)) : 1;
         $headers = [];
 
         foreach ($headerValues as $columnIndex => $header) {
