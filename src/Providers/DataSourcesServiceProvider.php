@@ -166,6 +166,10 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->names($this->resourceRouteNames('management.data-source'));
                 Route::apiResource('data-picker', DataPickerController::class)
                     ->names($this->resourceRouteNames('management.data-picker'));
+                Route::post('table-builder/custom-api/test', [DataTableBuilderController::class, 'testCustomApi'])
+                    ->name('management.table-builder.custom-api.test');
+                Route::post('table-builder/custom-api/execute', [DataTableBuilderController::class, 'executeCustomApi'])
+                    ->name('management.table-builder.custom-api.execute');
                 Route::apiResource('table-builder', DataTableBuilderController::class)
                     ->names($this->resourceRouteNames('management.table-builder'));
                 Route::apiResource('api-config', DataAPIBuilderController::class)

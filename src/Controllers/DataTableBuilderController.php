@@ -8,6 +8,7 @@ use ESolution\DataSources\Support\DatabaseConnection;
 use Illuminate\Http\Request;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Http;
 
 class DataTableBuilderController extends Controller
 {
@@ -129,11 +130,14 @@ class DataTableBuilderController extends Controller
           }
       }
 
+      $sourceType = (string) $request->input('params.source_type', 'data_source');
       $validateParams = [
         'enable_no' => 'nullable|boolean',
         'pagination' => 'nullable|boolean',
-        'data_source_id' => 'required|integer',
-        'data_source_name' => 'required|string'
+        'source_type' => 'nullable|in:data_source,custom_api',
+        'data_source_id' => $sourceType === 'custom_api' ? 'nullable|integer' : 'required|integer',
+        'data_source_name' => $sourceType === 'custom_api' ? 'nullable|string' : 'required|string',
+        'api_config' => $sourceType === 'custom_api' ? 'required|array' : 'nullable|array',
       ];
       // foreach ($request->params as $key => $value) {
 
@@ -145,6 +149,117 @@ class DataTableBuilderController extends Controller
       // }
 
       return null;
+  }
+
+  public function testCustomApi(Request $request)
+  {
+    $config = $request->validate(['api_config' => 'required|array'])['api_config'];
+
+    try {
+      $rows = $this->executeCustomApiConfig($request, $config);
+      return response()->json(['data' => $rows, 'count' => count($rows), 'message' => 'API connection successful. ' . count($rows) . ' records found.']);
+    } catch (\Throwable $exception) {
+      return response()->json(['message' => 'API request failed: ' . $this->safeApiErrorMessage($exception)], 422);
+    }
+  }
+
+  public function executeCustomApi(Request $request)
+  {
+    $validated = $request->validate([
+      'api_config' => 'required|array',
+      'runtime_params' => 'nullable|array',
+      'page' => 'nullable|integer|min:1',
+      'per_page' => 'nullable|integer|min:1|max:100',
+    ]);
+    $config = $validated['api_config'];
+
+    try {
+      $rows = $this->executeCustomApiConfig($request, $config, $validated['runtime_params'] ?? []);
+      $total = count($rows);
+      $perPage = max(1, min(100, (int) ($validated['per_page'] ?? 10)));
+      $currentPage = max(1, (int) ($validated['page'] ?? 1));
+      $offset = ($currentPage - 1) * $perPage;
+      return response()->json([
+        'data' => array_slice($rows, $offset, $perPage),
+        'total' => $total,
+        'current_page' => $currentPage,
+        'per_page' => $perPage,
+      ]);
+    } catch (\Throwable $exception) {
+      return response()->json(['message' => 'API request failed: ' . $this->safeApiErrorMessage($exception)], 422);
+    }
+  }
+
+  protected function executeCustomApiConfig(Request $request, array $config, array $runtimeParams = []): array
+  {
+    $validator = Validator::make($config, [
+      'type' => 'required|in:internal,external',
+      'method' => 'required|in:GET,POST,PUT,PATCH,DELETE',
+      'url' => 'required|string|max:2048',
+      'headers' => 'nullable|array', 'headers.*.key' => 'nullable|string|max:255', 'headers.*.value' => 'nullable|string|max:4096',
+      'query_params' => 'nullable|array', 'query_params.*.key' => 'nullable|string|max:255', 'query_params.*.value' => 'nullable',
+      'body_params' => 'nullable|array', 'body_params.*.key' => 'nullable|string|max:255', 'body_params.*.value' => 'nullable',
+      'response_data_path' => 'nullable|string|max:255',
+    ]);
+    $validator->validate();
+
+    $url = trim((string) $config['url']);
+    if ($config['type'] === 'internal') {
+      if (! str_starts_with($url, '/')) throw new \InvalidArgumentException('Internal routes must start with /.');
+      $url = rtrim((string) config('app.url'), '/') . '/' . ltrim($url, '/');
+    } elseif (! filter_var($url, FILTER_VALIDATE_URL) || ! preg_match('/^https?:\/\//i', $url)) {
+      throw new \InvalidArgumentException('External API URL must be a valid HTTP(S) URL.');
+    }
+
+    $headers = $this->keyValueRows($config['headers'] ?? []);
+    if ($config['type'] === 'internal') {
+      foreach (['authorization', 'x-tenant'] as $header) {
+        if ($request->headers->has($header) && ! isset($headers[$header])) $headers[$header] = $request->header($header);
+      }
+    }
+    $query = $this->keyValueRows($config['query_params'] ?? []);
+    foreach ($runtimeParams as $key => $value) {
+      if (is_string($key) && $key !== '' && ! is_array($value) && ! is_object($value)) $query[$key] = $value;
+    }
+    $body = $this->keyValueRows($config['body_params'] ?? []);
+    $method = strtoupper((string) $config['method']);
+    $client = Http::timeout(20)->withHeaders($headers);
+    $response = in_array($method, ['POST', 'PUT', 'PATCH'], true)
+      ? $client->send($method, $url, ['query' => $query, 'json' => $body])
+      : $client->send($method, $url, ['query' => $query]);
+
+    if (! $response->successful()) throw new \RuntimeException($response->status() === 401 ? 'Unauthorized.' : 'Request was rejected.');
+    $payload = $response->json();
+    $rows = $this->resolveResponseDataPath($payload, (string) ($config['response_data_path'] ?? ''));
+    if (! is_array($rows) || ! array_is_list($rows)) throw new \RuntimeException('Response data path must resolve to an array.');
+
+    return $rows;
+  }
+
+  protected function keyValueRows(array $rows): array
+  {
+    $values = [];
+    foreach ($rows as $row) {
+      $key = trim((string) ($row['key'] ?? ''));
+      if ($key !== '') $values[$key] = $row['value'] ?? null;
+    }
+    return $values;
+  }
+
+  protected function resolveResponseDataPath(mixed $payload, string $path): mixed
+  {
+    if (trim($path) === '') return $payload;
+    foreach (explode('.', trim($path)) as $segment) {
+      if (! is_array($payload) || ! array_key_exists($segment, $payload)) return null;
+      $payload = $payload[$segment];
+    }
+    return $payload;
+  }
+
+  protected function safeApiErrorMessage(\Throwable $exception): string
+  {
+    $message = $exception->getMessage();
+    return $message !== '' && strlen($message) <= 160 ? $message : 'Unable to complete the request.';
   }
 
   /**
