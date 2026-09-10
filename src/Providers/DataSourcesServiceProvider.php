@@ -170,6 +170,10 @@ class DataSourcesServiceProvider extends ServiceProvider
                     ->name('management.table-builder.custom-api.test');
                 Route::post('table-builder/custom-api/execute', [DataTableBuilderController::class, 'executeCustomApi'])
                     ->name('management.table-builder.custom-api.execute');
+                Route::post('table-builder/export', [DataTableBuilderController::class, 'export'])
+                    ->name('management.table-builder.export');
+                Route::post('table-builder/import', [DataTableBuilderController::class, 'import'])
+                    ->name('management.table-builder.import');
                 Route::apiResource('table-builder', DataTableBuilderController::class)
                     ->names($this->resourceRouteNames('management.table-builder'));
                 Route::apiResource('api-config', DataAPIBuilderController::class)

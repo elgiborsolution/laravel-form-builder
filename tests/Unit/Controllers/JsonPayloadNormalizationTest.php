@@ -17,6 +17,15 @@ class JsonPayloadNormalizationTest extends TestCase
         $this->assertSame($expected, $this->makeTableBuilderController()->exposeNormalizeJsonPayload($input));
     }
 
+    public function test_internal_custom_api_requests_cannot_reenter_test_or_executor_routes(): void
+    {
+        $controller = $this->makeTableBuilderController();
+
+        $this->assertTrue($controller->exposeIsCustomApiInternalEndpoint('/api/table-builder/custom-api/test'));
+        $this->assertTrue($controller->exposeIsCustomApiInternalEndpoint('/api/table-builder/custom-api/execute'));
+        $this->assertFalse($controller->exposeIsCustomApiInternalEndpoint('/api/agama'));
+    }
+
     public static function payloadProvider(): array
     {
         return [
@@ -86,5 +95,10 @@ class TestableDataTableBuilderController extends DataTableBuilderController
     public function exposeNormalizeJsonPayload(mixed $value): mixed
     {
         return $this->normalizeJsonPayload($value);
+    }
+
+    public function exposeIsCustomApiInternalEndpoint(string $url): bool
+    {
+        return $this->isCustomApiInternalEndpoint($url);
     }
 }
