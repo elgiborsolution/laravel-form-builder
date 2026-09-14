@@ -105,13 +105,13 @@ The backend ignores any incoming `database_scope` value and sets it from the cur
 Test an Import Builder workbook without committing any parent or child records:
 
 ```http
-POST /api/import/{endpoint}/test
+POST /api/{importPath}/import/test
 Content-Type: multipart/form-data
 ```
 
 Send the completed workbook in the `file` field. The endpoint uses the same
 request connection, template reader, mapping, validation, hooks, and
-parent/child processing as `POST /api/import/{endpoint}`, but always rolls the
+parent/child processing as `POST /api/{importPath}/import`, but always rolls the
 transaction back.
 
 Successful requests use the standard response envelope and return original

@@ -38,6 +38,9 @@ class ImportConfigResolver
 
     public function normalizeEndpoint(?string $endpoint): string
     {
-        return trim((string) $endpoint, '/');
+        $endpoint = trim((string) $endpoint);
+        $endpoint = trim($endpoint, '/');
+
+        return preg_replace('#/+#', '/', $endpoint) ?? '';
     }
 }
