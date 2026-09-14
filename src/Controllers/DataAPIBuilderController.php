@@ -8,6 +8,7 @@ use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use ESolution\DataSources\Rules\DoesNotEndWithImport;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
@@ -1608,6 +1609,7 @@ class DataAPIBuilderController extends Controller
       'endpoint' => [
           'required',
           'string',
+          new DoesNotEndWithImport(),
           function (string $attribute, mixed $value, \Closure $fail): void {
               if ($this->resolver->isReservedEndpoint((string) $value)) {
                   $fail('The endpoint conflicts with a reserved package route.');
@@ -1822,6 +1824,7 @@ class DataAPIBuilderController extends Controller
       'endpoint' => [
           'required',
           'string',
+          new DoesNotEndWithImport(),
           function (string $attribute, mixed $value, \Closure $fail): void {
               if ($this->resolver->isReservedEndpoint((string) $value)) {
                   $fail('The endpoint conflicts with a reserved package route.');

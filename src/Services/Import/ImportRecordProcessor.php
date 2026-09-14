@@ -56,9 +56,9 @@ class ImportRecordProcessor
     /**
      * Execute the complete import flow in a transaction which is always rolled back.
      */
-    public function test(ImportConfig $config, Request $request): array
+    public function test(ImportConfig $config, Request $request, int $previewLimit = 100): array
     {
-        return $this->processImport($config, $request, true);
+        return $this->processImport($config, $request, true, false, $previewLimit);
     }
 
     /** Build, validate, and execute the existing flow in a rollback-only transaction. */
@@ -100,7 +100,13 @@ class ImportRecordProcessor
         finally { $this->skipPersistenceValidation = false; }
     }
 
-    protected function processImport(ImportConfig $config, Request $request, bool $rollbackOnly = false, bool $includeDataset = false): array
+    protected function processImport(
+        ImportConfig $config,
+        Request $request,
+        bool $rollbackOnly = false,
+        bool $includeDataset = false,
+        ?int $previewLimit = null
+    ): array
     {
         $this->failFastNonWorksheetParent = false;
         $uploadedFile = $request->file('file');
@@ -196,7 +202,7 @@ class ImportRecordProcessor
             }
             if ($rollbackOnly) {
                 $connection->rollBack();
-                $result = $this->buildTestResult($originalDataset, $config, $summary);
+                $result = $this->buildTestResult($originalDataset, $config, $summary, $previewLimit);
                 if ($includeDataset) { $result['staging_dataset'] = $dataset; }
                 return $result;
             }
@@ -1735,8 +1741,9 @@ class ImportRecordProcessor
      * Convert the normal processor summary into a source-row report without
      * exposing mapped payloads or committing the transaction.
      */
-    protected function buildTestResult(array $dataset, ImportConfig $config, array $summary): array
+    protected function buildTestResult(array $dataset, ImportConfig $config, array $summary, ?int $previewLimit = null): array
     {
+        $previewLimit = $previewLimit === null ? null : max(1, $previewLimit);
         $errorsByRow = [];
         foreach ((array) ($summary['errors'] ?? []) as $error) {
             $master = (string) ($error['master'] ?? '');
@@ -1747,27 +1754,35 @@ class ImportRecordProcessor
 
         $rows = [];
         $masters = [];
-        $appendRows = function (array $sourceRows, string $master, string $worksheet) use (&$rows, $errorsByRow): array {
+        $total = 0;
+        $failed = 0;
+        $appendRows = function (array $sourceRows, string $master, string $worksheet) use (&$rows, &$total, &$failed, $errorsByRow, $previewLimit): array {
             $result = ['success' => 0, 'failed' => 0];
             foreach ($sourceRows as $rowInfo) {
                 $rowNumber = (int) ($rowInfo['row'] ?? 0);
                 $rowErrors = $errorsByRow[$master . ':' . $worksheet . ':' . $rowNumber] ?? [];
                 $status = $rowErrors === [] ? 'success' : 'failed';
-                $rows[] = [
-                    'master' => $master,
-                    'worksheet' => $worksheet,
-                    'row' => $rowNumber,
-                    'data' => (array) ($rowInfo['data'] ?? []),
-                    'status' => $status,
-                    'reason' => $rowErrors[0]['message'] ?? null,
-                    'errors' => array_map(static function (array $error): array {
-                        return array_filter([
-                            'column' => $error['column'] ?? null,
-                            'message' => $error['message'] ?? null,
-                            'errors' => $error['errors'] ?? null,
-                        ], static fn ($value): bool => $value !== null && $value !== []);
-                    }, $rowErrors),
-                ];
+                $total++;
+                if ($status === 'failed') {
+                    $failed++;
+                }
+                if ($previewLimit === null || count($rows) < $previewLimit) {
+                    $rows[] = [
+                        'master' => $master,
+                        'worksheet' => $worksheet,
+                        'row' => $rowNumber,
+                        'data' => (array) ($rowInfo['data'] ?? []),
+                        'status' => $status,
+                        'reason' => $rowErrors[0]['message'] ?? null,
+                        'errors' => array_map(static function (array $error): array {
+                            return array_filter([
+                                'column' => $error['column'] ?? null,
+                                'message' => $error['message'] ?? null,
+                                'errors' => $error['errors'] ?? null,
+                            ], static fn ($value): bool => $value !== null && $value !== []);
+                        }, $rowErrors),
+                    ];
+                }
                 $result[$status]++;
             }
             return $result;
@@ -1797,14 +1812,17 @@ class ImportRecordProcessor
             ];
         }
 
-        $failed = count(array_filter($rows, static fn (array $row): bool => $row['status'] === 'failed'));
-
         return [
-            'total' => count($rows),
-            'success' => count($rows) - $failed,
+            'total' => $total,
+            'success' => $total - $failed,
             'failed' => $failed,
             'masters' => $masters,
             'rows' => $rows,
+            'preview' => [
+                'limit' => $previewLimit,
+                'returned_rows' => count($rows),
+                'truncated' => $previewLimit !== null && $total > count($rows),
+            ],
         ];
     }
 
@@ -1841,7 +1859,7 @@ class ImportRecordProcessor
         return $this->applyAfterHook($hook, $config, $request, $summary);
     }
 
-    /** Run only for POST /api/import/{code}/stage before staging data is prepared. */
+    /** Run only for POST /api/{code}/import/stage before staging data is prepared. */
     protected function applyBeforeStageHook(ImportConfig $config, array &$data, Request $request): void
     {
         try {

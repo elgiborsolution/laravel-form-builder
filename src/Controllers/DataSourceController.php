@@ -12,6 +12,7 @@ use ESolution\DataSources\Services\CustomQueryService;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use ESolution\DataSources\Rules\DoesNotEndWithImport;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\File;
@@ -422,6 +423,7 @@ class DataSourceController extends Controller
       'name' => [
         'required',
         'string',
+        new DoesNotEndWithImport(),
         'unique:' . DatabaseConnection::validationTable('data_sources') . ',name',
         function (string $attribute, mixed $value, \Closure $fail): void {
           $message = $this->validateRouteTemplate((string) $value);
@@ -676,7 +678,12 @@ class DataSourceController extends Controller
     ]);
 
     $validated = $request->validate([
-      'name' => 'required|string|unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id ,
+      'name' => [
+        'required',
+        'string',
+        new DoesNotEndWithImport(),
+        'unique:' . DatabaseConnection::validationTable('data_sources') . ',name,'. $dataSource->id,
+      ],
       'use_custom_query' => 'boolean',
       'use_soft_delete' => ['nullable', 'boolean'],
       'response_type' => ['nullable', 'string', Rule::in(['array', 'object'])],

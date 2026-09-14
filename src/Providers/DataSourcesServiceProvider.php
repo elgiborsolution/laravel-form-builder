@@ -236,20 +236,24 @@ class DataSourcesServiceProvider extends ServiceProvider
             ->group(function (): void {
                 Route::middleware([ForceDatabaseConnection::class])
                     ->group(function (): void {
-                        Route::get('import/{endpoint}/template', [ImportBuilderController::class, 'downloadTemplate'])
-                            ->where('endpoint', '.+')
+                        // Keep Import Builder routes ahead of the generic API
+                        // dispatcher below. The fixed /import suffix makes a
+                        // multi-segment import path unambiguous.
+                        Route::get('{endpoint}/import/template', [ImportBuilderController::class, 'downloadTemplate'])
+                            ->where('endpoint', '.*')
                             ->name('import.template');
-                        Route::post('import/{endpoint}/test', [ImportBuilderController::class, 'test'])
-                            ->where('endpoint', '.+')
+                        Route::post('{endpoint}/import/test', [ImportBuilderController::class, 'test'])
+                            ->where('endpoint', '.*')
                             ->name('import.test');
-                        Route::get('import/{endpoint}/temporary/{importUuid}', [ImportBuilderController::class, 'temporary'])
-                            ->where('endpoint', '.+')
+                        Route::get('{endpoint}/import/temporary/{importUuid}', [ImportBuilderController::class, 'temporary'])
+                            ->where('endpoint', '.*')
+                            ->whereUuid('importUuid')
                             ->name('import.temporary');
-                        Route::post('import/{endpoint}/stage', [ImportBuilderController::class, 'stage'])
-                            ->where('endpoint', '.+')
+                        Route::post('{endpoint}/import/stage', [ImportBuilderController::class, 'stage'])
+                            ->where('endpoint', '.*')
                             ->name('import.stage');
-                        Route::post('import/{endpoint}', [ImportBuilderController::class, 'import'])
-                            ->where('endpoint', '.+')
+                        Route::post('{endpoint}/import', [ImportBuilderController::class, 'import'])
+                            ->where('endpoint', '.*')
                             ->name('import.execute');
                     });
                 Route::any('{dynamicPath}', [ApiController::class, 'handleRequest'])

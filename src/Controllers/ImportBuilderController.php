@@ -601,7 +601,8 @@ class ImportBuilderController extends Controller
         }
 
         try {
-            $result = $this->processor->test($config, $request);
+            $previewLimit = min(max((int) $request->input('preview_limit', 100), 1), 200);
+            $result = $this->processor->test($config, $request, $previewLimit);
         } catch (ImportHookException $exception) {
             return $this->importHookResponse($exception);
         } catch (ValidationException $exception) {
@@ -630,6 +631,7 @@ class ImportBuilderController extends Controller
                 $isCreate ? 'required' : 'sometimes',
                 'string',
                 'max:255',
+                'regex:/^(?!\.{1,2}(?:\/|$))(?!.*\/\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/',
                 Rule::unique(DatabaseConnection::validationTable('import_configs'), 'endpoint')->ignore($config?->id),
             ],
             'import_mode' => ['required', Rule::in(['INSERT', 'UPDATE', 'UPSERT'])],
@@ -1090,7 +1092,7 @@ class ImportBuilderController extends Controller
             $normalized['description'] = $this->nullableString($payload['description'] ?? null);
         }
         if ($isCreate || array_key_exists('endpoint', $payload)) {
-            $normalized['endpoint'] = trim((string) ($payload['endpoint'] ?? ''));
+            $normalized['endpoint'] = $this->normalizeImportEndpoint($payload['endpoint'] ?? '');
         }
         if ($isCreate || array_key_exists('import_mode', $payload)) {
             $normalized['import_mode'] = strtoupper(trim((string) ($payload['import_mode'] ?? 'UPSERT'))) ?: 'UPSERT';
@@ -1121,6 +1123,10 @@ class ImportBuilderController extends Controller
 
     protected function normalizeIncomingPayload(array $payload): array
     {
+        if (array_key_exists('endpoint', $payload)) {
+            $payload['endpoint'] = $this->normalizeImportEndpoint($payload['endpoint']);
+        }
+
         foreach ([
             'enabled',
             'generate_before_execute_hook', 'generate_after_execute_hook',
@@ -1535,5 +1541,14 @@ METHOD;
     {
         $value = trim((string) ($value ?? ''));
         return $value === '' ? null : $value;
+    }
+
+    /** Keep a configured import path canonical without removing inner segments. */
+    protected function normalizeImportEndpoint(mixed $endpoint): string
+    {
+        $endpoint = trim((string) $endpoint);
+        $endpoint = trim($endpoint, '/');
+
+        return preg_replace('#/+#', '/', $endpoint) ?? '';
     }
 }
