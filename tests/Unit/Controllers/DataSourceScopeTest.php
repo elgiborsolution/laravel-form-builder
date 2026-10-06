@@ -3,6 +3,10 @@
 namespace ESolution\DataSources\Tests\Unit\Controllers;
 
 use ESolution\DataSources\Controllers\DataSourceController;
+use ESolution\DataSources\Controllers\DataAPIBuilderController;
+use ESolution\DataSources\Controllers\ApiController;
+use ESolution\DataSources\Models\ApiConfig;
+use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Database\Drivers\MySqlDatabaseDriver;
 use ESolution\DataSources\Models\DataSource;
 use ESolution\DataSources\Services\CustomQueryService;
@@ -13,6 +17,8 @@ use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseDriverResolver;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use Illuminate\Config\Repository;
+use Illuminate\Cache\ArrayStore;
+use Illuminate\Cache\Repository as CacheRepository;
 use Illuminate\Container\Container;
 use Illuminate\Database\Capsule\Manager;
 use Illuminate\Database\Schema\Blueprint;
@@ -58,6 +64,7 @@ class DataSourceScopeTest extends TestCase
         $capsule->bootEloquent();
         $this->app->instance('db', $capsule->getDatabaseManager());
         $this->app->instance('log', new NullLogger());
+        $this->app->instance('cache', new CacheRepository(new ArrayStore()));
         $this->app->instance(\Illuminate\Contracts\Routing\ResponseFactory::class, new class {
             public function json(mixed $data, int $status = 200): \Illuminate\Http\JsonResponse
             {
@@ -382,11 +389,164 @@ class DataSourceScopeTest extends TestCase
     {
         $this->scope->enabled = false;
         $this->assertFalse($this->scope->tenancyEnabled());
-        $this->create('central');
+        // The legacy Add New create flow omits scope and tenant fields.
+        $response = $this->controller->store($this->request([
+            'name' => 'normal-non-tenancy-api', 'use_custom_query' => false,
+            'table_name' => 'items', 'columns' => ['id', 'name'],
+        ], '', 'POST'));
+        $this->assertSame(201, $response->getStatusCode());
+        $this->assertSame('central', DataSource::findOrFail($response->getData()->id)->database_scope);
         $this->assertContains('central_only', $this->controller->listTables($this->request(['database_scope' => 'central']))->getData(true)['data']);
         $this->expectException(ValidationException::class);
         $this->create('tenant', '', 'a');
     }
+
+    private function apiBuilder(): ScopeFixtureApiBuilderController
+    {
+        return new ScopeFixtureApiBuilderController($this->createMock(DynamicApiConfigResolver::class),
+            $this->createMock(DynamicVariableParser::class), new ScopeFixtureMetadata(), $this->scope);
+    }
+
+    public function test_api_builder_lists_and_searches_both_scopes_in_both_login_contexts(): void
+    {
+        $schema = DB::connection('central')->getSchemaBuilder();
+        $schema->create('api_configs', function (Blueprint $table): void {
+            $table->id();
+            foreach (['database_scope', 'route_name', 'endpoint', 'method', 'description'] as $column) $table->string($column);
+        });
+        foreach (['api_tables', 'api_permissions'] as $name) {
+            $schema->create($name, function (Blueprint $table): void {
+                $table->id(); $table->integer('api_config_id'); $table->integer('parent_id')->default(0);
+            });
+        }
+        $schema->table('api_hooks', fn (Blueprint $table) => $table->integer('api_config_id')->nullable());
+        foreach (['central', 'tenant'] as $scope) {
+            DB::connection('central')->table('api_configs')->insert([
+                'database_scope' => $scope, 'route_name' => $scope . '-definition',
+                'endpoint' => $scope, 'method' => 'GET', 'description' => $scope,
+            ]);
+        }
+        foreach (['', 'a'] as $login) {
+            $api = $this->apiBuilder();
+            $this->assertSame(['central', 'tenant'], array_column($api->index($this->request([], $login))->getData(true)['data'], 'database_scope'));
+            $this->assertSame(['tenant'], array_column($api->index($this->request(['search' => 'tenant-definition'], $login))->getData(true)['data'], 'database_scope'));
+        }
+        $this->assertSame('central', DB::getDefaultConnection());
+    }
+
+    public function test_api_builder_creation_and_bundles_use_explicit_scope_in_both_login_contexts(): void
+    {
+        $api = $this->apiBuilder();
+        $this->assertTrue($api->defaults()->getData()->data->tenancy_enabled);
+        foreach (['', 'a'] as $login) {
+            foreach (['central', 'tenant'] as $scope) {
+                $connection = $scope === 'central' ? 'central' : 'tenant_a';
+                $payload = ['database_scope' => $scope, 'tenant_id' => 'a',
+                    'parent_table' => ['table_name' => $connection . '_only', 'data_params' => ['id' => 'id']]];
+                foreach (['store', 'bundleCrud'] as $operation) {
+                    $response = $api->$operation($this->request($payload, $login, 'POST'))->getData();
+                    $this->assertSame($scope, $response->scope);
+                    $this->assertSame($connection, $response->connection);
+                    $this->assertFalse($this->tenancy->initialized);
+                }
+            }
+        }
+    }
+
+    public function test_api_builder_rejects_cross_database_table_and_column_mappings(): void
+    {
+        foreach ([['table_name' => 'central_only'], ['table_name' => 'items', 'data_params' => ['missing' => 'id']]] as $table) {
+            try {
+                $this->apiBuilder()->store($this->request(['database_scope' => 'tenant', 'tenant_id' => 'a', 'parent_table' => $table], '', 'POST'));
+                $this->fail('Mappings must belong to the selected database.');
+            } catch (ValidationException $exception) {
+                $this->assertNotEmpty($exception->errors());
+                $this->assertFalse($this->tenancy->initialized);
+            }
+        }
+    }
+
+    public function test_api_builder_honors_tenant_access_restrictions_before_creation_or_bundling(): void
+    {
+        $gate = new \Illuminate\Auth\Access\Gate($this->app, fn () => null);
+        $gate->define('datasources.select-tenant', fn ($user, $tenant) => $tenant->getTenantKey() === 'a');
+        $this->app->instance(\Illuminate\Contracts\Auth\Access\Gate::class, $gate);
+        foreach (['store', 'bundleCrud'] as $operation) {
+            try {
+                $this->apiBuilder()->$operation($this->request([
+                    'database_scope' => 'tenant', 'tenant_id' => 'b',
+                    'parent_table' => ['table_name' => 'tenant_b_only'],
+                ], '', 'POST'));
+                $this->fail('The denied tenant must not be accessed.');
+            } catch (\Symfony\Component\HttpKernel\Exception\HttpException $exception) {
+                $this->assertSame(403, $exception->getStatusCode());
+                $this->assertFalse($this->tenancy->initialized);
+                $this->assertSame('central', DB::getDefaultConnection());
+            }
+        }
+    }
+
+    public function test_api_builder_edit_retains_persisted_scope_when_payload_omits_it(): void
+    {
+        DB::connection('central')->getSchemaBuilder()->create('api_configs', function (Blueprint $table): void {
+            $table->id(); $table->string('database_scope');
+        });
+        DB::connection('central')->table('api_configs')->insert(['id' => 1, 'database_scope' => 'tenant']);
+        $response = $this->apiBuilder()->update($this->request(['tenant_id' => 'a',
+            'parent_table' => ['table_name' => 'tenant_a_only']], '', 'PUT'), 1)->getData();
+        $this->assertSame('tenant', $response->scope);
+        $this->assertSame('tenant_a', $response->connection);
+    }
+
+    public function test_api_runtime_enforces_persisted_scope_even_with_stale_models_and_payload_overrides(): void
+    {
+        DB::connection('central')->getSchemaBuilder()->create('api_configs', function (Blueprint $table): void {
+            $table->id(); $table->string('database_scope');
+        });
+        $runtime = new class extends ApiController {
+            public function __construct() {}
+            public function checkScope(Request $request, ApiConfig $definition): mixed {
+                return $this->validateApiConfigDatabaseScope($request, $definition);
+            }
+        };
+        foreach (['central', 'tenant'] as $scope) {
+            DB::connection('central')->table('api_configs')->updateOrInsert(['id' => 1], ['database_scope' => $scope]);
+            $stale = new ApiConfig(['database_scope' => $scope === 'central' ? 'tenant' : 'central']);
+            $stale->id = 1;
+            foreach (['', 'a'] as $login) {
+                $response = $runtime->checkScope($this->request(['database_scope' => $stale->database_scope], $login), $stale);
+                if (($scope === 'tenant') === ($login !== '')) {
+                    $this->assertNull($response);
+                } else {
+                    $this->assertSame(403, $response->getStatusCode());
+                }
+            }
+        }
+    }
+
+    public function test_api_builder_non_tenancy_capability_and_legacy_create_flow(): void
+    {
+        $this->scope->enabled = false;
+        $api = $this->apiBuilder();
+        $this->assertFalse($api->defaults()->getData()->data->tenancy_enabled);
+        $response = $api->store($this->request(['parent_table' => ['table_name' => 'central_only']], '', 'POST'))->getData();
+        $this->assertSame('central', $response->scope);
+        $this->assertSame('central', $response->connection);
+        $this->expectException(ValidationException::class);
+        $api->bundleCrud($this->request(['database_scope' => 'tenant', 'tenant_id' => 'a'], '', 'POST'));
+    }
+}
+
+/** Exercise public scope entry points against real SQLite metadata without code generation. */
+class ScopeFixtureApiBuilderController extends DataAPIBuilderController
+{
+    protected function storeInScope(Request $request)
+    {
+        $this->validateScopedTables($request);
+        return response()->json(['scope' => $this->resolveRequestDatabaseScope($request), 'connection' => $this->tableConnectionName]);
+    }
+    protected function updateInScope(Request $request, $id) { return $this->storeInScope($request); }
+    protected function bundleCrudInScope(Request $request) { return $this->storeInScope($request); }
 }
 
 class ScopeFixtureConnection extends DataSourceConnectionScope

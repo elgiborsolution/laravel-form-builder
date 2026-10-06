@@ -87,11 +87,13 @@ class DataTableBuilderController extends Controller
   {
 
       $validateFilter = [
-        'type' => ["required" , "string", "in:text,textarea,email,number,currency,date,datetime,select,radio,checkbox,switch,data-picker,dropdown"],
+        'type' => ["required" , "string", "in:text,textarea,email,number,currency,date,datetime,select,radio,checkbox,switch,data-picker,dropdown,date_range,multiselect,autocomplete"],
         // Filter labels are presentation-only. Keep this relaxation scoped to
         // the direct filters[] item; action and nested option labels remain required.
         'label' => 'nullable|string',
         'name' => 'required|string',
+        'name_from' => 'nullable|string',
+        'name_to' => 'nullable|string',
         'value' => 'nullable',
       'options' => 'nullable|array'
       ];
