@@ -29,12 +29,16 @@ Every Data Source record has a `database_scope` field:
 - `central`
 - `tenant`
 
-The backend determines the value automatically from the current request:
+Create requests send `database_scope` explicitly. Updates retain the saved scope when the field is omitted. Legacy create requests use the request context as their default:
 
 - `X-Tenant` present and not empty -> `tenant`
 - otherwise -> `central`
 
-The management list endpoint only returns records for the current scope, and runtime execution rejects a Data Source when the request scope does not match the stored scope.
+The management list returns all accessible definitions from the shared package connection, independent of query scope. Runtime execution still rejects requests whose scope does not match the saved definition.
+
+For central logins, Tenant API operations send `database_scope=tenant` and the selected `tenant_id` as query parameters (metadata) or request fields (validation and creation). They keep central authentication and do not change `X-Tenant`. The frontend reuses the existing session/context tenant, or requires **Use Tenant** before any tenant metadata or creation request. A validated selection is retained in browser session storage for that server and user; **Change Tenant** replaces it explicitly, and logout clears it. Tenant logins always use their authenticated `X-Tenant` context and cannot select another tenant.
+
+The backend requires authentication for tenant database access, resolves the selected tenant through the tenancy registry, and rejects missing, unknown, conflicting, or inaccessible tenants without falling back to central. Existing management middleware continues to authorize builder operations. Hosts can restrict registered tenants with the Laravel Gate `datasources.select-tenant` (receiving the authenticated user and tenant model), or a tenant model's `view` policy; both are checked before tenant initialization. Without a per-tenant Gate/policy, authorized central managers may select any registered tenant.
 
 ## Configuration Fields
 
@@ -91,10 +95,7 @@ GET /api/data-source/{id}/query
 GET /api/data-source/{id}/{routePath}
 ```
 
-The list endpoint is scope-aware:
-
-- `X-Tenant` present and not empty -> only `database_scope = tenant`
-- no `X-Tenant` header -> only `database_scope = central`
+The list endpoint includes both scopes. Helper endpoints choose the database from `database_scope` and authenticated/selected tenant context, rather than definition-list visibility.
 
 ## Filtering and Pagination
 

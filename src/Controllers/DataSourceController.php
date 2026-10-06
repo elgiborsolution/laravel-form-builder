@@ -11,12 +11,12 @@ use ESolution\DataSources\Services\DataQueryService;
 use ESolution\DataSources\Services\CustomQueryService;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
+use ESolution\DataSources\Support\DataSourceConnectionScope;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
 use ESolution\DataSources\Rules\DoesNotEndWithImport;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\File;
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Collection;
 use Illuminate\Pipeline\Pipeline;
@@ -34,9 +34,11 @@ class DataSourceController extends Controller
     protected DataQueryService $dataQueryService,
     protected CustomQueryService $customQueryService,
     protected Pipeline $pipeline,
-    protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
+    protected ?DatabaseMetadataProvider $databaseMetadataProvider = null,
+    protected ?DataSourceConnectionScope $connectionScope = null
   ) {
     $this->databaseMetadataProvider ??= new DatabaseMetadataProvider();
+    $this->connectionScope ??= new DataSourceConnectionScope();
   }
 
   /**
@@ -50,14 +52,10 @@ class DataSourceController extends Controller
   public function index(Request $request)
   {
     $connection = DatabaseConnection::configuredName();
-    $data = $this->applyDatabaseScopeFilter(
-      $this->applySearchFilter(
-        DataSource::on($connection)->orderBy('id'),
-        $request,
-        ['code', 'name', 'description', 'table_name', 'custom_query'],
-        'data_sources'
-      ),
+    $data = $this->applySearchFilter(
+      DataSource::on($connection)->orderBy('id'),
       $request,
+      ['code', 'name', 'description', 'table_name', 'custom_query'],
       'data_sources'
     );
 
@@ -396,6 +394,11 @@ class DataSourceController extends Controller
   */
   public function store(Request $request)
   {
+    return $this->runWithDatasourceTenantContext($request, fn () => $this->storeInScope($request));
+  }
+
+  protected function storeInScope(Request $request)
+  {
     $request->merge([
       'use_custom_query' => filter_var($request->input('use_custom_query'), FILTER_VALIDATE_BOOLEAN),
       'use_soft_delete' => filter_var($request->input('use_soft_delete'), FILTER_VALIDATE_BOOLEAN),
@@ -487,6 +490,7 @@ class DataSourceController extends Controller
 
     $dataParam = $dataParam['data'];
     $validated['columns'] = $validated['columns'] ?? [];
+    $this->validateTableSelection($request, $validated, $dataParam);
     $beforeExecuteHookName = $this->getBeforeExecuteHookName((string) $validated['name']);
     $afterExecuteHookName = $this->getAfterExecuteHookName((string) $validated['name']);
     $defaultBeforeExecuteHookClass = 'App\\Hooks\\Api\\' . $beforeExecuteHookName;
@@ -643,6 +647,13 @@ class DataSourceController extends Controller
   public function update(Request $request, $id)
   {
     $dataSource = DataSource::findOrFail($id);
+    $request->merge(['database_scope' => $this->connectionScope->scope($request, $dataSource->database_scope ?? 'central')]);
+    return $this->runWithDatasourceTenantContext($request, fn () => $this->updateInScope($request, $id));
+  }
+
+  protected function updateInScope(Request $request, $id)
+  {
+    $dataSource = DataSource::findOrFail($id);
     if (empty($dataSource)) {
       return response()->json(['error' => 'Data source not found'], 422);
     }
@@ -741,6 +752,7 @@ class DataSourceController extends Controller
 
     $dataParam = $dataParam['data'];
     $validated['columns'] = $validated['columns'] ?? [];
+    $this->validateTableSelection($request, $validated, $dataParam);
 
     if ($validated['use_custom_query']) {
       $validated['custom_parameters'] = $this->syncCustomParametersInput(
@@ -1275,11 +1287,7 @@ class DataSourceController extends Controller
   }
 
   /**
-   * Execute a callback inside the tenant database context when the request
-   * provides an `x-tenant` header.
-   *
-   * This keeps the existing non-tenant behavior intact while ensuring the
-   * Data Source lookup and execution flow run on the active tenant database.
+   * Select the query database independently of the shared definition store.
    *
    * @template TReturn
    * @param Request $request
@@ -1288,45 +1296,8 @@ class DataSourceController extends Controller
    */
   protected function runWithDatasourceTenantContext(Request $request, \Closure $callback)
   {
-    if ($request->attributes->get('datasources.connection_resolved') === true) {
-      return $callback();
-    }
-
-    $tenantId = trim((string) $request->header('x-tenant'));
-
-    if ($tenantId === '') {
-      return $callback();
-    }
-
-    $tenantInitialized = false;
-
-    try {
-      if (function_exists('tenancy')) {
-        try {
-          tenancy()->initialize($tenantId);
-          $tenantInitialized = true;
-          $connection = DB::getDefaultConnection();
-
-          if (! is_string($connection) || trim($connection) === '') {
-            $connection = DatabaseConnection::configuredName();
-          }
-
-          $request->attributes->set('datasources.connection_name', trim($connection));
-        } catch (\Throwable $e) {
-          // If tenancy cannot be initialized, keep the package connection flow.
-        }
-      }
-
-      return $callback();
-    } finally {
-      if ($tenantInitialized && function_exists('tenancy')) {
-        try {
-          tenancy()->end();
-        } catch (\Throwable $e) {
-          // Ignore teardown failures so the request can still complete.
-        }
-      }
-    }
+    $scope = $this->connectionScope;
+    return $scope->run($request, $scope->scope($request), $callback);
   }
 
   /**
@@ -1348,9 +1319,7 @@ class DataSourceController extends Controller
 
   protected function resolveRequestDatabaseScope(Request $request): string
   {
-    $tenantId = trim((string) $request->header('X-Tenant', ''));
-
-    return $tenantId !== '' ? 'tenant' : 'central';
+    return $this->connectionScope->scope($request);
   }
 
   /**
@@ -1405,6 +1374,9 @@ class DataSourceController extends Controller
     return $this->runWithDatasourceTenantContext($request, function () use ($request, $table) {
       try {
         $connectionName = $this->resolveExecutionConnectionNameFromRequest($request);
+        if (! in_array((string) $table, $this->databaseMetadataProvider->listTables($connectionName), true)) {
+          return response()->json(['message' => 'Table not found in the chosen database scope.'], 404);
+        }
         $columnList = $this->databaseMetadataProvider->listColumns((string) $table, $connectionName);
         $hasDeletedAt = $this->tableHasColumn((string) $table, 'deleted_at', $connectionName, $columnList);
         $indexes = $this->databaseMetadataProvider->listIndexes((string) $table, $connectionName);
@@ -1450,13 +1422,16 @@ class DataSourceController extends Controller
   */
   public function executeQuery(Request $request, $id, ?string $routePath = null)
   {
-    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id, $routePath) {
-      $dataSourceMatch = $this->resolveDataSourceForExecution((string) $id, $routePath);
-
-      if ($dataSourceMatch === null) {
-        return response()->json(['error' => 'Data source not found', 'message' => 'Data source not found'], 422);
-      }
-
+    $dataSourceMatch = $this->resolveDataSourceForExecution((string) $id, $routePath);
+    if ($dataSourceMatch === null) {
+      return response()->json(['message' => 'Data source not found'], 422);
+    }
+    if ($denied = $this->validateDataSourceDatabaseScope($request, $dataSourceMatch[0])) {
+      return $denied;
+    }
+    // Runtime connection selection comes from the persisted definition.
+    $request->merge(['database_scope' => $dataSourceMatch[0]->database_scope ?? 'central']);
+    return $this->runWithDatasourceTenantContext($request, function () use ($request, $id, $dataSourceMatch) {
       [$dataSource, $routeParameters, $cacheKeySuffix] = $dataSourceMatch;
 
       $routeParameterNames = array_keys($routeParameters);
@@ -1592,7 +1567,7 @@ class DataSourceController extends Controller
 
   protected function validateDataSourceDatabaseScope(Request $request, DataSource $dataSource): ?JsonResponse
   {
-    $requestScope = $this->resolveRequestDatabaseScope($request);
+    $requestScope = trim((string) $request->header('X-Tenant')) !== '' ? 'tenant' : 'central';
     $configuredScope = trim((string) ($dataSource->database_scope ?? 'central'));
 
     if (! in_array($configuredScope, ['central', 'tenant'], true)) {
@@ -2015,6 +1990,30 @@ PHP;
     }
 
     return false;
+  }
+
+  protected function validateTableSelection(Request $request, array $definition, array $parameters): void
+  {
+    if ($definition['use_custom_query']) {
+      return;
+    }
+
+    $connection = $this->resolveExecutionConnectionNameFromRequest($request);
+    $table = (string) ($definition['table_name'] ?? '');
+    if (! in_array($table, $this->databaseMetadataProvider->listTables($connection), true)) {
+      throw \Illuminate\Validation\ValidationException::withMessages([
+        'table_name' => 'Select an available table from the chosen database scope.',
+      ]);
+    }
+    $columns = array_column($this->databaseMetadataProvider->listColumns($table, $connection), 'name');
+    $selected = array_merge($definition['columns'], array_column($parameters, 'param_name'));
+    foreach ($selected as $column) {
+      if ($column !== '*' && ! in_array($column, $columns, true)) {
+        throw \Illuminate\Validation\ValidationException::withMessages([
+          'columns' => "Unknown column '{$column}' in the chosen database scope.",
+        ]);
+      }
+    }
   }
 
   protected function sanitizeCacheKeySuffix(string $value): string

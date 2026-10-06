@@ -8,6 +8,7 @@ use ESolution\DataSources\Support\DynamicApiConfigResolver;
 use ESolution\DataSources\Support\Concerns\AppliesSearchFilter;
 use ESolution\DataSources\Support\DatabaseConnection;
 use ESolution\DataSources\Support\DatabaseMetadataProvider;
+use ESolution\DataSources\Support\DataSourceConnectionScope;
 use ESolution\DataSources\Rules\DoesNotEndWithImport;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use Illuminate\Http\Request;
@@ -24,13 +25,16 @@ use Illuminate\Support\Str;
 class DataAPIBuilderController extends Controller
 {
     use AppliesSearchFilter;
+    protected ?string $tableConnectionName = null;
 
     public function __construct(
         protected DynamicApiConfigResolver $resolver,
         protected DynamicVariableParser $runtimeVariableParser,
-        protected ?DatabaseMetadataProvider $databaseMetadataProvider = null
+        protected ?DatabaseMetadataProvider $databaseMetadataProvider = null,
+        protected ?DataSourceConnectionScope $connectionScope = null
     ) {
         $this->databaseMetadataProvider ??= new DatabaseMetadataProvider();
+        $this->connectionScope ??= new DataSourceConnectionScope();
     }
 
     /**
@@ -43,11 +47,10 @@ class DataAPIBuilderController extends Controller
       public function index(Request $request)
       {
         $search = trim((string) $request->query('search', ''));
-        $scope = $this->resolveDatabaseScope($request);
 
         $dataApiBuilder = $search !== ''
             ? $this->loadApiConfigs($request)
-            : Cache::remember($this->cacheKey('list-api-configs', $scope), 60, function () use ($request) {
+            : Cache::remember($this->cacheKey('list-api-configs'), 60, function () use ($request) {
                 return $this->loadApiConfigs($request);
             });
 
@@ -196,6 +199,7 @@ class DataAPIBuilderController extends Controller
         return response()->json([
             'data' => [
                 'default_api_middlewares' => $this->getDefaultApiMiddlewares(),
+                'tenancy_enabled' => $this->connectionScope->tenancyEnabled(),
             ],
         ]);
     }
@@ -1217,7 +1221,7 @@ class DataAPIBuilderController extends Controller
         }
 
         try {
-            $indexes = $this->databaseMetadataProvider?->listIndexes($tableName) ?? [];
+            $indexes = $this->databaseMetadataProvider?->listIndexes($tableName, $this->tableConnectionName) ?? [];
         } catch (\Throwable $e) {
             return '';
         }
@@ -1250,7 +1254,7 @@ class DataAPIBuilderController extends Controller
         }
 
         try {
-            $columns = DatabaseConnection::schema()->getColumnListing($tableName);
+            $columns = DatabaseConnection::schema($this->tableConnectionName)->getColumnListing($tableName);
         } catch (\Throwable $e) {
             return false;
         }
@@ -1586,6 +1590,12 @@ class DataAPIBuilderController extends Controller
     
   public function store(Request $request)
   {
+     $request->merge(['database_scope' => $this->connectionScope->scope($request)]);
+     return $this->runWithDatabaseScope($request, fn () => $this->storeInScope($request));
+  }
+
+  protected function storeInScope(Request $request)
+  {
      $this->logApiConfigPayload('store.incoming_request', $request->all());
      $databaseScope = $this->resolveRequestDatabaseScope($request);
      $databaseScopeBeforeSave = (string) $request->input('database_scope', 'central');
@@ -1658,6 +1668,8 @@ class DataAPIBuilderController extends Controller
     if (!empty($invalid)) {
        return $invalid;
     }
+
+    $this->validateScopedTables($request);
 
     if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
        return $runtimeValidation;
@@ -1791,6 +1803,16 @@ class DataAPIBuilderController extends Controller
     
   public function update(Request $request, $id)
   {
+     $definition = ApiConfig::on(DatabaseConnection::configuredName())->find($id);
+     if (!$definition) {
+         return response()->json(['error' => 'Data api builder not found', 'message' => 'Data api builder not found'], 400);
+     }
+     $request->merge(['database_scope' => $this->connectionScope->scope($request, $definition->database_scope ?? 'central')]);
+     return $this->runWithDatabaseScope($request, fn () => $this->updateInScope($request, $id));
+  }
+
+  protected function updateInScope(Request $request, $id)
+  {
      $this->logApiConfigPayload('update.incoming_request', $request->all());
      $databaseScope = $this->resolveRequestDatabaseScope($request);
 
@@ -1871,6 +1893,8 @@ class DataAPIBuilderController extends Controller
     if (!empty($invalid)) {
        return $invalid;
     }
+
+    $this->validateScopedTables($request);
 
     if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
        return $runtimeValidation;
@@ -1972,6 +1996,12 @@ class DataAPIBuilderController extends Controller
    */
   public function bundleCrud(Request $request)
   {
+     $request->merge(['database_scope' => $this->connectionScope->scope($request)]);
+     return $this->runWithDatabaseScope($request, fn () => $this->bundleCrudInScope($request));
+  }
+
+  protected function bundleCrudInScope(Request $request)
+  {
      $request->merge([
         'method' => strtoupper((string) $request->input('method')),
         'endpoint' => $this->resolver->normalizeEndpoint($request->input('endpoint')),
@@ -2031,6 +2061,8 @@ class DataAPIBuilderController extends Controller
     if (!empty($invalid)) {
        return $invalid;
     }
+
+    $this->validateScopedTables($request);
 
     if ($runtimeValidation = $this->validateRuntimeVariables($request->all())) {
        return $runtimeValidation;
@@ -2174,6 +2206,7 @@ class DataAPIBuilderController extends Controller
 
       protected function forgetListApiConfigsCache(): void
       {
+            Cache::forget($this->cacheKey('list-api-configs'));
             Cache::forget($this->cacheKey('list-api-configs', 'central'));
             Cache::forget($this->cacheKey('list-api-configs', 'tenant'));
       }
@@ -2187,13 +2220,9 @@ class DataAPIBuilderController extends Controller
       protected function loadApiConfigs(Request $request): array
       {
             return $this->applySearchFilter(
-                $this->applyDatabaseScopeFilter(
-                    ApiConfig::on(DatabaseConnection::configuredName())
-                        ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
-                        ->orderBy('id'),
-                    $request,
-                    'api_configs'
-                ),
+                ApiConfig::on(DatabaseConnection::configuredName())
+                    ->with('parentTable', 'childTables', 'permission', 'hook', 'beforeExecuteHook')
+                    ->orderBy('id'),
                 $request,
                 ['route_name', 'endpoint', 'description', 'method'],
                 'api_configs'
@@ -2273,9 +2302,42 @@ class DataAPIBuilderController extends Controller
 
       protected function resolveRequestDatabaseScope(Request $request): string
       {
-            $tenantId = trim((string) $request->header('X-Tenant', ''));
+            return $this->connectionScope->scope($request);
+      }
 
-            return $tenantId !== '' ? 'tenant' : 'central';
+      protected function runWithDatabaseScope(Request $request, \Closure $callback): mixed
+      {
+            return $this->connectionScope->run($request, $this->resolveRequestDatabaseScope($request), function () use ($request, $callback) {
+                $previous = $this->tableConnectionName;
+                $this->tableConnectionName = $request->attributes->get('datasources.connection_name');
+                try { return $callback(); }
+                finally { $this->tableConnectionName = $previous; }
+            });
+      }
+
+      protected function validateScopedTables(Request $request): void
+      {
+            $tables = $this->databaseMetadataProvider->listTables($this->tableConnectionName);
+            $definitions = ['parent_table' => $request->input('parent_table', [])];
+            foreach ($request->input('child_tables', []) as $index => $child) {
+                $definitions['child_tables.' . $index] = $child;
+            }
+            foreach ($definitions as $field => $definition) {
+                $table = (string) ($definition['table_name'] ?? '');
+                if (!in_array($table, $tables, true)) {
+                    throw ValidationException::withMessages([$field . '.table_name' => 'Table not found in the chosen database scope.']);
+                }
+                $columns = array_column($this->databaseMetadataProvider->listColumns($table, $this->tableConnectionName), 'name');
+                $selected = array_keys($definition['data_params'] ?? []);
+                foreach (['primary_key', 'key_update_delete', 'child_update_key', 'foreign_key'] as $key) {
+                    if (!empty($definition[$key])) $selected[] = $definition[$key];
+                }
+                foreach ($selected as $column) {
+                    if (!in_array($column, $columns, true)) {
+                        throw ValidationException::withMessages([$field => 'Column not found in the chosen database scope: ' . $column]);
+                    }
+                }
+            }
       }
 
       protected function normalizeUseDefaultMiddlewares(mixed $value): bool
