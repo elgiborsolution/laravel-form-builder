@@ -14,6 +14,23 @@ use PHPUnit\Framework\TestCase;
 
 class DataSourceControllerRouteTemplateTest extends TestCase
 {
+    private mixed $previousFacadeApplication;
+
+    protected function setUp(): void
+    {
+        $this->previousFacadeApplication = \Illuminate\Support\Facades\Facade::getFacadeApplication();
+        $container = new \Illuminate\Container\Container();
+        $container->instance('log', new \Psr\Log\NullLogger());
+        \Illuminate\Support\Facades\Facade::clearResolvedInstances();
+        \Illuminate\Support\Facades\Facade::setFacadeApplication($container);
+    }
+
+    protected function tearDown(): void
+    {
+        \Illuminate\Support\Facades\Facade::clearResolvedInstances();
+        \Illuminate\Support\Facades\Facade::setFacadeApplication($this->previousFacadeApplication);
+    }
+
     public function test_it_detects_only_braced_route_parameter_segments(): void
     {
         $controller = $this->makeController();

@@ -196,6 +196,7 @@ class DataAPIBuilderController extends Controller
         return response()->json([
             'data' => [
                 'default_api_middlewares' => $this->getDefaultApiMiddlewares(),
+                'tenancy_enabled' => (new \ESolution\DataSources\Support\DataSourceConnectionScope())->tenancyEnabled(),
             ],
         ]);
     }

@@ -8,7 +8,7 @@ if (! function_exists(__NAMESPACE__ . '\\response')) {
     function response(): object
     {
         return new class () {
-            public function json(array $data, int $status = 200): JsonResponse
+            public function json(mixed $data, int $status = 200): JsonResponse
             {
                 return new JsonResponse($data, $status);
             }
