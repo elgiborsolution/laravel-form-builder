@@ -89,7 +89,7 @@ class DataTableBuilderController extends Controller
       $validateFilter = [
         'type' => ["required" , "string", "in:text,textarea,email,number,currency,date,datetime,select,radio,checkbox,switch,data-picker,dropdown,date_range,multiselect,autocomplete"],
         // Filter labels are presentation-only. Keep this relaxation scoped to
-        // the direct filters[] item; action and nested option labels remain required.
+        // the direct filters[] item; nested option validation stays unchanged.
         'label' => 'nullable|string',
         'name' => 'required|string',
         'name_from' => 'nullable|string',
@@ -107,7 +107,7 @@ class DataTableBuilderController extends Controller
       }
 
       $validateColumn = [
-        'header' => 'required|string',
+        'header' => 'nullable|string',
         'detail' => 'required|string'
       ];
       foreach ($request->columns as $key => $value) {
@@ -121,7 +121,7 @@ class DataTableBuilderController extends Controller
 
 
       $validateFilter = [
-        'label' => 'required|string',
+        'label' => 'nullable|string',
         'type' => ["required" , "string", "in:link,emit"],
         'icon' => 'nullable|string',
         'class' => 'nullable|string',

@@ -150,4 +150,81 @@ class DataTableBuilderFilterTest extends TestCase
             $this->assertArrayHasKey($field, $invalid->getData(true)['error']);
         }
     }
+
+    public static function optionalPresentation(): array
+    {
+        return [
+            'omitted' => [[], []],
+            'null' => [['header' => null], ['label' => null]],
+            'empty' => [['header' => ''], ['label' => '']],
+            'custom' => [['header' => 'Custom display name'], ['label' => 'Custom action label']],
+        ];
+    }
+
+    #[DataProvider('optionalPresentation')]
+    public function test_optional_headers_and_action_labels_round_trip_through_create_update_and_import(array $header, array $label): void
+    {
+        $payload = $this->payload(['name' => 'query', 'type' => 'text']);
+        $payload['columns'] = [$header + ['detail' => 'id']];
+        $payload['actions'] = [
+            $label + ['type' => 'link', 'url' => '/items', 'icon' => 'fa fa-eye'],
+            $label + ['type' => 'emit', 'event' => 'onSelect', 'icon' => 'fa fa-check'],
+        ];
+        $response = $this->controller->store(Request::create('/', 'POST', $payload));
+        $this->assertSame(201, $response->getStatusCode());
+        foreach (['columns', 'actions'] as $field) $this->assertSame($payload[$field], $response->getData(true)['data'][$field]);
+        $payload['name'] = 'Updated table';
+        $response = $this->controller->update(Request::create('/', 'PUT', $payload), $payload['code']);
+        $this->assertSame(201, $response->getStatusCode());
+        $shown = $this->controller->show(Request::create('/'), $payload['code'])->getData(true)['data'];
+        foreach (['columns', 'actions'] as $field) $this->assertSame($payload[$field], $shown[$field]);
+        foreach ([false, true] as $encoded) {
+            $row = $payload;
+            $row['code'] = $encoded ? 'optional-json' : 'optional-array';
+            if ($encoded) {
+                foreach (['columns', 'actions', 'filters', 'params'] as $field) $row[$field] = json_encode($row[$field]);
+            }
+            $result = $this->controller->import(Request::create('/', 'POST', ['rows' => [$row]]))->getData(true);
+            $this->assertSame(1, $result['imported']);
+            $this->assertSame(0, $result['failed']);
+            $shown = $this->controller->show(Request::create('/'), $row['code'])->getData(true)['data'];
+            foreach (['columns', 'actions'] as $field) $this->assertSame($payload[$field], $shown[$field]);
+        }
+    }
+
+    public static function missingColumnKeys(): array
+    {
+        return ['omitted' => [[]], 'null' => [['detail' => null]], 'empty' => [['detail' => '']], 'whitespace' => [['detail' => '   ']]];
+    }
+
+    #[DataProvider('missingColumnKeys')]
+    public function test_missing_column_keys_fail_create_update_and_import(array $column): void
+    {
+        $payload = $this->payload(['name' => 'query', 'type' => 'text']);
+        $created = $this->controller->store(Request::create('/', 'POST', $payload));
+        $this->assertSame(201, $created->getStatusCode());
+        $payload['columns'] = [$column];
+        $payload['code'] = 'invalid-create';
+        $response = $this->controller->store(Request::create('/', 'POST', $payload));
+        $this->assertArrayHasKey('detail', $response->getData(true)['error']);
+        $payload['code'] = 'filter-test';
+        $response = $this->controller->update(Request::create('/', 'PUT', $payload), 'filter-test');
+        $this->assertArrayHasKey('detail', $response->getData(true)['error']);
+        $payload['code'] = 'invalid-import';
+        $result = $this->controller->import(Request::create('/', 'POST', ['rows' => [$payload]]))->getData(true);
+        $this->assertSame(0, $result['imported']);
+        $this->assertSame(1, $result['failed']);
+        $this->assertSame(1, DB::connection('central')->table('data_table_builders')->count());
+        $shown = $this->controller->show(Request::create('/'), 'filter-test')->getData(true)['data'];
+        $this->assertSame([['header' => 'ID', 'detail' => 'id']], $shown['columns']);
+    }
+
+    public function test_optional_action_labels_do_not_relax_other_required_action_fields(): void
+    {
+        foreach ([['type' => 'link'], ['type' => 'emit'], ['url' => '/items'], ['type' => 'unknown']] as $action) {
+            $payload = $this->payload(['name' => 'query', 'type' => 'text']);
+            $payload['actions'] = [$action];
+            $this->assertNotNull($this->controller->validateDetail(Request::create('/', 'POST', $payload)));
+        }
+    }
 }
