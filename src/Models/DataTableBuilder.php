@@ -16,7 +16,7 @@ class DataTableBuilder extends Model
      *
      * @var array
      */
-    protected $fillable = ['name', 'code', 'columns', 'params', 'filters', 'actions'];
+    protected $fillable = ['name', 'code', 'type', 'default_tab', 'tabs', 'columns', 'params', 'filters', 'actions'];
 
     /**
      * Cast attributes to specific data types.
@@ -29,5 +29,6 @@ class DataTableBuilder extends Model
         'filters' => 'array',
         'params' => 'array',
         'actions' => 'array',
+        'tabs' => 'array',
     ];
 }

@@ -21,6 +21,7 @@ use Illuminate\Http\Request;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Facades\DB;
@@ -106,10 +107,18 @@ class ImportBuilderController extends Controller
 
     public function preview(Request $request): JsonResponse
     {
+        $uploadedFile = $request->file('template_file');
         $validator = Validator::make($request->all(), [
             'template_file' => ['required', 'file', 'mimes:xlsx,csv'],
         ]);
         if ($validator->fails()) {
+            if (! ($uploadedFile instanceof UploadedFile) || ! $uploadedFile->isValid()) {
+                $this->logTemplateUploadDiagnostics(
+                    $request,
+                    $uploadedFile instanceof UploadedFile ? $uploadedFile : null
+                );
+            }
+
             return $this->importResponse(false, $validator->errors()->first(), ['errors' => $validator->errors()->toArray()], 422);
         }
 
@@ -123,6 +132,32 @@ class ImportBuilderController extends Controller
         }
 
         return $this->importResponse(true, 'Template preview generated successfully.', $analysis['metadata']);
+    }
+
+    protected function logTemplateUploadDiagnostics(Request $request, ?UploadedFile $file): void
+    {
+        $configuredTempDir = trim((string) ini_get('upload_tmp_dir'));
+        $effectiveTempDir = $configuredTempDir !== '' ? $configuredTempDir : sys_get_temp_dir();
+        $tempDirExists = is_dir($effectiveTempDir);
+        $freeBytes = $tempDirExists ? @disk_free_space($effectiveTempDir) : false;
+        $contentLength = $request->server('CONTENT_LENGTH');
+
+        Log::warning('Import template upload failed before Excel parsing.', [
+            'php_sapi' => PHP_SAPI,
+            'upload_error_code' => $file?->getError(),
+            'upload_error_message' => $file?->getErrorMessage(),
+            'file_field_present' => $request->files->has('template_file'),
+            'request_content_length' => is_numeric($contentLength) ? (int) $contentLength : null,
+            'php_ini_loaded_file' => php_ini_loaded_file() ?: null,
+            'upload_max_filesize' => ini_get('upload_max_filesize'),
+            'post_max_size' => ini_get('post_max_size'),
+            'file_uploads' => ini_get('file_uploads'),
+            'upload_tmp_dir' => $configuredTempDir,
+            'effective_upload_tmp_dir' => $effectiveTempDir,
+            'upload_tmp_dir_exists' => $tempDirExists,
+            'upload_tmp_dir_writable' => $tempDirExists && is_writable($effectiveTempDir),
+            'upload_tmp_dir_free_bytes' => $freeBytes === false ? null : $freeBytes,
+        ]);
     }
 
     public function store(Request $request): JsonResponse
