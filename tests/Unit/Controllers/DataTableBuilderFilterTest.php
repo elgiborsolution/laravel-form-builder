@@ -56,7 +56,10 @@ class DataTableBuilderFilterTest extends TestCase
             $table->id();
             $table->string('code')->unique();
             $table->string('name');
-            foreach (['columns', 'filters', 'actions', 'params'] as $field) $table->text($field);
+            $table->string('type')->nullable();
+            $table->string('default_tab')->nullable();
+            $table->text('tabs')->nullable();
+            foreach (['columns', 'filters', 'actions', 'params'] as $field) $table->text($field)->nullable();
             $table->timestamps();
         });
         $this->controller = new DataTableBuilderController();
@@ -225,6 +228,225 @@ class DataTableBuilderFilterTest extends TestCase
             $payload = $this->payload(['name' => 'query', 'type' => 'text']);
             $payload['actions'] = [$action];
             $this->assertNotNull($this->controller->validateDetail(Request::create('/', 'POST', $payload)));
+        }
+    }
+
+    private function tabsPayload(string $code, array $tabs, ?string $defaultTab = null): array
+    {
+        return [
+            'type' => 'tabs',
+            'code' => $code,
+            'name' => ucfirst(str_replace('-', ' ', $code)),
+            'default_tab' => $defaultTab ?? ($tabs[0]['key'] ?? ''),
+            'tabs' => $tabs,
+        ];
+    }
+
+    public function test_tabs_share_table_storage_and_get_resolves_nested_references_without_copying_configs(): void
+    {
+        $table = $this->payload(['name' => 'status', 'type' => 'text'], 'orders');
+        $table['params'] = ['source_type' => 'data_source', 'data_source_code' => 'orders_source'];
+        $this->assertSame(201, $this->controller->store(Request::create('/', 'POST', $table))->getStatusCode());
+
+        $child = $this->tabsPayload('order-tabs', [
+            ['key' => 'pending', 'label' => 'Pending', 'type' => 'table', 'table_builder_code' => 'orders', 'default_params' => ['status' => 'pending'], 'count' => ['source_type' => 'data_source', 'path' => 'meta.total']],
+            ['key' => 'done', 'label' => 'Done', 'type' => 'table', 'table_builder_code' => 'orders', 'default_params' => ['status' => 'done'], 'count' => ['source_type' => 'data_source', 'path' => 'meta.total']],
+        ], 'pending');
+        $createdChild = $this->controller->store(Request::create('/', 'POST', $child));
+        $this->assertSame(201, $createdChild->getStatusCode());
+
+        $parent = $this->tabsPayload('transaction-tabs', [
+            ['key' => 'sales', 'label' => 'Sales', 'type' => 'tabs', 'table_builder_code' => 'order-tabs'],
+        ], 'sales');
+        $createdParent = $this->controller->store(Request::create('/', 'POST', $parent));
+        $this->assertSame(201, $createdParent->getStatusCode());
+
+        $stored = DB::connection('central')->table('data_table_builders')->where('code', 'transaction-tabs')->first();
+        $storedTabs = json_decode($stored->tabs, true);
+        $this->assertSame([['key' => 'sales', 'label' => 'Sales', 'type' => 'tabs', 'table_builder_code' => 'order-tabs']], $storedTabs);
+
+        $resolved = $this->controller->show(Request::create('/table-builder/transaction-tabs'), 'transaction-tabs')->getData(true)['data'];
+        $this->assertSame('tabs', $resolved['type']);
+        $this->assertSame('pending', $resolved['tabs'][0]['tabs'][0]['key']);
+        $this->assertSame('orders_source', $resolved['tabs'][0]['tabs'][0]['count']['data_source_code']);
+        $this->assertSame(['status' => 'pending'], $resolved['tabs'][0]['tabs'][0]['count']['default_params']);
+        $this->assertSame(['status' => 'done'], $resolved['tabs'][0]['tabs'][1]['default_params']);
+        $this->assertSame('table', $this->controller->show(Request::create('/table-builder/orders'), 'orders')->getData(true)['data']['type']);
+        $listed = $this->controller->index(Request::create('/'))->getData(true)['data'];
+        $listedParent = array_values(array_filter($listed, fn (array $record): bool => $record['code'] === 'transaction-tabs'))[0];
+        $this->assertSame('pending', $listedParent['tabs'][0]['tabs'][0]['key']);
+        $this->assertSame(3, DB::connection('central')->table('data_table_builders')->count());
+    }
+
+    public function test_tabs_reject_self_and_indirect_cycles(): void
+    {
+        $table = $this->payload(['name' => 'status', 'type' => 'text'], 'cycle-table');
+        $table['params'] = ['source_type' => 'data_source', 'data_source_code' => 'orders_source'];
+        $this->controller->store(Request::create('/', 'POST', $table));
+
+        $self = $this->tabsPayload('self-tabs', [
+            ['key' => 'self', 'label' => 'Self', 'type' => 'tabs', 'table_builder_code' => 'self-tabs'],
+        ]);
+        $response = $this->controller->store(Request::create('/', 'POST', $self));
+        $this->assertSame(422, $response->getStatusCode());
+
+        $first = $this->tabsPayload('first-tabs', [
+            ['key' => 'table', 'label' => 'Table', 'type' => 'table', 'table_builder_code' => 'cycle-table'],
+        ]);
+        $second = $this->tabsPayload('second-tabs', [
+            ['key' => 'first', 'label' => 'First', 'type' => 'tabs', 'table_builder_code' => 'first-tabs'],
+        ]);
+        $this->assertSame(201, $this->controller->store(Request::create('/', 'POST', $first))->getStatusCode());
+        $this->assertSame(201, $this->controller->store(Request::create('/', 'POST', $second))->getStatusCode());
+
+        $cycle = $this->tabsPayload('first-tabs', [
+            ['key' => 'second', 'label' => 'Second', 'type' => 'tabs', 'table_builder_code' => 'second-tabs'],
+        ]);
+        $response = $this->controller->update(Request::create('/', 'PUT', $cycle), 'first-tabs');
+        $this->assertSame(422, $response->getStatusCode());
+        $this->assertStringContainsString('cycle', strtolower($response->getData(true)['message']));
+    }
+
+    public function test_legacy_records_without_type_are_returned_as_tables(): void
+    {
+        DB::connection('central')->table('data_table_builders')->insert([
+            'code' => 'legacy-table', 'name' => 'Legacy', 'columns' => json_encode([]),
+            'filters' => json_encode([]), 'actions' => json_encode([]),
+            'params' => json_encode(['source_type' => 'custom_api', 'api_config' => ['type' => 'internal', 'method' => 'GET', 'url' => '/api/legacy']]),
+            'type' => null, 'default_tab' => null, 'tabs' => null,
+            'created_at' => date('Y-m-d H:i:s'), 'updated_at' => date('Y-m-d H:i:s'),
+        ]);
+        $record = $this->controller->show(Request::create('/table-builder/legacy-table'), 'legacy-table')->getData(true)['data'];
+        $this->assertSame('table', $record['type']);
+        $this->assertArrayHasKey('columns', $record);
+        $this->assertArrayNotHasKey('tabs', $record);
+    }
+
+    public function test_import_accepts_tabs_rows_without_regular_table_fields(): void
+    {
+        $table = $this->payload(['name' => 'status', 'type' => 'text'], 'imported-orders');
+        $table['params'] = ['source_type' => 'custom_api', 'api_config' => ['type' => 'internal', 'method' => 'GET', 'url' => '/api/orders']];
+        $tabs = $this->tabsPayload('imported-order-tabs', [
+            ['key' => 'pending', 'label' => 'Pending', 'type' => 'table', 'table_builder_code' => 'imported-orders', 'default_params' => ['status' => 'pending']],
+        ]);
+        $result = $this->controller->import(Request::create('/', 'POST', ['rows' => [$tabs, $table]]))->getData(true);
+        $this->assertSame(2, $result['imported']);
+        $this->assertSame(0, $result['failed']);
+        $shown = $this->controller->show(Request::create('/'), 'imported-order-tabs')->getData(true)['data'];
+        $this->assertSame('custom_api', $shown['tabs'][0]['source_type']);
+        $this->assertSame(['status' => 'pending'], $shown['tabs'][0]['default_params']);
+    }
+
+    public function test_delete_blocks_referenced_records_and_deletes_unused_tab_builders(): void
+    {
+        $table = $this->payload(['name' => 'status', 'type' => 'text'], 'delete-table');
+        $table['params'] = ['source_type' => 'data_source', 'data_source_code' => 'orders_source'];
+        $this->controller->store(Request::create('/', 'POST', $table));
+        $tabs = $this->tabsPayload('delete-tabs', [
+            ['key' => 'orders', 'label' => 'Orders', 'type' => 'table', 'table_builder_code' => 'delete-table'],
+        ]);
+        $this->controller->store(Request::create('/', 'POST', $tabs));
+
+        $blocked = $this->controller->destroy(Request::create('/', 'DELETE'), 'delete-table');
+        $this->assertSame(409, $blocked->getStatusCode());
+        $deleted = $this->controller->destroy(Request::create('/', 'DELETE'), 'delete-tabs');
+        $this->assertSame(200, $deleted->getStatusCode());
+        $deletedTable = $this->controller->destroy(Request::create('/', 'DELETE'), 'delete-table');
+        $this->assertSame(200, $deletedTable->getStatusCode());
+    }
+
+    public function test_automatic_count_uses_root_total_and_synchronizes_on_create_update_and_get(): void
+    {
+        $table = $this->payload(['name' => 'status', 'type' => 'text'], 'paged-orders');
+        $table['params'] = ['source_type' => 'data_source', 'data_source_code' => 'orders_source', 'pagination' => true];
+        $this->controller->store(Request::create('/', 'POST', $table));
+        $tabs = $this->tabsPayload('automatic-tabs', [[
+            'key' => 'pending', 'label' => 'Pending', 'type' => 'table', 'table_builder_code' => 'paged-orders',
+            'default_params' => ['status' => 'pending'], 'count' => ['mode' => 'automatic', 'source_type' => 'data_source',
+                'data_source_code' => 'stale_source', 'default_params' => ['status' => 'stale'], 'path' => 'meta.total'],
+        ]]);
+        $created = $this->controller->store(Request::create('/', 'POST', $tabs));
+        $this->assertSame(201, $created->getStatusCode());
+        $count = $created->getData(true)['data']['tabs'][0]['count'];
+        $this->assertSame('automatic', $count['mode']);
+        $this->assertSame('total', $count['path']);
+        $this->assertSame('orders_source', $count['data_source_code']);
+        $this->assertSame(['status' => 'pending'], $count['default_params']);
+
+        $tabs['tabs'][0]['default_params'] = ['status' => 'done'];
+        $updated = $this->controller->update(Request::create('/', 'PUT', $tabs), 'automatic-tabs');
+        $this->assertSame(201, $updated->getStatusCode());
+        $this->assertSame(['status' => 'done'], $updated->getData(true)['data']['tabs'][0]['count']['default_params']);
+        $table['params']['data_source_code'] = 'changed_source';
+        $this->controller->update(Request::create('/', 'PUT', $table), 'paged-orders');
+        $show = fn () => $this->controller->show(Request::create('/'), 'automatic-tabs')->getData(true)['data']['tabs'][0]['count'];
+        $this->assertSame('changed_source', $show()['data_source_code']);
+        $this->assertSame('total', $show()['path']);
+        $table['params']['pagination'] = false;
+        $this->controller->update(Request::create('/', 'PUT', $table), 'paged-orders');
+        $this->assertSame('manual', $show()['mode']);
+        $invalid = $this->controller->validateDetail(Request::create('/', 'POST', $tabs));
+        $this->assertSame(422, $invalid->getStatusCode());
+    }
+
+    public function test_manual_count_sources_and_parameters_round_trip_independently_through_crud_export_and_import(): void
+    {
+        foreach (['data_source', 'custom_api'] as $tableSource) {
+            $table = $this->payload(['name' => 'status', 'type' => 'text'], 'table-' . $tableSource);
+            if ($tableSource === 'data_source') $table['params'] = ['source_type' => 'data_source', 'data_source_code' => 'orders_source', 'pagination' => true];
+            $this->controller->store(Request::create('/', 'POST', $table));
+            $counts = [
+                ['mode' => 'manual', 'source_type' => 'data_source', 'data_source_code' => 'summary_source', 'default_params' => ['year' => '002026', 'flag' => false], 'path' => 'data.0.aggregate'],
+            ];
+            foreach (['internal', 'external'] as $apiType) {
+                $counts[] = ['mode' => 'manual', 'source_type' => 'custom_api', 'api_config' => [
+                    'type' => $apiType, 'method' => 'POST', 'url' => $apiType === 'internal' ? '/summary' : 'https://example.com/summary',
+                    'headers' => [['key' => 'X-Example', 'value' => 'example']], 'body_params' => [['key' => 'include', 'value' => 'all']],
+                ], 'default_params' => ['arbitrary_name' => 'manual'], 'path' => 'data.aggregate'];
+            }
+            foreach ($counts as $index => $count) {
+                $code = 'manual-' . $tableSource . '-' . $index;
+                $tabs = $this->tabsPayload($code, [[
+                    'key' => 'orders', 'label' => 'Orders', 'type' => 'table', 'table_builder_code' => $table['code'],
+                    'default_params' => ['status' => 'tab-value'], 'count' => $count,
+                ]]);
+                $created = $this->controller->store(Request::create('/', 'POST', $tabs));
+                $this->assertSame(201, $created->getStatusCode(), json_encode($created->getData(true)));
+                $tabs['tabs'][0]['default_params'] = ['status' => 'changed-tab-value'];
+                $updated = $this->controller->update(Request::create('/', 'PUT', $tabs), $code);
+                $this->assertSame(201, $updated->getStatusCode());
+                $shown = $this->controller->show(Request::create('/'), $code)->getData(true)['data'];
+                $this->assertEquals($count, $shown['tabs'][0]['count']);
+                $this->assertSame(['status' => 'changed-tab-value'], $shown['tabs'][0]['default_params']);
+                ob_start();
+                try {
+                    $this->controller->export(Request::create('/', 'POST', ['ids' => [$shown['id']]]))->sendContent();
+                    $exported = json_decode(ob_get_contents(), true);
+                } finally {
+                    ob_end_clean();
+                }
+                $this->assertEquals($count, $exported[0]['tabs'][0]['count']);
+                $exported[0]['code'] = $code . '-imported';
+                $import = $this->controller->import(Request::create('/', 'POST', ['rows' => json_encode($exported)]))->getData(true);
+                $this->assertSame(1, $import['imported'], json_encode($import));
+                $this->assertSame(0, $import['failed']);
+                $imported = $this->controller->show(Request::create('/'), $exported[0]['code'])->getData(true)['data'];
+                $this->assertEquals($count, $imported['tabs'][0]['count']);
+            }
+        }
+    }
+
+    public function test_manual_counts_require_a_source_path_and_scalar_parameters(): void
+    {
+        $table = $this->payload(['name' => 'status', 'type' => 'text'], 'orders');
+        $this->controller->store(Request::create('/', 'POST', $table));
+        $base = ['mode' => 'manual', 'source_type' => 'data_source', 'data_source_code' => 'summary_source', 'path' => 'total'];
+        foreach ([['data_source_code' => ''], ['path' => ''], ['default_params' => ['nested' => ['bad']]], ['mode' => 'unknown'], ['source_type' => 'unknown']] as $bad) {
+            $tabs = $this->tabsPayload('invalid-count', [[
+                'key' => 'orders', 'label' => 'Orders', 'type' => 'table', 'table_builder_code' => 'orders', 'count' => array_replace($base, $bad),
+            ]]);
+            $invalid = $this->controller->validateDetail(Request::create('/', 'POST', $tabs));
+            $this->assertSame(422, $invalid->getStatusCode());
         }
     }
 }
