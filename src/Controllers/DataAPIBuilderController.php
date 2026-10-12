@@ -747,7 +747,9 @@ class DataAPIBuilderController extends Controller
             ];
         }
 
-        if ($runtimeValidation = $this->validateRuntimeVariables($payload)) {
+        $runtimeValidation = $this->validateApiBuilderParamDefaults($payload['params'] ?? [])
+            ?? $this->validateRuntimeVariables($payload);
+        if ($runtimeValidation !== null) {
             $batchSummary['failed']++;
             $batchSummary['errors'][] = [
                 'file_name' => $fileName,
@@ -1448,6 +1450,7 @@ class DataAPIBuilderController extends Controller
             'required' => ['nullable', 'boolean'],
             'unique' => ['nullable', 'boolean'],
             'default' => ['nullable'],
+            'default_mode' => ['nullable', Rule::in(['manual', 'runtime_variable'])],
             'params' => ['nullable', 'array'],
         ]);
 
@@ -1459,6 +1462,9 @@ class DataAPIBuilderController extends Controller
         }
 
         $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+        if ($defaultError = $this->validateApiBuilderParamDefault($param, $pathSegments)) {
+            return $defaultError;
+        }
         $children = is_array($param['params'] ?? null) ? $param['params'] : [];
 
         if ($this->isPrimitiveArrayParamType($type) && $children !== []) {
@@ -1484,6 +1490,43 @@ class DataAPIBuilderController extends Controller
         }
 
         return null;
+    }
+
+    /** Validate default metadata on imports without restricting legacy parameter schemas. */
+    protected function validateApiBuilderParamDefaults(array $params, array $pathSegments = []): ?\Illuminate\Http\JsonResponse
+    {
+        foreach ($params as $index => $param) {
+            if (! is_array($param)) {
+                continue;
+            }
+            $path = [...$pathSegments, (string) $index];
+            $error = $this->validateApiBuilderParamDefault($param, $path)
+                ?? $this->validateApiBuilderParamDefaults(is_array($param['params'] ?? null) ? $param['params'] : [], $path);
+            if ($error !== null) {
+                return $error;
+            }
+        }
+
+        return null;
+    }
+
+    protected function validateApiBuilderParamDefault(array $param, array $pathSegments): ?\Illuminate\Http\JsonResponse
+    {
+        $mode = $param['default_mode'] ?? null;
+        $message = null;
+        $field = 'default_mode';
+        if ($mode !== null && ! in_array($mode, ['manual', 'runtime_variable'], true)) {
+            $message = 'Select a valid default value mode.';
+        } elseif ($mode === 'runtime_variable' && (! is_string($param['default'] ?? null)
+            || preg_match('/^\s*\{\{\s*[A-Za-z0-9_.-]+\s*\}\}\s*$/', $param['default']) !== 1)) {
+            $message = 'Select a runtime variable for the default value.';
+            $field = 'default';
+        }
+
+        return $message === null ? null : response()->json([
+            'error' => [$field => [$message]],
+            'message' => 'Invalid payload params at row ' . $this->formatParamPath($pathSegments),
+        ], 400);
     }
 
     protected function allowedApiBuilderParamTypes(): array
@@ -1568,7 +1611,7 @@ class DataAPIBuilderController extends Controller
         }
 
         try {
-            $this->runtimeVariableParser->parse($payload);
+            $this->runtimeVariableParser->validate($payload);
         } catch (InvalidRuntimeVariableException $e) {
             return response()->json([
                 'status' => 422,

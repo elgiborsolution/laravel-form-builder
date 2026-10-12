@@ -64,6 +64,30 @@ class DynamicVariableParser
         return $resolved;
     }
 
+    /** Check registry membership without evaluating request-dependent resolvers. */
+    public function validate(mixed $value): void
+    {
+        if (is_array($value) || is_object($value)) {
+            foreach ($value as $item) {
+                $this->validate($item);
+            }
+
+            return;
+        }
+
+        if (! is_string($value)) {
+            return;
+        }
+
+        preg_match_all('/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/', $value, $matches);
+
+        foreach ($matches[1] as $key) {
+            if (! $this->registry->has($key)) {
+                throw new InvalidRuntimeVariableException($key);
+            }
+        }
+    }
+
     protected function resolveVariable(string $key, mixed $default = null): mixed
     {
         $normalizedKey = trim($key);
