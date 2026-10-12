@@ -3,6 +3,7 @@
 namespace ESolution\DataSources\Tests\Unit\Runtime;
 
 use ESolution\DataSources\Exceptions\InvalidRuntimeVariableException;
+use ESolution\DataSources\Contracts\RuntimeVariableRegistryInterface;
 use ESolution\DataSources\Services\Runtime\DynamicVariableParser;
 use ESolution\DataSources\Tests\Support\FakeRuntimeVariableRegistry;
 use PHPUnit\Framework\TestCase;
@@ -46,5 +47,16 @@ class DynamicVariableParserTest extends TestCase
 
         $this->expectException(InvalidRuntimeVariableException::class);
         $parser->parse('{{ auth.password }}');
+    }
+
+    public function test_validation_checks_nested_expressions_without_evaluating_resolvers(): void
+    {
+        $registry = $this->createMock(RuntimeVariableRegistryInterface::class);
+        $registry->method('has')->willReturnCallback(fn ($key) => $key === 'auth.id');
+        $registry->expects($this->never())->method('resolve');
+        $parser = new DynamicVariableParser($registry);
+        $parser->validate(['nested' => (object) ['value' => ['{{ auth.id }}', 'INV-{{ auth.id }}', 0, false]]]);
+        $this->expectException(InvalidRuntimeVariableException::class);
+        $parser->validate(['nested' => '{{ unknown.key }}']);
     }
 }

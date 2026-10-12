@@ -445,7 +445,16 @@ class ApiController extends Controller
           }
 
           $name = (string) $param['name'];
-          $type = (string) ($param['type'] ?? '');
+          $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+
+          if (
+              empty($param['required'])
+              && (! array_key_exists($name, $payload) || $payload[$name] === null)
+              && array_key_exists('default', $param)
+              && $param['default'] !== null
+          ) {
+              $payload[$name] = $this->runtimeVariableParser->parse($param['default']);
+          }
 
           if ($this->isPrimitiveArrayApiBuilderParamType($type)) {
               if (array_key_exists($name, $payload) && is_array($payload[$name])) {
@@ -455,7 +464,7 @@ class ApiController extends Controller
               continue;
           }
 
-          if (in_array($type, ['array', 'object'], true)) {
+          if ($this->isContainerApiBuilderParamType($type)) {
               if (! array_key_exists($name, $payload) || ! is_array($payload[$name])) {
                   continue;
               }
@@ -468,7 +477,7 @@ class ApiController extends Controller
 
               $payload[$name] = $this->normalizeNumericIndexedArray($payload[$name]);
 
-              if (array_is_list($payload[$name])) {
+              if ($type !== 'object' && array_is_list($payload[$name])) {
                   foreach ($payload[$name] as $index => $item) {
                       if (! is_array($item)) {
                           continue;
@@ -483,15 +492,6 @@ class ApiController extends Controller
               continue;
           }
 
-          if (
-              (! array_key_exists($name, $payload))
-              || $payload[$name] === null
-              || $payload[$name] === ''
-          ) {
-              if (array_key_exists('default', $param)) {
-                  $payload[$name] = $this->runtimeVariableParser->parse($param['default']);
-              }
-          }
       }
 
       return $payload;

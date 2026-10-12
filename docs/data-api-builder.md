@@ -218,6 +218,34 @@ Example:
 }
 ```
 
+### Parameter defaults
+
+Parameter settings include an optional **Default Value**, with **Manual** entry or
+a **Runtime Variable** selected from the shared registry. Manual values may also
+contain runtime expressions, including mixed strings such as `INV-{{ auth.id }}`.
+
+```json
+{
+  "name": "owner_id",
+  "type": "integer",
+  "required": false,
+  "default": "{{ auth.id }}",
+  "default_mode": "runtime_variable"
+}
+```
+
+Defaults apply only when a nullable parameter is missing or explicitly null.
+Supplied values, including `0`, `false`, empty strings, and empty arrays, are kept.
+Required parameters still require an input. Missing/null defaults mean no fallback.
+Runtime variables are validated against the registry when saving and resolved only
+when needed during execution, using the current request context.
+
+Defaults work recursively inside supplied objects/array rows and configured parent
+defaults. Child defaults alone do not create missing parents or new array rows.
+Values and the optional `default_mode` (`manual` or `runtime_variable`) are stored
+within `params` and preserved by import/export. Legacy defaults without a mode
+continue to work.
+
 ### Unique validation
 
 `unique` rules are built against the active execution connection.
