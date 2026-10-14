@@ -123,6 +123,8 @@ The builder stores these fields:
 Inside `parent_table`, `key_update_delete` controls the route parameter used for PUT, PATCH, and DELETE.
 When it is missing, the package falls back to `primary_key`.
 
+POST APIs default to the `CREATE` parent operation. They may opt into `CREATE_OR_UPDATE` with one or more lookup keys. Every lookup key pairs a parent-table column with a declared scalar request parameter; all values are required, and all configured keys must match the same parent. A match updates that parent, while no match creates one. Ambiguous matches are rejected. Child rows are synchronized using their configured update key within the resulting parent, in the same transaction.
+
 ## Parent and Child Tables
 
 The parent table defines the main CRUD target.
@@ -132,6 +134,8 @@ Important fields:
 - `table_name`
 - `primary_key`
 - `key_update_delete`
+- `operation` (`CREATE` or `CREATE_OR_UPDATE`, POST only)
+- `lookup_keys` (`column` and `parameter` pairs, for `CREATE_OR_UPDATE`)
 - `foreign_key`
 - `data_params`
 - `use_soft_delete`
@@ -148,6 +152,8 @@ Each child table can also define:
 
 `child_update_key` is the lookup column used when child rows are updated.
 If it is empty, the runtime falls back to the child primary key, then the table primary key, then `id`.
+
+During POST `CREATE_OR_UPDATE`, a child is matched by its `foreign_key` and `child_update_key` together. Matching children retain their primary keys, even when request defaults generate new UUIDs; unmatched children are inserted using their mapped IDs. For example, `foreign_key: agama_id` and `child_update_key: code` match by `agama_id + code`, never by an incoming `id`. `DELETE_MISSING` removes children whose update keys were not received, only within the current parent, after incoming children are processed. `KEEP_EXISTING` leaves omitted children in place.
 
 ## Validation Rules
 
@@ -377,6 +383,37 @@ GET /api/customers?status=active
   ]
 }
 ```
+
+### POST create-or-update example
+
+```json
+{
+  "route_name": "customers.upsert",
+  "endpoint": "customers",
+  "method": "POST",
+  "enabled": true,
+  "params": [
+    { "name": "email", "type": "string", "required": true, "validation_rules": "email" },
+    { "name": "tenant_code", "type": "string", "required": true },
+    { "name": "name", "type": "string", "required": true }
+  ],
+  "parent_table": {
+    "table_name": "customers",
+    "primary_key": "id",
+    "operation": "CREATE_OR_UPDATE",
+    "lookup_keys": [
+      { "column": "email", "parameter": "email" },
+      { "column": "tenant_code", "parameter": "tenant_code" }
+    ],
+    "data_params": {
+      "name": "name"
+    }
+  },
+  "child_tables": []
+}
+```
+
+Operation and lookup settings are stored in the existing parent `data_params` JSON column and are returned separately from the column mappings. Existing configurations without this metadata keep the default `CREATE` behavior.
 
 ### Validation example
 
