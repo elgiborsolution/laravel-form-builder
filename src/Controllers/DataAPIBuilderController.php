@@ -110,6 +110,11 @@ class DataAPIBuilderController extends Controller
      */
     public function import(Request $request)
     {
+        return $this->runWithDatabaseScope($request, fn () => $this->importInScope($request));
+    }
+
+    protected function importInScope(Request $request): \Illuminate\Http\JsonResponse
+    {
         $rows = $this->normalizeImportRowsFromRequest($request);
 
         if ($rows === null) {
@@ -766,6 +771,47 @@ class DataAPIBuilderController extends Controller
             ];
         }
 
+        if ($operationError = $this->validateParentOperationConfig(
+            is_array($payload['parent_table'] ?? null) ? $payload['parent_table'] : [],
+            is_array($payload['params'] ?? null) ? $payload['params'] : [],
+            strtoupper((string) ($payload['method'] ?? '')),
+            false
+        )) {
+            $batchSummary['failed']++;
+            $message = $operationError->getData(true)['message'] ?? 'Invalid parent operation configuration.';
+            $batchSummary['errors'][] = [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => $message,
+            ];
+
+            return ['error' => [
+                'file_name' => $fileName,
+                'row' => $rowNumber,
+                'message' => $message,
+            ]];
+        }
+
+        $parentOperationMetadata = $payload['parent_table']['data_params']['__parent_operation'] ?? [];
+        $parentOperation = strtoupper((string) ($payload['parent_table']['operation'] ?? ($parentOperationMetadata['operation'] ?? 'CREATE')));
+        $parentLookupKeys = $payload['parent_table']['lookup_keys'] ?? ($parentOperationMetadata['lookup_keys'] ?? []);
+        if ($parentOperation === 'CREATE_OR_UPDATE') {
+            $parentTableName = trim((string) ($payload['parent_table']['table_name'] ?? ''));
+            $columns = array_column(
+                $this->databaseMetadataProvider->listColumns($parentTableName, $this->tableConnectionName),
+                'name'
+            );
+            foreach ($parentLookupKeys as $lookupKey) {
+                $column = trim((string) ($lookupKey['column'] ?? ''));
+                if (! in_array($column, $columns, true)) {
+                    $batchSummary['failed']++;
+                    $message = "Parent lookup column '{$column}' was not found in the selected database scope.";
+                    $batchSummary['errors'][] = ['file_name' => $fileName, 'row' => $rowNumber, 'message' => $message];
+                    return ['error' => ['file_name' => $fileName, 'row' => $rowNumber, 'message' => $message]];
+                }
+            }
+        }
+
         $routeName = trim((string) $payload['route_name']);
         $endpoint = $this->resolver->normalizeEndpoint((string) $payload['endpoint']);
         $method = strtoupper((string) $payload['method']);
@@ -872,7 +918,7 @@ class DataAPIBuilderController extends Controller
                         'primary_key' => $payload['parent_table']['primary_key'] ?? 'id',
                         'key_update_delete' => $this->resolveParentLookupKey($payload['parent_table'] ?? [], $payload['parent_table']['primary_key'] ?? 'id'),
                         'foreign_key' => $payload['parent_table']['foreign_key'] ?? null,
-                        'data_params' => $payload['parent_table']['data_params'] ?? [],
+                        'data_params' => $this->encodeParentOperationDataParams($payload['parent_table'], $config->method),
                         'use_soft_delete' => $parentSoftDelete,
                     ]
                 );
@@ -1054,6 +1100,11 @@ class DataAPIBuilderController extends Controller
             'use_soft_delete' => (bool) $table->use_soft_delete,
         ];
 
+        if ((int) $table->parent_id === 0 && $table->operation === 'CREATE_OR_UPDATE') {
+            $serialized['operation'] = $table->operation;
+            $serialized['lookup_keys'] = $table->lookup_keys;
+        }
+
         \Log::debug('API Builder serialize table config', [
             'table_name' => $serialized['table_name'],
             'primary_key' => $serialized['primary_key'],
@@ -1093,6 +1144,128 @@ class DataAPIBuilderController extends Controller
         }
 
         return null;
+    }
+
+    protected function encodeParentOperationDataParams(array $parentTable, string $method): array
+    {
+        $dataParams = is_array($parentTable['data_params'] ?? null) ? $parentTable['data_params'] : [];
+        $storedMetadata = $dataParams['__parent_operation'] ?? null;
+        unset($dataParams['__parent_operation']);
+
+        $operation = strtoupper((string) ($parentTable['operation'] ?? ($storedMetadata['operation'] ?? 'CREATE')));
+        $lookupKeys = $parentTable['lookup_keys'] ?? ($storedMetadata['lookup_keys'] ?? []);
+
+        if (strtoupper($method) !== 'POST' || $operation !== 'CREATE_OR_UPDATE') {
+            return $dataParams;
+        }
+
+        $dataParams['__parent_operation'] = [
+            'version' => 1,
+            'operation' => 'CREATE_OR_UPDATE',
+            'lookup_keys' => is_array($lookupKeys) ? array_values($lookupKeys) : [],
+        ];
+
+        return $dataParams;
+    }
+
+    protected function validateParentOperationConfig(array $parentTable, array $params, string $method, bool $bundle = false): ?\Illuminate\Http\JsonResponse
+    {
+        $storedMetadata = $parentTable['data_params']['__parent_operation'] ?? null;
+        $operation = strtoupper((string) ($parentTable['operation'] ?? ($storedMetadata['operation'] ?? 'CREATE')));
+        $lookupKeys = $parentTable['lookup_keys'] ?? ($storedMetadata['lookup_keys'] ?? []);
+
+        if (! in_array($operation, ['CREATE', 'CREATE_OR_UPDATE'], true)) {
+            return response()->json(['status' => 422, 'error' => 'Invalid parent operation.', 'message' => 'Invalid parent operation.'], 422);
+        }
+
+        if ($operation !== 'CREATE_OR_UPDATE') {
+            return null;
+        }
+
+        if (! $bundle && strtoupper($method) !== 'POST') {
+            return response()->json(['status' => 422, 'error' => 'Create or Update is only available for POST APIs.', 'message' => 'Create or Update is only available for POST APIs.'], 422);
+        }
+
+        if (! is_array($lookupKeys) || $lookupKeys === []) {
+            return response()->json(['status' => 422, 'error' => 'At least one parent lookup key is required.', 'message' => 'At least one parent lookup key is required.'], 422);
+        }
+
+        if (trim((string) ($parentTable['table_name'] ?? '')) === '') {
+            return response()->json(['status' => 422, 'error' => 'A parent table is required for Create or Update.', 'message' => 'A parent table is required for Create or Update.'], 422);
+        }
+
+        $scalarPaths = [];
+        $this->collectScalarParameterPaths($params, $scalarPaths);
+        $columns = [];
+        $parameters = [];
+
+        foreach ($lookupKeys as $index => $lookupKey) {
+            $column = is_array($lookupKey) ? trim((string) ($lookupKey['column'] ?? '')) : '';
+            $parameter = is_array($lookupKey) ? trim((string) ($lookupKey['parameter'] ?? '')) : '';
+
+            if ($column === '' || $parameter === '') {
+                return response()->json(['status' => 422, 'error' => 'Every parent lookup key needs a column and parameter.', 'message' => 'Every parent lookup key needs a column and parameter.'], 422);
+            }
+
+            if (isset($columns[$column]) || isset($parameters[$parameter])) {
+                return response()->json(['status' => 422, 'error' => 'Parent lookup columns and parameters must be unique.', 'message' => 'Parent lookup columns and parameters must be unique.'], 422);
+            }
+
+            if (! in_array($parameter, $scalarPaths, true)) {
+                return response()->json(['status' => 422, 'error' => "Parent lookup parameter '{$parameter}' must reference a declared scalar parameter outside arrays.", 'message' => "Parent lookup parameter '{$parameter}' must reference a declared scalar parameter outside arrays."], 422);
+            }
+
+            $columns[$column] = true;
+            $parameters[$parameter] = true;
+        }
+
+        $mappings = is_array($parentTable['data_params'] ?? null) ? $parentTable['data_params'] : [];
+        foreach (array_keys($mappings) as $column) {
+            if (isset($columns[trim((string) $column)])) {
+                $message = "Parent lookup column '{$column}' cannot also be selected in Mapping Data.";
+                return response()->json(['status' => 422, 'error' => $message, 'message' => $message], 422);
+            }
+        }
+
+        return null;
+    }
+
+    protected function collectScalarParameterPaths(array $params, array &$paths, string $prefix = ''): void
+    {
+        foreach ($params as $param) {
+            if (! is_array($param) || ! is_string($param['name'] ?? null)) {
+                continue;
+            }
+
+            $name = trim($param['name']);
+            if ($name === '') {
+                continue;
+            }
+
+            $path = $prefix !== '' ? $prefix . '.' . $name : $name;
+            $type = $this->normalizeApiBuilderParamType($param['type'] ?? null);
+
+            if ($this->isContainerApiBuilderParamType($type)) {
+                if ($type === 'object') {
+                    $this->collectScalarParameterPaths(
+                        is_array($param['params'] ?? null) ? $param['params'] : [],
+                        $paths,
+                        $path
+                    );
+                }
+                continue;
+            }
+
+            if ($this->isPrimitiveArrayParamType($type)) {
+                continue;
+            }
+
+            if (! in_array($type, $this->allowedApiBuilderParamTypes(), true)) {
+                continue;
+            }
+
+            $paths[] = $path;
+        }
     }
 
     protected function resolveChildLookupKey(mixed $table, mixed $fallback = null): ?string
@@ -1393,7 +1566,11 @@ class DataAPIBuilderController extends Controller
           $validateParentTable = [
             'table_name' => 'required|string',
             'primary_key' => 'nullable|string',
-            'key_update_delete' => 'nullable|string'
+            'key_update_delete' => 'nullable|string',
+            'operation' => ['nullable', 'string', Rule::in(['CREATE', 'CREATE_OR_UPDATE'])],
+            'lookup_keys' => 'nullable|array',
+            'lookup_keys.*.column' => 'required_with:lookup_keys|string',
+            'lookup_keys.*.parameter' => 'required_with:lookup_keys|string',
           ];
 
           $validateChildTable = [
@@ -1418,6 +1595,15 @@ class DataAPIBuilderController extends Controller
 
           if ($validator->fails()) {
                   return response()->json(['error'=>$validator->errors(), 'message'=>'In param parent_table, '.$validator->errors()->first()], 400);
+          }
+
+          if ($operationError = $this->validateParentOperationConfig(
+              is_array($request->parent_table ?? null) ? $request->parent_table : [],
+              $params,
+              strtoupper((string) ($request->method ?? '')),
+              $forceDataMappings
+          )) {
+              return $operationError;
           }
 
 
@@ -1678,6 +1864,10 @@ class DataAPIBuilderController extends Controller
       'parent_table.table_name' => 'required|string',
       'parent_table.primary_key' => 'nullable|string',
       'parent_table.key_update_delete' => 'nullable|string',
+      'parent_table.operation' => ['nullable', 'string', Rule::in(['CREATE', 'CREATE_OR_UPDATE'])],
+      'parent_table.lookup_keys' => 'nullable|array',
+      'parent_table.lookup_keys.*.column' => 'required_with:parent_table.lookup_keys|string',
+      'parent_table.lookup_keys.*.parameter' => 'required_with:parent_table.lookup_keys|string',
       'parent_table.foreign_key' => 'nullable|string',
       'parent_table.data_params' => 'nullable|array',
       'parent_table.use_soft_delete' => 'nullable|boolean',
@@ -1905,6 +2095,10 @@ class DataAPIBuilderController extends Controller
       'parent_table.table_name' => 'required|string',
       'parent_table.primary_key' => 'nullable|string',
       'parent_table.key_update_delete' => 'nullable|string',
+      'parent_table.operation' => ['nullable', 'string', Rule::in(['CREATE', 'CREATE_OR_UPDATE'])],
+      'parent_table.lookup_keys' => 'nullable|array',
+      'parent_table.lookup_keys.*.column' => 'required_with:parent_table.lookup_keys|string',
+      'parent_table.lookup_keys.*.parameter' => 'required_with:parent_table.lookup_keys|string',
       'parent_table.foreign_key' => 'nullable|string',
       'parent_table.data_params' => 'nullable|array',
       'parent_table.use_soft_delete' => 'nullable|boolean',
@@ -2078,6 +2272,10 @@ class DataAPIBuilderController extends Controller
       'parent_table.table_name' => 'required|string',
       'parent_table.primary_key' => 'nullable|string',
       'parent_table.key_update_delete' => 'nullable|string',
+      'parent_table.operation' => ['nullable', 'string', Rule::in(['CREATE', 'CREATE_OR_UPDATE'])],
+      'parent_table.lookup_keys' => 'nullable|array',
+      'parent_table.lookup_keys.*.column' => 'required_with:parent_table.lookup_keys|string',
+      'parent_table.lookup_keys.*.parameter' => 'required_with:parent_table.lookup_keys|string',
       'parent_table.foreign_key' => 'nullable|string',
       'parent_table.data_params' => 'nullable|array',
       'parent_table.use_soft_delete' => 'nullable|boolean',
@@ -2372,6 +2570,16 @@ class DataAPIBuilderController extends Controller
                 }
                 $columns = array_column($this->databaseMetadataProvider->listColumns($table, $this->tableConnectionName), 'name');
                 $selected = array_keys($definition['data_params'] ?? []);
+                if ($field === 'parent_table') {
+                    $selected = array_values(array_diff($selected, ['__parent_operation']));
+                    $operationMetadata = $definition['data_params']['__parent_operation'] ?? [];
+                    $lookupKeys = $definition['lookup_keys'] ?? ($operationMetadata['lookup_keys'] ?? []);
+                    foreach ($lookupKeys as $lookupKey) {
+                        if (is_array($lookupKey) && ! empty($lookupKey['column'])) {
+                            $selected[] = $lookupKey['column'];
+                        }
+                    }
+                }
                 foreach (['primary_key', 'key_update_delete', 'child_update_key', 'foreign_key'] as $key) {
                     if (!empty($definition[$key])) $selected[] = $definition[$key];
                 }

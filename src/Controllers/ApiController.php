@@ -902,7 +902,8 @@ class ApiController extends Controller
       array $childRows,
       array $parentIds,
       ?string $connectionName = null,
-      ?Request $request = null
+      ?Request $request = null,
+      bool $preserveMatchedPrimaryKey = false
   ): void {
         $foreignKey = trim((string) ($table['foreign_key'] ?? ''));
 
@@ -981,6 +982,12 @@ class ApiController extends Controller
                             'action' => 'UPDATE',
                             'payload_value' => $identifier,
                         ]);
+                        if ($preserveMatchedPrimaryKey && $tablePrimaryKey !== '') {
+                            // A request default may have generated a fresh UUID. The
+                            // configured child lookup key determines the match, and
+                            // the stored primary key must survive that update.
+                            unset($persistedRow[$tablePrimaryKey]);
+                        }
                         $existingQuery->update($persistedRow);
                         continue;
                     }
@@ -1372,6 +1379,13 @@ class ApiController extends Controller
   */
     public function store(Request $request, $apiConfigs)
   {
+      if (
+          strtoupper((string) ($apiConfigs->parentTable?->operation ?? 'CREATE')) === 'CREATE_OR_UPDATE'
+          && strtoupper((string) ($apiConfigs->method ?? '')) === 'POST'
+      ) {
+          return $this->storeOrUpdateParent($request, $apiConfigs);
+      }
+
     
       if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
           return $runtimeError;
@@ -1482,6 +1496,232 @@ class ApiController extends Controller
               "error" => $e->getMessage()
           ], 422);
       }
+  }
+
+  protected function storeOrUpdateParent(Request $request, ApiConfig $apiConfigs): JsonResponse
+  {
+      $parentTableConfig = $apiConfigs->parentTable;
+      $lookupKeys = is_array($parentTableConfig?->lookup_keys) ? $parentTableConfig->lookup_keys : [];
+
+      try {
+          // Check the raw payload first so defaults cannot hide an omitted or null lookup input.
+          $this->resolveParentLookupValues($request->all(), $lookupKeys);
+      } catch (\InvalidArgumentException $exception) {
+          return response()->json(['status' => 422, 'data' => [], 'error' => $exception->getMessage(), 'message' => $exception->getMessage()], 422);
+      }
+
+      if ($runtimeError = $this->prepareRuntimeRequest($request, $apiConfigs->params ?? [])) {
+          return $runtimeError;
+      }
+
+      $connection = $this->executionConnectionResolver->connection($request);
+      $connectionName = $this->executionConnectionResolver->resolve($request);
+      $parentTable = (string) $parentTableConfig->table_name;
+      $prefix = $connection->getTablePrefix();
+      $cleanParentTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $parentTable);
+      $primaryKey = trim((string) ($parentTableConfig->primary_key ?? '')) ?: 'id';
+      $childTables = $apiConfigs->childTables->toArray();
+      $flattenedParams = $this->flattenArray($apiConfigs->params ?? []);
+      $transactionStarted = false;
+
+      try {
+          $connection->beginTransaction();
+          $transactionStarted = true;
+
+          $lookupValues = $this->resolveParentLookupValues($request->all(), $lookupKeys);
+          $matches = $this->findParentMatches($connection, $cleanParentTable, $lookupValues);
+          if ($matches->count() > 1) {
+              throw new \RuntimeException('Parent lookup matched more than one record.');
+          }
+
+          $matchedRecord = $matches->first();
+          $matchedId = $matchedRecord === null ? null : $this->resolveRecordValue($matchedRecord, $primaryKey);
+          if ($matchedRecord !== null && ($matchedId === null || $matchedId === '')) {
+              throw new \RuntimeException("Unable to resolve parent primary key '{$primaryKey}'.");
+          }
+
+          $this->validateUpsertPayload($request, $apiConfigs->params ?? [], $connectionName, $parentTable, $matchedId, $primaryKey);
+          $this->runBeforeExecuteHooks($request, $apiConfigs);
+
+          // Hooks may alter lookup inputs, so resolve the target again and validate against it.
+          $lookupValues = $this->resolveParentLookupValues($request->all(), $lookupKeys);
+          $matches = $this->findParentMatches($connection, $cleanParentTable, $lookupValues);
+          if ($matches->count() > 1) {
+              throw new \RuntimeException('Parent lookup matched more than one record.');
+          }
+
+          $matchedRecord = $matches->first();
+          $matchedId = $matchedRecord === null ? null : $this->resolveRecordValue($matchedRecord, $primaryKey);
+          if ($matchedRecord !== null && ($matchedId === null || $matchedId === '')) {
+              throw new \RuntimeException("Unable to resolve parent primary key '{$primaryKey}'.");
+          }
+          $this->validateUpsertPayload($request, $apiConfigs->params ?? [], $connectionName, $parentTable, $matchedId, $primaryKey);
+
+          $parentRows = $this->buildMappedTableRows(
+              is_array($parentTableConfig->data_params ?? null) ? $parentTableConfig->data_params : [],
+              $request,
+              $flattenedParams
+          );
+          $parentRows = array_values($this->normalizeNumericIndexedArray($parentRows));
+
+          if (count($parentRows) !== 1 || ! is_array($parentRows[0])) {
+              throw new \RuntimeException('Create or Update requires exactly one parent row.');
+          }
+
+          $parentRow = $parentRows[0];
+          $configuredLookupColumns = [];
+          foreach ($lookupKeys as $lookupKey) {
+              $column = trim((string) ($lookupKey['column'] ?? ''));
+              if ($column !== '') {
+                  $configuredLookupColumns[$column] = true;
+              }
+          }
+          foreach ($lookupValues as $column => $value) {
+              $parentRow[$column] = $value;
+          }
+
+          if ($matchedRecord !== null) {
+              if (array_key_exists($primaryKey, $parentRow) && (string) $parentRow[$primaryKey] !== (string) $matchedId) {
+                  throw new \RuntimeException('The primary key of a matched parent cannot be changed.');
+              }
+
+              unset($parentRow[$primaryKey]);
+              foreach (array_keys($configuredLookupColumns) as $column) {
+                  $parentRow[$column] = $lookupValues[$column];
+              }
+
+              if ($parentRow !== []) {
+                  $connection->table($cleanParentTable)->where($primaryKey, $matchedId)->update($parentRow);
+              }
+              $parentIds = [$matchedId];
+              $action = 'update';
+              $message = 'Data has been successfully updated';
+          } else {
+              $parentIds = $this->insertTableRows($connection, $cleanParentTable, [$parentRow], $primaryKey);
+              $action = 'create';
+              $message = 'Data has been successfully created';
+          }
+
+          $parentId = $this->firstArrayValue($parentIds);
+          if ($parentId === null) {
+              throw new \RuntimeException('Unable to resolve persisted parent identifier.');
+          }
+
+          foreach ($childTables as $table) {
+              $cleanChildTable = preg_replace('/^' . preg_quote($prefix, '/') . '/', '', $table['table_name']);
+              $childRows = $this->buildMappedTableRows(
+                  is_array($table['data_params'] ?? null) ? $table['data_params'] : [],
+                  $request,
+                  $flattenedParams
+              );
+              $childRows = array_values($this->normalizeNumericIndexedArray($childRows));
+
+              $this->persistChildTableRows(
+                  $connection,
+                  $table,
+                  $cleanChildTable,
+                  $childRows,
+                  [$parentId],
+                  $connectionName,
+                  $request,
+                  true
+              );
+          }
+
+          $finalRecord = $this->normalizeAfterHitRecord(
+              $connection->table($cleanParentTable)->where($primaryKey, $parentId)->first()
+          );
+          $request->attributes->set('datasources.after_hit.action', $action);
+          $request->attributes->set('datasources.after_hit.result', $finalRecord);
+          $request->attributes->set('datasources.after_hit.before_data', []);
+
+          $connection->commit();
+          return response()->json(['status' => 200, 'message' => $message, 'data' => []], 201);
+      } catch (ApiHookException $exception) {
+          if ($transactionStarted) {
+              $connection->rollBack();
+          }
+          return response()->json($exception->toResponsePayload(), $exception->getStatusCode());
+      } catch (\Exception $exception) {
+          if ($transactionStarted) {
+              $connection->rollBack();
+          }
+          \Log::error('CREATE OR UPDATE API BUILDER ERROR => ' . $exception->getMessage());
+          return response()->json([
+              'status' => 422,
+              'data' => [],
+              'error' => $exception->getMessage(),
+              'message' => $exception->getMessage(),
+          ], 422);
+      }
+  }
+
+  protected function resolveParentLookupValues(array $payload, array $lookupKeys): array
+  {
+      if ($lookupKeys === []) {
+          throw new \InvalidArgumentException('At least one parent lookup key is required.');
+      }
+
+      $values = [];
+      foreach ($lookupKeys as $lookupKey) {
+          if (! is_array($lookupKey)) {
+              throw new \InvalidArgumentException('Invalid parent lookup key configuration.');
+          }
+
+          $column = trim((string) ($lookupKey['column'] ?? ''));
+          $parameter = trim((string) ($lookupKey['parameter'] ?? ''));
+          if ($column === '' || $parameter === '' || array_key_exists($column, $values)) {
+              throw new \InvalidArgumentException('Invalid parent lookup key configuration.');
+          }
+
+          $value = $payload;
+          foreach (explode('.', $parameter) as $segment) {
+              if (! is_array($value) || ! array_key_exists($segment, $value)) {
+                  throw new \InvalidArgumentException("Parent lookup value '{$parameter}' is required.");
+              }
+              $value = $value[$segment];
+          }
+
+          if ($value === null || ! is_scalar($value) || (is_string($value) && trim($value) === '')) {
+              throw new \InvalidArgumentException("Parent lookup value '{$parameter}' must be a non-null scalar value.");
+          }
+
+          $values[$column] = $value;
+      }
+
+      return $values;
+  }
+
+  protected function findParentMatches($connection, string $table, array $lookupValues)
+  {
+      $query = $connection->table($table);
+      foreach ($lookupValues as $column => $value) {
+          $query->where($column, $value);
+      }
+
+      return $query->lockForUpdate()->limit(2)->get();
+  }
+
+  protected function validateUpsertPayload(
+      Request $request,
+      array $params,
+      ?string $connectionName,
+      string $parentTable,
+      mixed $matchedId,
+      string $primaryKey
+  ): void {
+      if ($params === []) {
+          return;
+      }
+
+      $rules = $this->buildValidationRulesFromParams(
+          $params,
+          $parentTable,
+          $matchedId ?? 0,
+          '',
+          $primaryKey
+      );
+      $this->validateWithDatasourceConnection($request->all(), $rules, $connectionName);
   }
 
 
