@@ -113,6 +113,54 @@ class DataAPIBuilderParentOperationTest extends TestCase
         $this->assertSame(422, $response->getStatusCode());
     }
 
+    public function test_it_rejects_parent_mapping_columns_reserved_by_lookup_keys(): void
+    {
+        $controller = $this->makeController();
+        $parent = [
+            'table_name' => 'customers',
+            'operation' => 'CREATE_OR_UPDATE',
+            'lookup_keys' => [['column' => 'email', 'parameter' => 'email']],
+            'data_params' => ['name' => 'name'],
+        ];
+        $params = [['name' => 'email', 'type' => 'string'], ['name' => 'name', 'type' => 'string']];
+        $this->assertNull($controller->exposeValidateParentOperationConfig($parent, $params, 'POST'));
+
+        foreach (['email', ['value' => 'email', 'array_handling' => 'RAW_VALUE']] as $mapping) {
+            $parent['data_params']['email'] = $mapping;
+            $response = $controller->exposeValidateParentOperationConfig($parent, $params, 'POST');
+            $this->assertSame(422, $response->getStatusCode());
+            $this->assertStringContainsString("'email'", $response->getData(true)['message']);
+            $this->assertStringContainsString('Mapping Data', $response->getData(true)['message']);
+        }
+
+        unset($parent['data_params']['email']);
+        $this->assertNull($controller->exposeValidateParentOperationConfig($parent, $params, 'POST'));
+        $parent['operation'] = 'CREATE';
+        $parent['data_params']['email'] = 'email';
+        $this->assertNull($controller->exposeValidateParentOperationConfig($parent, $params, 'POST'));
+        $this->assertNull($controller->exposeValidateParentOperationConfig($parent, $params, 'PUT'));
+    }
+
+    public function test_imported_operation_metadata_cannot_bypass_mapping_conflict_validation(): void
+    {
+        $controller = $this->makeController();
+        $parent = [
+            'table_name' => 'customers',
+            'data_params' => [
+                'name' => 'name',
+                '__parent_operation' => [
+                    'version' => 1, 'operation' => 'CREATE_OR_UPDATE',
+                    'lookup_keys' => [['column' => 'email', 'parameter' => 'email']],
+                ],
+            ],
+        ];
+        $params = [['name' => 'email', 'type' => 'string']];
+        $this->assertNull($controller->exposeValidateParentOperationConfig($parent, $params, 'POST'));
+        $parent['data_params']['email'] = 'email';
+        $response = $controller->exposeValidateParentOperationConfig($parent, $params, 'POST');
+        $this->assertSame(422, $response->getStatusCode());
+    }
+
     private function makeController(): TestableParentOperationDataAPIBuilderController
     {
         return new TestableParentOperationDataAPIBuilderController(

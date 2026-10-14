@@ -1219,6 +1219,14 @@ class DataAPIBuilderController extends Controller
             $parameters[$parameter] = true;
         }
 
+        $mappings = is_array($parentTable['data_params'] ?? null) ? $parentTable['data_params'] : [];
+        foreach (array_keys($mappings) as $column) {
+            if (isset($columns[trim((string) $column)])) {
+                $message = "Parent lookup column '{$column}' cannot also be selected in Mapping Data.";
+                return response()->json(['status' => 422, 'error' => $message, 'message' => $message], 422);
+            }
+        }
+
         return null;
     }
 
